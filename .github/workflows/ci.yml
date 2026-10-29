@@ -34,8 +34,8 @@ jobs:
           cp upstream-torne-drv/driver/torne_dib.c third_party/torne_drv/torne_dib.c
           cp upstream-torne-drv/driver/torne_card.c third_party/torne_drv/torne_card.c
 
-      - name: Apply MSVC C11 portability fix to upstream snapshot (CI-only)
-        if: runner.os == 'Windows'
+      - name: Apply non-Linux C11 and errno portability fixes (CI-only)
+        if: runner.os != 'Linux'
         shell: bash
         run: cmake -P ci/msvc-compat.cmake
 
