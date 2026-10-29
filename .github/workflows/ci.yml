@@ -34,6 +34,11 @@ jobs:
           cp upstream-torne-drv/driver/torne_dib.c third_party/torne_drv/torne_dib.c
           cp upstream-torne-drv/driver/torne_card.c third_party/torne_drv/torne_card.c
 
+      - name: Apply MSVC C11 portability fix to upstream snapshot (CI-only)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cmake -P ci/msvc-compat.cmake
+
       - name: Install Linux USB build dependency
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libusb-1.0-0-dev
