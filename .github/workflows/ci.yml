@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: GPL-2.0-only
+name: torne-userland cross-platform build (public snapshot)
+on:
+  push:
+    branches: [ci/torne-userland]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        config: [Debug, Release]
+    steps:
+      - name: Check out public CI snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore pinned public GPL upstream C sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/mihalinn/torne_drv.git upstream-torne-drv
+          git -C upstream-torne-drv checkout --quiet --detach fc662902a3e4ad56566b00cae4a0ead922e3dd02
+          test "$(git hash-object upstream-torne-drv/driver/torne_dib.c)" = "e6c18a339894c3de36afd9585e367c4acaddfd16"
+          test "$(git hash-object upstream-torne-drv/driver/torne_card.c)" = "8d91a09e46c27adf6ca8a12796b9a4f06d4ac30"
+          cp upstream-torne-drv/driver/torne_dib.c third_party/torne_drv/torne_dib.c
+          cp upstream-torne-drv/driver/torne_card.c third_party/torne_drv/torne_card.c
+
+      - name: Install Linux USB build dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libusb-1.0-0-dev
+
+      - name: Configure
+        shell: bash
+        env:
+          BUILD_MODE: ${{ matrix.config }}
+          WITH_LIBUSB: ${{ runner.os == 'Linux' && 'ON' || 'OFF' }}
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE="$BUILD_MODE" -DTORNE_BUILD_TESTS=ON -DTORNE_BUILD_CARD=ON -DTORNE_BUILD_LIBUSB="$WITH_LIBUSB"
+
+      - name: Build
+        shell: bash
+        env:
+          BUILD_MODE: ${{ matrix.config }}
+        run: cmake --build build --config "$BUILD_MODE" --parallel 2
+
+      - name: CTest (no tuner hardware)
+        shell: bash
+        env:
+          BUILD_MODE: ${{ matrix.config }}
+        run: ctest --test-dir build -C "$BUILD_MODE" --output-on-failure
+
+      - name: Core integration smoke (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          test "$(./build/torne-probe --resolve T27)" = "557142857"
+          ./build/torne-probe --list-json > discovery.json
+          python3 -c 'import json; x=json.load(open("discovery.json")); assert x["schema"]["name"] == "userland.discovery"; assert x["producer"]["product"] == "torne"'
