@@ -13,17 +13,13 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.os }} / ${{ matrix.configuration }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        configuration: [Debug, Release]
-
+  source-gate:
+    name: Check private source settings (not a build)
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.source-ready.outputs.ready }}
     steps:
-      - name: Check whether private source is configured
+      - name: Detect required repository secrets
         id: source-ready
         shell: bash
         env:
@@ -33,13 +29,25 @@ jobs:
         run: |
           if [[ -n "$SOURCE_REPO" && -n "$SOURCE_REF" && -n "$SOURCE_TOKEN" ]]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "A private build can be scheduled." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "Private-source build SKIPPED: configure repository secrets first." >> "$GITHUB_STEP_SUMMARY"
+            echo "NOT TESTED: missing source access configuration; build jobs will be skipped." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.configuration }}
+    needs: source-gate
+    if: needs.source-gate.outputs.ready == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        configuration: [Debug, Release]
+
+    steps:
       - name: Check out private source
-        if: steps.source-ready.outputs.ready == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ secrets.CI_SOURCE_REPO }}
@@ -51,7 +59,7 @@ jobs:
           path: source
 
       - name: Install Linux USB development dependency
-        if: steps.source-ready.outputs.ready == 'true' && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update -qq > /dev/null 2>&1
@@ -62,7 +70,6 @@ jobs:
       # Log files remain on the ephemeral hosted runner; they are NOT
       # uploaded as public artifacts.
       - name: Configure
-        if: steps.source-ready.outputs.ready == 'true'
         shell: bash
         env:
           BUILD_TYPE: ${{ matrix.configuration }}
@@ -75,7 +82,6 @@ jobs:
           fi
 
       - name: Build
-        if: steps.source-ready.outputs.ready == 'true'
         shell: bash
         env:
           BUILD_TYPE: ${{ matrix.configuration }}
@@ -88,7 +94,6 @@ jobs:
           fi
 
       - name: Run tests without hardware
-        if: steps.source-ready.outputs.ready == 'true'
         shell: bash
         env:
           BUILD_TYPE: ${{ matrix.configuration }}
