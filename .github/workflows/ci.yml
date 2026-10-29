@@ -30,7 +30,7 @@ jobs:
           git clone --quiet https://github.com/mihalinn/torne_drv.git upstream-torne-drv
           git -C upstream-torne-drv checkout --quiet --detach fc662902a3e4ad56566b00cae4a0ead922e3dd02
           test "$(git hash-object upstream-torne-drv/driver/torne_dib.c)" = "e6c18a339894c3de36afd9585e367c4acaddfd16"
-          test "$(git hash-object upstream-torne-drv/driver/torne_card.c)" = "8d91a09e46c27adf6ca8a12796b9a4f06d4ac30"
+          test "$(git hash-object upstream-torne-drv/driver/torne_card.c)" = "8d91a09e46c27adf6ca8a12796b9a4f06d4ac30b"
           cp upstream-torne-drv/driver/torne_dib.c third_party/torne_drv/torne_dib.c
           cp upstream-torne-drv/driver/torne_card.c third_party/torne_drv/torne_card.c
 
