@@ -34,10 +34,12 @@ jobs:
           cp upstream-torne-drv/driver/torne_dib.c third_party/torne_drv/torne_dib.c
           cp upstream-torne-drv/driver/torne_card.c third_party/torne_drv/torne_card.c
 
-      - name: Apply non-Linux C11 and errno portability fixes (CI-only)
-        if: runner.os != 'Linux'
+      - name: Restore byte-identical private-portability sources
         shell: bash
-        run: cmake -P ci/msvc-compat.cmake
+        run: |
+          cmake -P ci/upstream-compat.cmake
+          test "$(git hash-object third_party/torne_drv/torne_dib.c)" = "285d19d639202220e55fef8028bc848a91c13077"
+          test "$(git hash-object third_party/torne_drv/torne_card.c)" = "783ef999ec6a8e8dee5f9e1ef18e971530caf7b8"
 
       - name: Install Linux USB build dependency
         if: runner.os == 'Linux'
