@@ -13,3 +13,19 @@ endif()
 string(REPLACE "${original}" "${replacement}" patched "${data}")
 file(WRITE "${path}" "${patched}")
 message(STATUS "Applied portable single-evaluation C11 conditional for MSVC")
+
+# Windows CRT does not define the Linux-specific ENOMEDIUM errno.
+# The numeric fallback is the Linux errno value so the callback contract
+# continues to distinguish "no smart card" from generic I/O failures.
+set(card "${CMAKE_CURRENT_LIST_DIR}/../third_party/torne_drv/torne_card.c")
+file(READ "${card}" card_data)
+set(card_marker "#include \"torne_card.h\"")
+string(FIND "${card_data}" "${card_marker}" card_at)
+if(card_at LESS 0)
+  message(FATAL_ERROR "Expected upstream card include not found; refuse to patch")
+endif()
+set(card_new "#include \"torne_card.h\"\n#ifndef ENOMEDIUM\n#define ENOMEDIUM 123 /* Linux: no medium / smart card */\n#endif")
+string(REPLACE "${card_marker}" "${card_new}" card_patched "${card_data}")
+file(WRITE "${card}" "${card_patched}")
+message(STATUS "Added ENOMEDIUM portability fallback for MSVC CI")
+
