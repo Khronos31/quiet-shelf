@@ -1,7 +1,7 @@
 # Public CI snapshot of torne-userland
 
 - **Source repository**: `Khronos31/torne-userland` (private at snapshot time).
-- **Source commit**: `80c590511f8ee2cb3a48cadf642adb6ece23dbc8` (**PR22 candidate**, not yet main; base main `1f3d6dd1`; PR21 Core/family/CardService/optional PC/SC packaging plus cold-start clock-gate fix).
+- **Source commit**: `ba35825e0a236c098ce5d614eef741618aa6feb2` (main; product tree identical to 9619; includes PR21 Core/family/CardService/optional PC/SC packaging and cold-start clock-gate fix).
 - **License**: GPL-2.0-only. The product `LICENSE`, `PROVENANCE.md`, and the upstream attribution `NOTICE` are preserved.
 - **Dependency pin**: `Khronos31/dtv-userland-core` at
   `1d5569ee303204cbb2d660517152d8a5b5878041` (Core141 intermediate pin), fetched by CMake
@@ -13,6 +13,13 @@
   `.github/workflows/fr30-generation.yml` is manual-only (`workflow_dispatch`)
   and adds one job. Neither uses secrets, write tokens, private checkouts,
   releases, packages, schedules, or external uploads.
+- The branch-only `.github/workflows/macos-ifd.yml` is triggered only by
+  `ci/torne-macos-ifd`. It builds the optional macOS IFD/bundle, checks Mach-O,
+  exports, plist, notices, and dependencies, then probes `CFBundle` loading and
+  the 10 IFDH function pointers with a temporary CoreFoundation client. It does
+  not call IFDH operations, start a daemon/pcscd, register a service, open USB,
+  or run the six normal jobs. The wrong `CFBundleExecutable` copy is a negative
+  control. macOS actual service discovery and registration remain unverified.
 - This branch contains only source, documentation, PC/SC packaging, and CI files from the
   allowlisted snapshot. No private git history, tokens, or device captures are
   copied.

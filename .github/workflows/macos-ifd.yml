@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Branch-only probe for the macOS candidate IFD bundle. This workflow is not
+# registered on the default/main branch and does not run the six normal jobs.
+name: macOS candidate PC/SC IFD bundle check
+
+on:
+  push:
+    branches: [ci/torne-macos-ifd]
+
+permissions:
+  contents: read
+
+jobs:
+  macos-ifd-bundle:
+    runs-on: macos-latest
+    steps:
+      - name: Check out public CI snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain
+        shell: bash
+        run: |
+          uname -m
+          clang --version | head -n 1
+          cmake --version | head -n 1
+          xcrun --show-sdk-path
+
+      - name: Configure PC/SC IFD/bundle
+        run: |
+          cmake -S . -B build-ifd \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTORNE_BUILD_TESTS=OFF \
+            -DTORNE_BUILD_PCSC_IFD=ON
+
+      - name: Build PC/SC IFD and candidate bundle
+        run: |
+          cmake --build build-ifd --target torne_pcsc_stage torne_pcsc_bundle --parallel 2
+
+      - name: Check bundle structure, Mach-O, symbols, dependencies and notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle=build-ifd/pcsc/torne-userland-ifd.bundle
+          exe="$bundle/Contents/MacOS/torne-userland-ifd"
+          test -d "$bundle"
+          test -s "$exe"
+          test -s "$bundle/Contents/Info.plist"
+          test -s "$bundle/Contents/Resources/LICENSE"
+          test -s "$bundle/Contents/Resources/COPYING"
+          test -s "$bundle/Contents/Resources/UNIX_PCSC_IFD_PROVENANCE.json"
+          test -s "$bundle/Contents/Resources/LICENSE.dtv-userland-core"
+          plutil -lint "$bundle/Contents/Info.plist"
+          test "$(plutil -extract CFBundleExecutable raw -o - "$bundle/Contents/Info.plist")" = "torne-userland-ifd"
+          test "$(plutil -extract CFBundlePackageType raw -o - "$bundle/Contents/Info.plist")" = "BNDL"
+          file "$exe"
+          headers=$(otool -hv "$exe")
+          filetype=$(awk 'NR > 2 && ($5 == "DYLIB" || $5 == "BUNDLE") { print $5; exit }' <<<"$headers")
+          if [ "$filetype" != "DYLIB" ] && [ "$filetype" != "BUNDLE" ]; then
+            echo "unexpected Mach-O filetype: ${filetype:-missing}" >&2
+            exit 1
+          fi
+          stage=$(find build-ifd/pcsc/unix -maxdepth 1 -type f -name '*.dylib' -print -quit)
+          test -n "$stage"
+          cmp "$stage" "$exe"
+          symbols=$(nm -gU "$exe" | awk '{print $NF}' | sed 's/^_//')
+          for symbol in IFDHCreateChannel IFDHCreateChannelByName IFDHCloseChannel IFDHGetCapabilities IFDHSetCapabilities IFDHSetProtocolParameters IFDHPowerICC IFDHTransmitToICC IFDHControl IFDHICCPresence; do
+            if ! grep -Fxq "$symbol" <<<"$symbols"; then
+              echo "missing IFD symbol: $symbol" >&2
+              exit 1
+            fi
+          done
+          dependencies=$(otool -L "$exe")
+          printf '%s\n' "$dependencies"
+          if grep -E 'libpcsclite|/opt/homebrew|/usr/local' <<<"$dependencies"; then
+            echo "unexpected external PCSC/Homebrew dependency" >&2
+            exit 1
+          fi
+
+      - name: Probe CFBundle executable loading without a card or USB
+        shell: bash
+        run: |
+          set -euo pipefail
+          loader="$RUNNER_TEMP/torne_cfbundle_probe.c"
+          cat > "$loader" <<'C'
+          #include <CoreFoundation/CoreFoundation.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          static int check(CFBundleRef bundle)
+          {
+              const char* names[] = {
+                  "IFDHCreateChannel", "IFDHCreateChannelByName",
+                  "IFDHCloseChannel", "IFDHGetCapabilities",
+                  "IFDHSetCapabilities", "IFDHSetProtocolParameters",
+                  "IFDHPowerICC", "IFDHTransmitToICC",
+                  "IFDHControl", "IFDHICCPresence"};
+              for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+                  CFStringRef name = CFStringCreateWithCString(
+                      NULL, names[i], kCFStringEncodingUTF8);
+                  void* pointer = CFBundleGetFunctionPointerForName(bundle, name);
+                  CFRelease(name);
+                  if (pointer == NULL) {
+                      fprintf(stderr, "missing CFBundle symbol: %s\n", names[i]);
+                      return 1;
+                  }
+              }
+              return 0;
+          }
+
+          int main(int argc, char** argv)
+          {
+              if (argc != 2) return 2;
+              CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+                  NULL, (const UInt8*)argv[1], strlen(argv[1]), true);
+              if (url == NULL) return 3;
+              CFBundleRef bundle = CFBundleCreate(NULL, url);
+              CFRelease(url);
+              if (bundle == NULL) return 4;
+              CFURLRef executable = CFBundleCopyExecutableURL(bundle);
+              if (executable == NULL) { CFRelease(bundle); return 5; }
+              CFRelease(executable);
+              CFErrorRef error = NULL;
+              Boolean loaded = CFBundleLoadExecutableAndReturnError(bundle, &error);
+              if (error != NULL) CFRelease(error);
+              int result = loaded ? check(bundle) : 1;
+              CFRelease(bundle);
+              return result;
+          }
+          C
+          clang -std=c11 -Wall -Wextra -Werror -framework CoreFoundation \
+            "$loader" -o "$RUNNER_TEMP/torne_cfbundle_probe"
+          bundle=build-ifd/pcsc/torne-userland-ifd.bundle
+          "$RUNNER_TEMP/torne_cfbundle_probe" "$bundle"
+          bad="$RUNNER_TEMP/torne-userland-ifd-bad.bundle"
+          rm -rf "$bad"
+          cp -R "$bundle" "$bad"
+          plutil -replace CFBundleExecutable -string missing-ifd-executable \
+            "$bad/Contents/Info.plist"
+          if "$RUNNER_TEMP/torne_cfbundle_probe" "$bad"; then
+            echo "CFBundle accepted the wrong CFBundleExecutable" >&2
+            exit 1
+          fi
