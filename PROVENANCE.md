@@ -1,57 +1,59 @@
-# Source provenance, licenses, and version pins
+# 出典と依存
 
-This repository is GPL-2.0-only; all upstream copyrights are retained.
+## 製品コード
 
-## Vendor: mihalinn/torne_drv
+`torne-userland` 本体は GPL-2.0-only。`LICENSE` を参照。
 
-- URL: https://github.com/mihalinn/torne_drv
-- Immutable source commit: `fc662902a3e4ad56566b00cae4a0ead922e3dd02`
-- License: GPL-2.0-only, as recorded by upstream LICENSE / NOTICE.
-- Unmodified files in `third_party/torne_drv`:
-  `torne_core.h`, `torne_regs.h`, `torne_bridge.c`,
-  `torne_fw_gen.h`, `torne_dib.h`,
-  `torne_dib_tables_gen.h`, `torne_card.h`, `LICENSE` and `NOTICE`.
-- **Portability-only modifications** relative to the pinned upstream:
-  - `torne_dib.c`: replaced one GNU omitted-middle-operand ternary with
-    a single-evaluation ISO C11 conditional accepted by MSVC.
-  - `torne_card.c`: added an `ENOMEDIUM=123` fallback for C runtimes
-    lacking this Linux-style missing-medium errno constant.
-  Both files remain GPL-2.0-only, with upstream attribution retained.
-- `torne_fw_gen.h` is generated FR30 code, and
-  `torne_dib_tables_gen.h` is the generated DiB8096 tables.
-  **Do not mix these headers with a different C implementation version.**
-- Upstream NOTICE attributes MB86H47A and ISO7816-related material to
-  Till0196/coax; DiB hardware drivers to DiBcom/Linux through coax.
-  Kernel character device sources originally derived from px4_drv are
-  intentionally **not copied** into this user-space project.
-- Upstream reference for coax:
-  https://github.com/Till0196/coax (versioned generator sources).
+## dtv-userland-core
 
-**Open source-distribution obligation:** The bundled FR30 code is generated
-machine code. Before binary redistribution, ensure exact generator-source
-versioning and complete corresponding source/generation scripts as required
-by GPLv2 (Opus license-audit F1). These portability changes do not resolve it.
+- repository: `https://github.com/Khronos31/dtv-userland-core.git`
+- commit: `301c4593fc34702729750477d93f9d9e0051b0cb`（v1.0.1 の実体）
+- 固定箇所: `cmake/TorneCoreDependency.cmake`
+- 用途: `host_ctl`、`host_ts`、`identity`、`json`、`host_runtime`、
+  `host_facade` の既存 API。製品側で共通契約を複製しない。
+- ライセンス: Core リポジトリの `LICENSE` / `PROVENANCE.json` に従う。
+  portable 部分は MIT、GPL adapter は GPL-2.0-only。
+- この commit は現時点の再現可能な参照であり、Core 整理後の最終 pin ではない。
 
-## Shared common core
+Core のソースは FetchContent で取得するか、`TORNE_CORE_SOURCE_DIR` で同じ
+commit を checkout 済みのツリーを指定する。生成物や取得物はこのリポジトリへ
+vendor しない。
 
-- URL: https://github.com/Khronos31/dtv-userland-core
-- Nominal baseline: `v0.1.0`
-- **Pinned commit, not moving tag:**
-  `32731433803f01903b4f198ddd94647c4d222ac0`
-- Source is brought in with CMake FetchContent, not copied into this project.
-- MIT applies to generic Core source; some optional Core host adapters
-  are GPL-2.0-only. This project is GPL-2.0-only.
-- A future v1.0.0 tag may be re-pointed; update the pinned commit only
-  following verification. The Core CMake package may still advertise
-  version 0.1.0 even when a separate tag says v1.0.0.
+- 既定の FetchContent 経路は `cmake/TorneCoreDependency.cmake` の固定 commit を
+  取得する。
+- `TORNE_CORE_SOURCE_DIR` は開発者向けの未検証入力である。CMake は指定ツリーの
+  commit・内容・ハッシュを検証しない。正式配布物の入力監査（固定版、ハッシュ、
+  対応ソース）は別工程で行う。
 
-## Excluded sources
+## libusb
 
-- No denpa/AGPL-3.0 code or generated code is imported. Ideas from denpa
-  may be independently implemented in a later, separately reviewed change.
-- No Sony proprietary firmware or NeToRne proprietary-dependant modules
-  are included.
+- version: `1.0.30`
+- source: `https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2`
+- SHA-256: `fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf`
+- 固定箇所: `cmake/TorneLibusb.cmake`
+- ビルド: libusb 自身の Autotools。`--disable-shared --enable-static
+  --disable-udev --disable-tests-build --disable-examples-build`。製品用の別
+  Makefile は持たない。ソースはビルド時に取得し、vendor しない。
+- ライセンス: LGPL-2.1-or-later（libusb の `COPYING`）。製品の GPL-2.0-only
+  実行ファイルへ静的リンクするため、配布時は LGPL の対応ソース・再リンク可能性・
+  表示義務を別途満たす必要がある。今回の増分はソース内のリンクまでで、配布物の
+  義務履行を完了したとは主張しない。
+- 使用 API: `libusb_init`、`libusb_exit`、`libusb_get_device_list`、
+  `libusb_free_device_list`、`libusb_get_device_descriptor`、
+  `libusb_get_bus_number`、`libusb_get_device_address`、
+  `libusb_get_port_numbers`。いずれも公開 API。デバイスの open/claim/reset/
+  transfer は行わない。
+- udev は無効化している。Linux の最終 ELF に libusb/libusb-1.0.so/libudev の
+  動的依存が無いことを検査する。
+- CMake の cross target/sysroot/compiler 引数は libusb の configure へ渡す。
+  Darwin では libusb 1.0.30 の `configure.ac` が `LIBS` に入れる `-lobjc` と
+  IOKit/CoreFoundation/Security の framework を、静的アーカイブに残らないため
+  `torne_libusb` の INTERFACE から最終リンクへ伝播する。
 
-All new files (CMake, product glue, tests, tools, documentation) carry
-SPDX `GPL-2.0-only` where suitable. This document is a technical
-attribution record, not legal advice.
+## この増分で採用していないもの
+
+- 旧 Draft PR #1 のコード、生成 FR30、`torne_fw_gen.h`。
+- denpa / NeToRne のコード・生成物・調整値。
+- Linux カーネルモジュール、usbfs/udev/IOKit/WinUSB の直接利用。
+- USB control/bulk transport、FR30、DiB8096、カード UART。libusb は列挙だけに
+  使い、機器の claim/初期化/転送には使わない。

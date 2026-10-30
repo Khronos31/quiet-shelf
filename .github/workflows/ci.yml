@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 name: torne-userland cross-platform build (public snapshot)
+
 on:
   push:
     branches: [ci/torne-userland]
@@ -8,14 +9,17 @@ on:
 permissions:
   contents: read
 
+env:
+  LLVM_MINGW_URL: "https://github.com/mstorsjo/llvm-mingw/releases/download/20250910/llvm-mingw-20250910-ucrt-ubuntu-22.04-x86_64.tar.xz"
+  LLVM_MINGW_SHA256: "f83556c9ffa4d4291fadea1a0776c1383332dacdf4d7fbdf974c2928cb32c6f7"
+
 jobs:
-  test:
-    name: ${{ matrix.os }} / ${{ matrix.config }}
-    runs-on: ${{ matrix.os }}
+  linux:
+    name: linux / ${{ matrix.config }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         config: [Debug, Release]
     steps:
       - name: Check out public CI snapshot
@@ -23,52 +27,159 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore pinned public GPL upstream C sources
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential make
+
+      - name: Configure
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE="$CONFIG" -DTORNE_BUILD_TESTS=ON
+
+      - name: Build
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: cmake --build build --config "$CONFIG" --parallel 2
+
+      - name: CTest (no tuner hardware)
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: ctest --test-dir build -C "$CONFIG" --output-on-failure
+
+      - name: Run three product commands
         shell: bash
         run: |
           set -euo pipefail
-          git clone --quiet https://github.com/mihalinn/torne_drv.git upstream-torne-drv
-          git -C upstream-torne-drv checkout --quiet --detach fc662902a3e4ad56566b00cae4a0ead922e3dd02
-          test "$(git hash-object upstream-torne-drv/driver/torne_dib.c)" = "e6c18a339894c3de36afd9585e367c4acaddfd16"
-          test "$(git hash-object upstream-torne-drv/driver/torne_card.c)" = "8d91a09e46c27adf6ca8a12796b9a4f06d4ac30b"
-          cp upstream-torne-drv/driver/torne_dib.c third_party/torne_drv/torne_dib.c
-          cp upstream-torne-drv/driver/torne_card.c third_party/torne_drv/torne_card.c
+          for exe in torned tornectl torne-ts; do
+            "./build/$exe" --version
+          done
 
-      - name: Restore byte-identical private-portability sources
+      - name: Scan dynamic dependencies
         shell: bash
         run: |
-          cmake -P ci/upstream-compat.cmake
-          test "$(git hash-object third_party/torne_drv/torne_dib.c)" = "285d19d639202220e55fef8028bc848a91c13077"
-          test "$(git hash-object third_party/torne_drv/torne_card.c)" = "783ef999ec6a8e8dee5f9e1ef18e971530caf7b8"
+          set -euo pipefail
+          for exe in torned tornectl torne-ts; do
+            echo "== $exe"
+            readelf -d "build/$exe" | grep NEEDED || true
+            if readelf -d "build/$exe" | grep -E 'NEEDED.*(libusb|libudev)'; then
+              echo "unexpected dynamic USB dependency in $exe" >&2
+              exit 1
+            fi
+          done
 
-      - name: Install Linux USB build dependency
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y libusb-1.0-0-dev
+  windows-cross:
+    name: windows-x64 cross / ${{ matrix.config }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - name: Check out public CI snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential make curl xz-utils
+
+      - name: Install pinned llvm-mingw UCRT toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/llvm-mingw.tar.xz"
+          curl -fsSL --retry 3 "$LLVM_MINGW_URL" -o "$archive"
+          echo "$LLVM_MINGW_SHA256  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/llvm-mingw"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/llvm-mingw" --strip-components=1
+          echo "$RUNNER_TEMP/llvm-mingw/bin" >> "$GITHUB_PATH"
 
       - name: Configure
-        shell: bash
         env:
-          BUILD_MODE: ${{ matrix.config }}
-          WITH_LIBUSB: ${{ runner.os == 'Linux' && 'ON' || 'OFF' }}
+          CONFIG: ${{ matrix.config }}
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE="$BUILD_MODE" -DTORNE_BUILD_TESTS=ON -DTORNE_BUILD_CARD=ON -DTORNE_BUILD_LIBUSB="$WITH_LIBUSB"
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-clang \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-clang++ \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_BUILD_TYPE="$CONFIG" \
+            -DTORNE_BUILD_TESTS=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
 
       - name: Build
-        shell: bash
         env:
-          BUILD_MODE: ${{ matrix.config }}
-        run: cmake --build build --config "$BUILD_MODE" --parallel 2
+          CONFIG: ${{ matrix.config }}
+        run: cmake --build build --config "$CONFIG" --parallel 2
 
-      - name: CTest (no tuner hardware)
-        shell: bash
-        env:
-          BUILD_MODE: ${{ matrix.config }}
-        run: ctest --test-dir build -C "$BUILD_MODE" --output-on-failure
-
-      - name: Core integration smoke (Linux only)
-        if: runner.os == 'Linux'
+      - name: Check linked DLL imports
         shell: bash
         run: |
-          test "$(./build/torne-probe --resolve T27)" = "557142857"
-          ./build/torne-probe --list-json > discovery.json
-          python3 -c 'import json; x=json.load(open("discovery.json")); assert x["schema"]["name"] == "userland.discovery"; assert x["producer"]["product"] == "torne"'
+          set -euo pipefail
+          for exe in torned tornectl torne-ts; do
+            test -f "build/$exe.exe"
+            echo "== $exe.exe"
+            x86_64-w64-mingw32-objdump -p "build/$exe.exe" |
+              awk '/DLL Name/{print $3}' | sort -u
+            if x86_64-w64-mingw32-objdump -p "build/$exe.exe" |
+              grep -E 'DLL Name: (libusb|libc\+\+|libgcc|libwinpthread|libstdc\+\+)'; then
+              echo "unexpected bundled runtime DLL in $exe.exe" >&2
+              exit 1
+            fi
+          done
+
+  macos:
+    name: macos / ${{ matrix.config }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - name: Check out public CI snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain
+        shell: bash
+        run: |
+          uname -m
+          clang --version | head -n 1
+          cmake --version | head -n 1
+
+      - name: Configure
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE="$CONFIG" -DTORNE_BUILD_TESTS=ON
+
+      - name: Build
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: cmake --build build --config "$CONFIG" --parallel 2
+
+      - name: CTest (no tuner hardware)
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: ctest --test-dir build -C "$CONFIG" --output-on-failure
+
+      - name: Run three product commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          for exe in torned tornectl torne-ts; do
+            "./build/$exe" --version
+          done
+
+      - name: Scan dynamic dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for exe in torned tornectl torne-ts; do
+            echo "== $exe"
+            otool -L "build/$exe"
+            if otool -L "build/$exe" |
+              grep -E 'libusb|/opt/homebrew|/usr/local/(opt|lib)'; then
+              echo "unexpected non-system dependency in $exe" >&2
+              exit 1
+            fi
+          done
