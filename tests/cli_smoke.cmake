@@ -105,11 +105,12 @@ foreach(instance com1 COM1 .abc abc.)
     expect_result(ts_bad_instance 2)
 endforeach()
 
-# A syntactically valid but absent topology keeps this smoke away from any
-# attached receiver. PR16's UsbBackend still returns UNSUPPORTED without USB.
+# Use a syntactically valid but absent topology so this smoke never touches
+# an attached receiver. The default-discovery path is exercised on hardware by
+# the measurement owner, not by this test.
 run_cli(torned_case_result torned_case_output torned_case_error
     ${TORNED} --device usb:255-99 --instance Abc)
-expect_result(torned_case 3)
+expect_result(torned_case 7)
 expect_contains(torned_case torned_case_error "hardware backend open failed")
 
 run_cli(tornectl_case_result tornectl_case_output tornectl_case_error

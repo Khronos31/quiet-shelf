@@ -91,9 +91,9 @@ const char* daemon_usage() noexcept
         "  torned (--device usb:BUS-PORT[.PORT...] | --instance TOKEN) [--runtime-dir PATH]\n"
         "  torned --help | --version\n"
         "\n"
-        "  This framework build has no hardware backend. Startup and --list-json\n"
-        "  report an explicit unsupported error instead of returning an empty\n"
-        "  device list or a fabricated receiver/card state.\n";
+        "  Without --device the daemon selects the first discovered enclosure.\n"
+        "  --list-json remains a read-only scan. Startup never fabricates a\n"
+        "  receiver or card state when no usable enclosure is present.\n";
 }
 
 }  // namespace torne::daemon

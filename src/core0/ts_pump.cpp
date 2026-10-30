@@ -62,11 +62,13 @@ int TsPump::start(std::uint32_t epoch) noexcept
     return 0;
 }
 
-int TsPump::pump() noexcept
+int TsPump::pump(std::size_t max_completions) noexcept
 {
     if (!running_ || stopping_) return -1;
     usb::UsbIo::AsyncBulkEvent event{};
+    std::size_t completed = 0U;
     while (true) {
+        if (max_completions != 0U && completed >= max_completions) break;
         const int polled = transport_.async_bulk_poll(event);
         if (polled < 0) return -1;
         if (polled == 0) break;
@@ -77,6 +79,7 @@ int TsPump::pump() noexcept
         if (index >= buffers_.size()) continue;
         active_[index] = false;
         ++stats_.transfers;
+        ++completed;
         const bool usable = !stopping_ && !failed_ && epochs_[index] == epoch_ &&
                             (event.transfer.state == usb::TransferState::complete ||
                              event.transfer.state == usb::TransferState::short_transfer);

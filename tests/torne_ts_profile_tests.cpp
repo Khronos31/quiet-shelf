@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "torne_ts/profile.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 
@@ -44,6 +45,42 @@ void test_invalid_tokens_are_rejected_by_core_rules()
     }
 }
 
+void test_queue_drop_summary()
+{
+    px4::userland::ipc::CountersPayload counters{};
+    counters.availability[5U] = dtv::userland::wire::MeasureState::valid;
+    counters.queue_drops = 0U;
+    auto drops = torne::ts::measured_queue_drops(counters);
+    CHECK(drops && drops.value() == 0U);
+
+    counters.queue_drops = 7U;
+    drops = torne::ts::measured_queue_drops(counters);
+    CHECK(drops && drops.value() == 7U);
+
+    counters.availability[5U] = dtv::userland::wire::MeasureState::unknown;
+    CHECK(!torne::ts::measured_queue_drops(counters));
+
+    std::FILE* errors = std::tmpfile();
+    CHECK(errors != nullptr);
+    counters.availability[5U] = dtv::userland::wire::MeasureState::valid;
+    counters.queue_drops = 7U;
+    CHECK(torne::ts::finalize_ipc_success(counters, errors) == 8);
+    std::fflush(errors);
+    std::rewind(errors);
+    char text[128] = {};
+    CHECK(std::fread(text, 1U, sizeof(text) - 1U, errors) > 0U);
+    CHECK(std::string(text).find("queue drops: 7") != std::string::npos);
+    std::fclose(errors);
+
+    errors = std::tmpfile();
+    counters.queue_drops = 0U;
+    CHECK(torne::ts::finalize_ipc_success(counters, errors) == 0);
+    std::fflush(errors);
+    std::rewind(errors);
+    CHECK(std::fread(text, 1U, sizeof(text) - 1U, errors) == 0U);
+    std::fclose(errors);
+}
+
 void test_ordinary_token_is_accepted()
 {
     auto arguments = parse_instance("torne");
@@ -59,6 +96,7 @@ int main()
     test_case_is_preserved();
     test_invalid_tokens_are_rejected_by_core_rules();
     test_ordinary_token_is_accepted();
+    test_queue_drop_summary();
     if (failures != 0) {
         std::fprintf(stderr, "%d checks failed\n", failures);
         return 1;

@@ -178,6 +178,11 @@ Result Uart::power_down() noexcept
 
 Result Uart::reset_card() noexcept
 {
+    return reset_card(clock_);
+}
+
+Result Uart::reset_card(Clock& clock) noexcept
+{
     const PresenceResult presence = detect_card();
     if (!presence.result.ok)
         return presence.result;
@@ -187,7 +192,7 @@ Result Uart::reset_card() noexcept
     Result result = power_down();
     if (!result.ok) return result;
 
-    clock_.sleep_ms(10U);
+    clock.sleep_ms(10U);
     result = write(card_irq, 0x3FFU, usb::ControlKind::trigger,
                    Step::reset_irq_clear);
     if (!result.ok) return result;
@@ -211,7 +216,7 @@ Result Uart::reset_card() noexcept
                    Step::reset_baud);
     if (!result.ok) return result;
 
-    clock_.sleep_ms(2U);
+    clock.sleep_ms(2U);
     result = read_modify(card_lines, 1U << 1U, true, Step::reset_lines_clock);
     if (!result.ok) return result;
     result = write(card_recv_lrc, reset_recv_lrc, usb::ControlKind::abs_write,
@@ -227,7 +232,7 @@ Result Uart::reset_card() noexcept
                    Step::reset_irq_mask);
     if (!result.ok) return result;
 
-    clock_.sleep_ms(1U);
+    clock.sleep_ms(1U);
     return read_modify(card_lines, 1U << 2U, true, Step::reset_lines_release);
 }
 

@@ -692,6 +692,38 @@ void test_pump_and_stop_with_fake()
     CHECK(sink.count == 1U);
 }
 
+void test_pump_callback_budget()
+{
+    FakeState state;
+    ImageFixture image = make_image();
+    state.image_bytes = static_cast<std::uint32_t>(image.image.image_bytes);
+    state.build_id = image.image.build_id;
+    state.param0 = image.image.param0;
+    auto* raw = new FakeIo(state);
+    std::unique_ptr<usb::UsbIo> io(raw);
+    auto opened = usb::Transport::open(std::move(io), location());
+    CHECK(opened.outcome.state == usb::OpenState::ok);
+    widen::Bridge bridge(*opened.transport);
+    core0::Framer framer;
+    TestClock clock;
+    PacketSinkState sink;
+    core0::TsPump pump(*opened.transport, framer, clock, 16U, 65536U,
+                       packet_sink, &sink);
+    core0::Runtime runtime;
+    Flush flush;
+    const auto started = runtime.start(bridge, *opened.transport, image.image, 8U,
+                                       true, flush, clock, pump);
+    CHECK(started.ok);
+    raw->complete_one(192U);
+    raw->complete_one(192U);
+    CHECK(pump.pump(1U) == 0);
+    CHECK(framer.stats().input_bytes == 192U);
+    CHECK(pump.pump(1U) == 0);
+    CHECK(framer.stats().input_bytes == 384U);
+    CHECK(sink.count == 1U);
+    CHECK(runtime.stop(bridge, pump).ok);
+}
+
 void test_run_outcome_unknown()
 {
     FakeState state;
@@ -911,6 +943,7 @@ int main()
     test_full_t2_added_mmio_is_abs_write();
     test_t7_trigger_is_not_retried();
     test_pump_and_stop_with_fake();
+    test_pump_callback_budget();
     test_run_outcome_unknown();
     test_epoch_partial_is_discarded();
     test_trigger_failure_is_not_retried();

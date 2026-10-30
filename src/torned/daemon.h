@@ -9,8 +9,8 @@
 
 namespace torne::daemon {
 
-// Runs the parsed command. A null backend is the normal framework build and
-// must fail explicitly; a fake backend exists only in tests.
+// Runs the parsed command. A null backend fails explicitly; a fake backend
+// exists only in tests.
 int run_daemon(const DaemonConfig& config, Backend* backend,
                std::FILE* output, std::FILE* error) noexcept;
 

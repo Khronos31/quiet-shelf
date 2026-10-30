@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Single source of truth for the dtv-userland-core input. v1.0.1 is the
-# reproducible reference for this framework, not the final product pin: the
-# five products re-pin together after the Core cleanup.
+# Single source of truth for the dtv-userland-core input. 9d8e02c4 is the
+# intermediate card/T=1 development pin, not the final five-product pin.
 set(TORNE_CORE_REPOSITORY "https://github.com/Khronos31/dtv-userland-core.git")
-set(TORNE_CORE_COMMIT "301c4593fc34702729750477d93f9d9e0051b0cb")
+set(TORNE_CORE_COMMIT "9d8e02c4f113568012e257ed46d72c9a55751958")
 
 set(TORNE_CORE_SOURCE_DIR "" CACHE PATH
     "Developer-supplied dtv-userland-core tree for offline builds; NOT SHA-verified, must be TORNE_CORE_COMMIT")

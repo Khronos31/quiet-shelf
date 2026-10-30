@@ -33,11 +33,15 @@ set(DTV_USERLAND_BUILD_CONTROL ON)
 set(DTV_USERLAND_BUILD_STATUS_PROJECTION ON)
 set(DTV_USERLAND_BUILD_AUTHORITY ON)
 set(DTV_USERLAND_BUILD_HOST_TUNER ON)
+set(DTV_USERLAND_BUILD_HOST_CARD_T1 ON)
 set(DTV_USERLAND_BUILD_HOST_WORKERS ON)
 set(DTV_USERLAND_BUILD_HOST_RUNTIME ON)
 set(DTV_USERLAND_BUILD_HOST_CTL ON)
 set(DTV_USERLAND_BUILD_HOST_TS ON)
 set(DTV_USERLAND_BUILD_HOST_FACADE ON)
+set(DTV_USERLAND_BUILD_HOST_AUTHORITY_OWNER ON)
+set(DTV_USERLAND_BUILD_HOST_AUTHORITY_BRIDGE ON)
+set(DTV_USERLAND_BUILD_HOST_LISTENER_CONTEXT ON)
 
 include(cmake/TorneCoreDependency.cmake)
 torne_add_core()
@@ -67,7 +71,8 @@ add_library(torne_daemon_core STATIC
     src/torned/config.cpp
     src/torned/daemon.cpp)
 target_link_libraries(torne_daemon_core PUBLIC
-    torne_cli_common dtv::host_runtime dtv::host_ts)
+    torne_cli_common dtv::host_runtime dtv::host_ts
+    dtv::host_tuner dtv::host_listener_context)
 torne_set_warnings(torne_daemon_core)
 
 add_library(torne_usb STATIC
@@ -113,6 +118,9 @@ target_include_directories(torne_dib_frontend PUBLIC
 torne_set_warnings(torne_dib_frontend)
 
 add_library(torne_product STATIC
+    src/card/service.cpp
+    src/product/core_family.cpp
+    src/product/daemon_backend.cpp
     src/product/hardware_device.cpp
     src/product/runner.cpp)
 target_include_directories(torne_product PUBLIC
@@ -121,12 +129,13 @@ target_include_directories(torne_product PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated")
 target_link_libraries(torne_product PUBLIC
     torne_widen torne_core1 torne_core0 torne_dib_frontend torne_usb
-    dtv::host_ts)
+    torne_card_uart dtv::host_card_t1 dtv::host_ts dtv::host_tuner
+    dtv::host_listener_context dtv::host_runtime)
 torne_set_warnings(torne_product)
 
 add_executable(torne_torned src/torned/main.cpp)
 set_target_properties(torne_torned PROPERTIES OUTPUT_NAME torned)
-target_link_libraries(torne_torned PRIVATE torne_usb)
+target_link_libraries(torne_torned PRIVATE torne_product)
 torne_set_warnings(torne_torned)
 
 add_executable(torne_tornectl src/tornectl/main.cpp)
@@ -227,6 +236,20 @@ if(TORNE_BUILD_TESTS)
     add_test(NAME torne_core0_host_ts_tests
         COMMAND torne_core0_host_ts_tests)
 
+    add_executable(torne_product_daemon_tests tests/product_daemon_tests.cpp)
+    target_link_libraries(torne_product_daemon_tests
+        PRIVATE torne_product torne_daemon_core torne_ts_entry)
+    torne_set_warnings(torne_product_daemon_tests)
+    add_test(NAME torne_product_daemon_tests
+        COMMAND torne_product_daemon_tests)
+
+    add_executable(torne_product_core_family_tests
+        tests/product_core_family_tests.cpp)
+    target_link_libraries(torne_product_core_family_tests PRIVATE torne_product)
+    torne_set_warnings(torne_product_core_family_tests)
+    add_test(NAME torne_product_core_family_tests
+        COMMAND torne_product_core_family_tests)
+
     add_executable(torne_card_uart_tests tests/card_uart_tests.cpp)
     target_link_libraries(torne_card_uart_tests PRIVATE torne_card_uart)
     torne_set_warnings(torne_card_uart_tests)
@@ -236,6 +259,11 @@ if(TORNE_BUILD_TESTS)
     target_link_libraries(torne_product_entry_tests PRIVATE torne_product)
     torne_set_warnings(torne_product_entry_tests)
     add_test(NAME torne_product_entry_tests COMMAND torne_product_entry_tests)
+
+    add_executable(torne_card_service_tests tests/card_service_tests.cpp)
+    target_link_libraries(torne_card_service_tests PRIVATE torne_product)
+    torne_set_warnings(torne_card_service_tests)
+    add_test(NAME torne_card_service_tests COMMAND torne_card_service_tests)
 
     add_executable(torne_dib_frontend_tests tests/dib_frontend_tests.cpp)
     target_link_libraries(torne_dib_frontend_tests PRIVATE torne_dib_frontend)

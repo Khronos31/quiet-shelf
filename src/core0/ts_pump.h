@@ -40,12 +40,16 @@ public:
     ~TsPump() noexcept;
 
     int start(std::uint32_t epoch) noexcept;
-    int pump() noexcept;
+    // max_completions=0 preserves the unbounded drain used by tests/direct
+    // callers. A nonzero limit bounds one poll to that many callbacks so a
+    // consumer can drain its queue between bursts.
+    int pump(std::size_t max_completions = 0U) noexcept;
     int stop() noexcept;
     bool running() const noexcept { return running_; }
     std::uint32_t epoch() const noexcept { return epoch_; }
     const PumpStats& stats() const noexcept { return stats_; }
     std::size_t depth() const noexcept { return buffers_.size(); }
+    std::size_t active() const noexcept { return id_to_index_.size(); }
     std::size_t buffer_size() const noexcept { return buffer_size_; }
 
 private:

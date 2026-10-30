@@ -7,13 +7,13 @@
 ## dtv-userland-core
 
 - repository: `https://github.com/Khronos31/dtv-userland-core.git`
-- commit: `301c4593fc34702729750477d93f9d9e0051b0cb`（v1.0.1 の実体）
+- commit: `9d8e02c4f113568012e257ed46d72c9a55751958`（Card/T=1開発branch用の中間pin）
 - 固定箇所: `cmake/TorneCoreDependency.cmake`
 - 用途: `host_ctl`、`host_ts`、`identity`、`json`、`host_runtime`、
-  `host_facade` の既存 API。製品側で共通契約を複製しない。
+  `host_facade`、`host_card_t1` の既存 API。製品側でATR/T=1/APDU契約を複製しない。
 - ライセンス: Core リポジトリの `LICENSE` / `PROVENANCE.json` に従う。
   portable 部分は MIT、GPL adapter は GPL-2.0-only。
-- この commit は現時点の再現可能な参照であり、Core 整理後の最終 pin ではない。
+- この commit はCardService接続のための中間pinであり、最終5製品同pinではない。
 
 Core のソースは FetchContent で取得するか、`TORNE_CORE_SOURCE_DIR` で同じ
 commit を checkout 済みのツリーを指定する。生成物や取得物はこのリポジトリへ
@@ -46,7 +46,9 @@ vendor しない。
   `libusb_free_config_descriptor`、`libusb_claim_interface`、
   `libusb_release_interface`、`libusb_control_transfer`、
   `libusb_bulk_transfer`。いずれも公開 API。kernel driver の detach、reset、
-  set_configuration、非同期 transfer は使わない。
+  set_configuration は使わない。Core0 TsPumpは公開非同期API
+  （`libusb_alloc_transfer`/`libusb_submit_transfer`/`libusb_cancel_transfer`/
+  `libusb_handle_events_timeout_completed`）でbounded async bulkを受ける。
 - udev は無効化している。Linux の最終 ELF に libusb/libusb-1.0.so/libudev の
   動的依存が無いことを検査する。
 - CMake の cross target/sysroot/compiler 引数は libusb の configure へ渡す。
@@ -74,7 +76,7 @@ vendor しない。
   `driver/torne_fw_gen.h:221-245` に基づく。製品コードはhash/entry/語だけを保持し、
   旧画像のbyte列を製品FWやロード対象へ埋め込まない。
 - SHA-256はCoreの `include/dtv/userland/detail/sha256.h`（Core入力
-  `301c4593...`、MIT範囲）を使用する。外部runtime依存は増やしていない。
+  `9d8e02c4...`、MIT範囲）を使用する。外部runtime依存は増やしていない。
 - `tests/widen_recognition_tests.cpp` に置く85語/340Bの旧画像は、登録tupleの
   受理・変異試験専用の固定参照データであり、製品FWではない。出典は同じ
   `torne_drv` commitの `torne_addressing0_code[85]`（GPL-2.0-only、coax/Linux由来）。
@@ -162,7 +164,15 @@ vendor しない。
 - 境界: RXはCONSUMING_READ、TXはFIFO_WRITE、SEND/FIFO reset/IRQ clearは
   TRIGGERとして再送しない。不正・short・unknown後はセッションを無効化し、
   後続操作を止める。実カード、presence極性、FIFO上限、byte lane、ATR/T=1は
-  未実測。fake EP0/clockのみで検証し、製品daemon/CardServiceへは未接続。
+  未実測。fake EP0/clockのみで検証する。
+- `src/card/service.*` は製品UARTを共有Core **9d8e02c4** の公開
+  `CardHardware`/`CardTime`/`CardSession`/`CardProtocolSessionAdapter`へ接続する
+  自作host adapter。ATR構文・T=1・IFSD・EDC・R/S/WTX・APDUはCore既存APIに任せ、
+  製品側で複製しない。`src/product/hardware_device.cpp`が同じ単一Transportから
+  `CardPort`を公開し、`src/product/core_family.cpp`が`EnclosureFamily`の
+  card backend/protocolとして`CardService`へ渡す。
+- Core 9d8はMIT/GPL-2.0-onlyの既存Core sourceであり、製品は公開APIだけに依存
+  する。Coreの生成物や他製品sourceをvendorしない。
 
 ## DiB8096 C11 frontend
 
@@ -188,5 +198,5 @@ vendor しない。
 - 旧 Draft PR #1 のコード、生成 FR30、`torne_fw_gen.h`。
 - denpa / NeToRne のコード・生成物・調整値。
 - Linux カーネルモジュール、usbfs/udev/IOKit/WinUSB の直接利用。
-- daemon/listener とカードATR/T=1/CardService（PR18 Core/familyは本snapshotに含まない）。
+- 実機USBでのdaemon/listener起動とカードATR/T=1/CardService I/O（sourceは収録し、fake/CTestで確認する）。
 - CIでの実USB open/claim/tune/TS。通常buildはFR30画像を生成せず、追跡済み画像を使用する。

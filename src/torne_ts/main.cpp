@@ -239,5 +239,5 @@ int main(int argc, char** argv)
                      dtv::userland::error_string(result.error()));
         return px4_ts_exit_status(result.error(), failure_kind);
     }
-    return 0;
+    return torne::ts::finalize_ipc_success(result.value().counters, stderr);
 }

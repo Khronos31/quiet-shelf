@@ -29,10 +29,13 @@ public:
         const DaemonConfig& config) noexcept = 0;
 
     // Opens the single owned enclosure. The returned family is the exact
-    // dependency graph host_runtime/host_listener_context consumes later; this
-    // framework stops before assembling a listener.
+    // dependency graph host_runtime/host_listener_context consumes.
     virtual dtv::userland::Result<FamilyPtr> open_family(
         const DaemonConfig& config) noexcept = 0;
+
+    // True only when open_family supplied a real formal CardService backend,
+    // independent of whether a card is currently inserted.
+    virtual bool card_service_available() const noexcept { return false; }
 };
 
 }  // namespace torne::daemon

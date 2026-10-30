@@ -105,6 +105,7 @@ public:
 
     PresenceResult detect_card() noexcept;
     Result reset_card() noexcept;
+    Result reset_card(Clock& clock) noexcept;
     Result power_down() noexcept;
     CountResult data_ready() noexcept;
     ReadResult read_data(std::uint8_t* buffer, std::size_t length) noexcept;
@@ -122,6 +123,56 @@ private:
     usb::Transport& transport_;
     Clock& clock_;
     bool valid_ = true;
+};
+
+// Narrow electrical seam used by the formal Core CardHardware adapter. The
+// formal path takes the Core clock for the reset waits; tests can substitute
+// this interface without emulating EP0 registers.
+class Line {
+public:
+    virtual ~Line() noexcept = default;
+    virtual PresenceResult detect_card() noexcept = 0;
+    virtual Result reset_card(Clock& clock) noexcept = 0;
+    virtual Result power_down() noexcept = 0;
+    virtual CountResult data_ready() noexcept = 0;
+    virtual ReadResult read_data(std::uint8_t* buffer,
+                                 std::size_t length) noexcept = 0;
+    virtual Result write_data(const std::uint8_t* data,
+                              std::size_t length) noexcept = 0;
+    virtual Result set_baud_rate(std::uint32_t rate) noexcept = 0;
+    virtual void invalidate() noexcept = 0;
+    virtual bool valid() const noexcept = 0;
+};
+
+class UartLine final : public Line {
+public:
+    explicit UartLine(Uart& uart) noexcept : uart_(uart) {}
+    PresenceResult detect_card() noexcept override { return uart_.detect_card(); }
+    Result reset_card(Clock& clock) noexcept override
+    {
+        return uart_.reset_card(clock);
+    }
+    Result power_down() noexcept override { return uart_.power_down(); }
+    CountResult data_ready() noexcept override { return uart_.data_ready(); }
+    ReadResult read_data(std::uint8_t* buffer,
+                         std::size_t length) noexcept override
+    {
+        return uart_.read_data(buffer, length);
+    }
+    Result write_data(const std::uint8_t* data,
+                      std::size_t length) noexcept override
+    {
+        return uart_.write_data(data, length);
+    }
+    Result set_baud_rate(std::uint32_t rate) noexcept override
+    {
+        return uart_.set_baud_rate(rate);
+    }
+    void invalidate() noexcept override { uart_.invalidate(); }
+    bool valid() const noexcept override { return uart_.valid(); }
+
+private:
+    Uart& uart_;
 };
 
 }  // namespace torne::card

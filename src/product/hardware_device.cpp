@@ -6,6 +6,7 @@
 #include "core0/framer.h"
 #include "core0/host_runtime.h"
 #include "core0/ts_pump.h"
+#include "card/uart.h"
 #include "core1/host_runtime.h"
 #include "core1/i2c_backend_cpp.h"
 #include "dib/dib_frontend.h"
@@ -29,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -44,6 +46,13 @@ using dtv::userland::Result;
 constexpr std::uint32_t kCore0Epoch = 0x00040001U;
 constexpr std::size_t kQueueLimit = 1024U;
 
+bool diag_enabled() noexcept
+{
+    const char* value = std::getenv("TORNE_DAEMON_DIAG");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+
 class RuntimeClock final : public core1::Clock, public core0::Clock {
 public:
     explicit RuntimeClock(torne::product::Clock& clock) noexcept : clock_(clock) {}
@@ -58,6 +67,20 @@ public:
 
 private:
     torne::product::Clock& clock_;
+};
+
+class SystemClock final : public Clock {
+public:
+    std::uint64_t monotonic_ms() noexcept override
+    {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    void sleep_ms(std::uint32_t milliseconds) noexcept override
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+    }
 };
 
 class I2cFlushAdapter final : public core0::I2cFlush {
@@ -200,11 +223,34 @@ bool gpio_power_reset(widen::Ep0Io& io) noexcept
     return true;
 }
 
+class CardClock final : public card::Clock {
+public:
+    explicit CardClock(torne::product::Clock& clock) noexcept : clock_(clock) {}
+    std::uint64_t monotonic_ms() noexcept override
+    {
+        return clock_.monotonic_ms();
+    }
+    void sleep_ms(std::uint32_t milliseconds) noexcept override
+    {
+        clock_.sleep_ms(milliseconds);
+    }
+
+private:
+    torne::product::Clock& clock_;
+};
+
 class HardwareDevice final : public Device {
 public:
     HardwareDevice(std::unique_ptr<usb::Transport> transport, Clock& clock) noexcept
-        : transport_(std::move(transport)), clock_(clock), bridge_(*transport_),
-          runtime_clock_(clock), flush_(api_) {}
+        : transport_(std::move(transport)), clock_(clock), card_clock_(clock),
+          card_uart_(*transport_, card_clock_), card_line_(card_uart_),
+          bridge_(*transport_), runtime_clock_(clock), flush_(api_) {}
+    HardwareDevice(std::unique_ptr<usb::Transport> transport,
+                   std::unique_ptr<Clock> clock) noexcept
+        : owned_clock_(std::move(clock)), transport_(std::move(transport)),
+          clock_(*owned_clock_), card_clock_(*owned_clock_),
+          card_uart_(*transport_, card_clock_), card_line_(card_uart_),
+          bridge_(*transport_), runtime_clock_(*owned_clock_), flush_(api_) {}
 
     ~HardwareDevice() noexcept override { close(); }
 
@@ -214,9 +260,17 @@ public:
                       std::uint32_t timeout_ms) noexcept override;
     Result<void> start_stream() noexcept override;
     Result<void> stop_stream() noexcept override;
+    Result<void> stop_capture() noexcept override;
     Result<void> read_packet(std::array<std::uint8_t, 188U>& packet,
                              std::uint32_t timeout_ms) noexcept override;
+    Result<std::size_t> read_packets(std::uint8_t* output, std::size_t capacity,
+                                     std::uint32_t timeout_ms) noexcept override;
     Result<Status> status() noexcept override;
+    Result<StreamStats> stream_stats() noexcept override;
+    CardPort card_port() noexcept override
+    {
+        return CardPort{&card_line_, &card_clock_};
+    }
     void close() noexcept override;
 
 private:
@@ -240,8 +294,12 @@ private:
     void enqueue(const std::uint8_t* data, std::size_t length) noexcept;
     void reset_device() noexcept;
 
+    std::unique_ptr<Clock> owned_clock_;
     std::unique_ptr<usb::Transport> transport_;
     torne::product::Clock& clock_;
+    CardClock card_clock_;
+    card::Uart card_uart_;
+    card::UartLine card_line_;
     widen::Bridge bridge_;
     RuntimeClock runtime_clock_;
     torne_i2c_backend api_{};
@@ -257,9 +315,10 @@ private:
     core0::Runtime core0_;
     bool core0_started_ = false;
     bool core0_start_attempted_ = false;
-    std::uint64_t reported_dropped_ = 0U;
     std::atomic<std::uint64_t> stream_packets_{0U};
     std::atomic<std::uint64_t> stream_bytes_{0U};
+    std::atomic<bool> diag_read_logged_{false};
+    std::atomic<bool> diag_drop_logged_{false};
     std::uint32_t core1_session_ = 0U;
     PacketQueue queue_{kQueueLimit};
     bool closed_ = false;
@@ -355,34 +414,54 @@ Result<void> HardwareDevice::start_stream() noexcept
     stream_packets_.store(0U);
     stream_bytes_.store(0U);
     queue_.reset();
-    reported_dropped_ = 0U;
     pump_.reset(new core0::TsPump(*transport_, framer_, runtime_clock_, 16U,
                                   65536U, packet_sink, this));
     const core0::Result started = core0_.start(
         bridge_, *transport_, core0_image_, kCore0Epoch, true, flush_,
         runtime_clock_, *pump_);
-    if (!started.ok) return fail(Error::PROTOCOL_ERROR);
+    if (!started.ok) {
+        if (diag_enabled())
+            std::fprintf(stderr,
+                "torne-diag hw start error stage=%u error=%u input_open=%u active=%zu\n",
+                static_cast<unsigned>(started.stage),
+                static_cast<unsigned>(started.error),
+                static_cast<unsigned>(started.input_open),
+                pump_ ? pump_->active() : 0U);
+        return fail(Error::PROTOCOL_ERROR);
+    }
     core0_started_ = true;
+    return Result<void>::success();
+}
+
+Result<void> HardwareDevice::stop_capture() noexcept
+{
+    if (!core0_started_ && !core0_start_attempted_)
+        return Result<void>::success();
+    const core0::Result stopped = core0_.stop(bridge_, *pump_);
+    if (diag_enabled())
+        std::fprintf(stderr,
+            "torne-diag hw stop_capture ok=%u stage=%u error=%u active=%zu running=%u\n",
+            static_cast<unsigned>(stopped.ok),
+            static_cast<unsigned>(stopped.stage),
+            static_cast<unsigned>(stopped.error),
+            pump_ ? pump_->active() : 0U,
+            static_cast<unsigned>(pump_ && pump_->running()));
+    if (!stopped.ok) return fail(Error::USB_IO);
+    core0_started_ = false;
+    core0_start_attempted_ = false;
     return Result<void>::success();
 }
 
 Result<void> HardwareDevice::stop_stream() noexcept
 {
-    Result<void> result = Result<void>::success();
+    Result<void> result = stop_capture();
     const auto retain = [&result](Error error) noexcept {
         if (result) result = fail(error);
     };
-    if (core0_started_ || core0_start_attempted_) {
-        const core0::Result stopped = core0_.stop(bridge_, *pump_);
-        if (stopped.ok) {
-            core0_started_ = false;
-            core0_start_attempted_ = false;
-        } else {
-            retain(Error::USB_IO);
-        }
-    }
     if (dib_initialized_) {
         const int slept = torne_dib_frontend_sleep(&dib_);
+        if (diag_enabled())
+            std::fprintf(stderr, "torne-diag hw dib_sleep rc=%d\n", slept);
         if (slept == 0) {
             dib_initialized_ = false;
         } else {
@@ -391,6 +470,12 @@ Result<void> HardwareDevice::stop_stream() noexcept
     }
     if (core1_started_) {
         const core1::Result stopped = core1_.stop(bridge_);
+        if (diag_enabled())
+            std::fprintf(stderr,
+                "torne-diag hw core1_stop ok=%u stage=%u error=%u\n",
+                static_cast<unsigned>(stopped.ok),
+                static_cast<unsigned>(stopped.stage),
+                static_cast<unsigned>(stopped.error));
         if (stopped.ok) {
             core1_started_ = false;
         } else {
@@ -406,19 +491,84 @@ Result<void> HardwareDevice::read_packet(
     if (!core0_started_ || !pump_) return fail(Error::NOT_READY);
     const std::uint64_t start = clock_.monotonic_ms();
     for (;;) {
-        if (pump_->pump() < 0) return fail(Error::USB_IO);
-        {
-            const std::uint64_t dropped = queue_.dropped();
-            if (dropped != reported_dropped_) {
-                reported_dropped_ = dropped;
-                return fail(Error::SLOW_CONSUMER);
-            }
-            if (queue_.pop(packet)) return Result<void>::success();
+        if (pump_->pump(1U) < 0) {
+            if (diag_enabled() && !diag_read_logged_.exchange(true))
+                std::fprintf(stderr,
+                    "torne-diag hw read error=USB_IO dropped=%llu packets=%llu bytes=%llu queue=%zu\n",
+                    static_cast<unsigned long long>(queue_.dropped()),
+                    static_cast<unsigned long long>(stream_packets_.load()),
+                    static_cast<unsigned long long>(stream_bytes_.load()),
+                    queue_.size());
+            return fail(Error::USB_IO);
         }
+        if (queue_.dropped() != 0U && diag_enabled() &&
+            !diag_drop_logged_.exchange(true)) {
+            std::fprintf(stderr,
+                "torne-diag hw queue_drop dropped=%llu packets=%llu bytes=%llu queue=%zu\n",
+                static_cast<unsigned long long>(queue_.dropped()),
+                static_cast<unsigned long long>(stream_packets_.load()),
+                static_cast<unsigned long long>(stream_bytes_.load()),
+                queue_.size());
+        }
+        if (queue_.pop(packet)) return Result<void>::success();
         if (clock_.monotonic_ms() - start >= timeout_ms)
             return fail(Error::TIMEOUT);
         clock_.sleep_ms(1U);
     }
+}
+
+Result<std::size_t> HardwareDevice::read_packets(
+    std::uint8_t* output, std::size_t capacity,
+    std::uint32_t timeout_ms) noexcept
+{
+    if (!core0_started_ || !pump_)
+        return Result<std::size_t>::failure(Error::NOT_READY);
+    if (output == nullptr || capacity < 188U)
+        return Result<std::size_t>::failure(Error::BUFFER_TOO_SMALL);
+    const std::size_t usable = capacity - (capacity % 188U);
+    const std::uint64_t start = clock_.monotonic_ms();
+    std::size_t bytes = 0U;
+    for (;;) {
+        if (pump_->pump(1U) < 0) {
+            if (bytes != 0U) return Result<std::size_t>::success(bytes);
+            if (diag_enabled() && !diag_read_logged_.exchange(true))
+                std::fprintf(stderr,
+                    "torne-diag hw read error=USB_IO dropped=%llu packets=%llu bytes=%llu queue=%zu\n",
+                    static_cast<unsigned long long>(queue_.dropped()),
+                    static_cast<unsigned long long>(stream_packets_.load()),
+                    static_cast<unsigned long long>(stream_bytes_.load()),
+                    queue_.size());
+            return Result<std::size_t>::failure(Error::USB_IO);
+        }
+        if (queue_.dropped() != 0U && diag_enabled() &&
+            !diag_drop_logged_.exchange(true)) {
+            std::fprintf(stderr,
+                "torne-diag hw queue_drop dropped=%llu packets=%llu bytes=%llu queue=%zu\n",
+                static_cast<unsigned long long>(queue_.dropped()),
+                static_cast<unsigned long long>(stream_packets_.load()),
+                static_cast<unsigned long long>(stream_bytes_.load()),
+                queue_.size());
+        }
+        while (bytes + 188U <= usable) {
+            std::array<std::uint8_t, 188U> packet{};
+            if (!queue_.pop(packet)) break;
+            std::memcpy(output + bytes, packet.data(), packet.size());
+            bytes += packet.size();
+        }
+        if (bytes != 0U) return Result<std::size_t>::success(bytes);
+        if (clock_.monotonic_ms() - start >= timeout_ms)
+            return Result<std::size_t>::failure(Error::TIMEOUT);
+        clock_.sleep_ms(1U);
+    }
+}
+
+Result<StreamStats> HardwareDevice::stream_stats() noexcept
+{
+    StreamStats stats;
+    stats.packets = stream_packets_.load();
+    stats.bytes = stream_bytes_.load();
+    stats.dropped = queue_.dropped();
+    return Result<StreamStats>::success(stats);
 }
 
 Result<Status> HardwareDevice::status() noexcept
@@ -459,6 +609,7 @@ void HardwareDevice::reset_device() noexcept
     }
     i2c_.reset();
     dib_initialized_ = false;
+    card_line_.invalidate();
     transport_.reset();
 }
 
@@ -477,12 +628,18 @@ Result<std::unique_ptr<Device>> open_hardware(
 {
     const auto selector =
         dtv::userland::identity::parse_device_selector(usb_selector);
-    if (!selector ||
-        selector.value().kind !=
-            dtv::userland::identity::SelectorKind::usb_topology)
+    if (!selector)
+        return Result<std::unique_ptr<Device>>::failure(Error::INVALID_ARGUMENT);
+    return open_hardware(selector.value(), clock);
+}
+
+Result<std::unique_ptr<Device>> open_hardware(
+    const dtv::userland::identity::Selector& selector, Clock& clock) noexcept
+{
+    if (selector.kind != dtv::userland::identity::SelectorKind::usb_topology)
         return Result<std::unique_ptr<Device>>::failure(Error::INVALID_ARGUMENT);
     usb::DeviceLocation location;
-    if (!usb::location_from_selector(selector.value(), location))
+    if (!usb::location_from_selector(selector, location))
         return Result<std::unique_ptr<Device>>::failure(Error::INVALID_ARGUMENT);
     auto opened = usb::Transport::open(usb::create_libusb_io(), location);
     if (opened.outcome.state != usb::OpenState::ok || !opened.transport)
@@ -490,6 +647,29 @@ Result<std::unique_ptr<Device>> open_hardware(
 
     std::unique_ptr<HardwareDevice> device(
         new HardwareDevice(std::move(opened.transport), clock));
+    const Result<void> started = device->startup();
+    if (!started) {
+        device->close();
+        return Result<std::unique_ptr<Device>>::failure(started.error());
+    }
+    return Result<std::unique_ptr<Device>>::success(std::move(device));
+}
+
+Result<std::unique_ptr<Device>> open_hardware(
+    const dtv::userland::identity::Selector& selector) noexcept
+{
+    if (selector.kind != dtv::userland::identity::SelectorKind::usb_topology)
+        return Result<std::unique_ptr<Device>>::failure(Error::INVALID_ARGUMENT);
+    usb::DeviceLocation location;
+    if (!usb::location_from_selector(selector, location))
+        return Result<std::unique_ptr<Device>>::failure(Error::INVALID_ARGUMENT);
+    auto opened = usb::Transport::open(usb::create_libusb_io(), location);
+    if (opened.outcome.state != usb::OpenState::ok || !opened.transport)
+        return Result<std::unique_ptr<Device>>::failure(Error::USB_IO);
+
+    std::unique_ptr<Clock> clock(new SystemClock());
+    std::unique_ptr<HardwareDevice> device(
+        new HardwareDevice(std::move(opened.transport), std::move(clock)));
     const Result<void> started = device->startup();
     if (!started) {
         device->close();

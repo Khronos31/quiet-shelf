@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "torned/config.h"
+#include "product/daemon_backend.h"
 #include "torned/daemon.h"
-#include "usb/backend.h"
 
 #include <cstdio>
 
@@ -40,6 +40,6 @@ int main(int argc, char** argv)
         std::printf("torned %s\n", TORNE_USERLAND_PRODUCT_VERSION);
         return 0;
     }
-    torne::usb::UsbBackend backend;
+    torne::product::DaemonBackend backend;
     return torne::daemon::run_daemon(parsed.config, &backend, stdout, stderr);
 }

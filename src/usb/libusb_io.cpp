@@ -3,6 +3,7 @@
 
 #include <libusb.h>
 
+#include <atomic>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -262,7 +263,7 @@ public:
     {
         int result = 0;
         for (auto& entry : async_) {
-            if (!entry.second->completed &&
+            if (!entry.second->completed.load(std::memory_order_acquire) &&
                 libusb_cancel_transfer(entry.second->transfer) != LIBUSB_SUCCESS)
                 result = -1;
         }
@@ -276,7 +277,7 @@ public:
         (void)libusb_handle_events_timeout_completed(context_, &timeout, nullptr);
         for (auto item = async_.begin(); item != async_.end(); ++item) {
             AsyncTransfer& transfer = *item->second;
-            if (!transfer.completed) continue;
+            if (!transfer.completed.load(std::memory_order_acquire)) continue;
             event.id = transfer.id;
             event.data = transfer.data;
             event.length = transfer.length;
@@ -297,7 +298,7 @@ public:
     {
         if (async_.empty()) return 0;
         for (auto& entry : async_) {
-            if (!entry.second->completed)
+            if (!entry.second->completed.load(std::memory_order_acquire))
                 (void)libusb_cancel_transfer(entry.second->transfer);
         }
         const int attempts = static_cast<int>(timeout_ms / 10U) + 1;
@@ -306,7 +307,7 @@ public:
             if (context_ != nullptr)
                 (void)libusb_handle_events_timeout_completed(context_, &timeout, nullptr);
             for (auto item = async_.begin(); item != async_.end();) {
-                if (!item->second->completed) {
+                if (!item->second->completed.load(std::memory_order_acquire)) {
                     ++item;
                     continue;
                 }
@@ -384,7 +385,11 @@ private:
         libusb_transfer* transfer = nullptr;
         std::uint8_t* data = nullptr;
         std::size_t length = 0U;
-        bool completed = false;
+        // The callback publishes the outcome with a release store and poll/
+        // drain acquire it before freeing the item or libusb_transfer. This
+        // keeps a synchronous control transfer that runs libusb callbacks from
+        // exposing a half-written outcome to the TS poll thread.
+        std::atomic<bool> completed{false};
         TransferOutcome outcome{};
     };
 
@@ -392,7 +397,6 @@ private:
     {
         auto* item = static_cast<AsyncTransfer*>(transfer->user_data);
         if (item == nullptr) return;
-        item->completed = true;
         item->outcome.cause = cause_for_transfer_status(transfer->status);
         item->outcome.transferred = transfer->actual_length;
         if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
@@ -403,6 +407,7 @@ private:
         } else {
             item->outcome.state = TransferState::failed;
         }
+        item->completed.store(true, std::memory_order_release);
     }
 
     libusb_context* context_ = nullptr;

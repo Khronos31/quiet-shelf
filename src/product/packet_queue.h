@@ -46,6 +46,12 @@ public:
         return dropped_;
     }
 
+    std::size_t size() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
     void reset() noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);

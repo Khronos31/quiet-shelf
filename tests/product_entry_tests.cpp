@@ -251,6 +251,9 @@ void test_packet_queue_is_bounded_and_counts_drops()
     CHECK(queue.pop(output));
     CHECK(output[0] == 5U);
     CHECK(!queue.pop(output));
+    queue.reset();
+    CHECK(queue.dropped() == 0U);
+    CHECK(!queue.pop(output));
 }
 
 void test_start_failure_stops()

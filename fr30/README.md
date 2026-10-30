@@ -155,7 +155,7 @@ build_idは `+0x08` を0にした画像のSHA-256先頭4Bで、2回のリンク�
 - CTRL/STAT: session、NOP `cmd_seq`/`cmd_ack_seq`、heartbeat、8slot I²C ring、`i2c_progress`のbit31 HALTED、HALTED/resume。
 - I²C: busy待ち、START/repeated START、ACK/NACK、READ/WRITE/WRITE_READ、最大32B、STOP後idle、byte poll `0x40000`。ADDR/DATA NACK、BUS_ERROR、TIMEOUT、BUS_BUSY、INVALID、TORNを結果コードと段階で返す。
 - HALTEDでは新規要求を取らず、CONTINUE/DISCARDを`i2c_resume`のindex/action/serialで処理する。DISCARDは受理時の`CTRL.i2c_req_prod`で対象範囲を固定し、全SKIPPED完了を公開するまで`STAT.state`と`i2c_progress`のHALTED bitを維持し、`resume_ack`も完了後まで更新しない。CONTINUEも解除の公開後にackを出す。
-- hostのS4（I²C master初期化）はCoreへ移していない。通常build/daemonはCore 1 RUNを自動接続しない。直接CLIの起動経路はCore 1/Core 0を起動する。
+- hostのS4（I²C master初期化）はCoreへ移していない。通常buildは追跡画像だけを消費する。通常daemonの`torned --device`起動はCore 1 HOLD/S4/load/RUNとCore 0を接続する（fake/CTestまで、実機I/Oは測定担当）。CIは実機open/claim/RUN/TSを行わない。
 
 生成は明示targetで行う。通常buildは追跡画像を消費するだけで、クロスアセンブラを要求しない。
 
