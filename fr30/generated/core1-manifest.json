@@ -1,0 +1,21 @@
+{
+  "format": "torne-core1-manifest-v1",
+  "status": "candidate-unverified-on-device",
+  "source": "fr30/src/core1.s",
+  "source_sha256": "ebcea142133f63766b1664f4449d6ea124498ae25c94811dce93a0c812d118da",
+  "linker": "fr30/ld/core1.ld",
+  "linker_sha256": "86eb8ed001ef7df9e88aa8ea8952770e5fc0b0124d3bc65ba917d29226499f90",
+  "tool": "GNU binutils 2.47 fr30-elf",
+  "base": "0x000a0000",
+  "entry": "0x000a0000",
+  "image_bytes": 1924,
+  "build_id": "0xfc662bd9",
+  "bin_file": "core1.bin",
+  "bin_sha256": "0e02c9468936bb4411323939baca42e1dc85559e29da632cc186998e6a0ea202",
+  "elf_file": "core1.elf",
+  "elf_sha256": "5aa546560a420a5aee8ef188ce530d15ad39ac9ecf52993e43edd899aa2d5574",
+  "stack": {"start": "0x000a3000", "initial_sp": "0x000a37fc"},
+  "shared": {"base": "0x000a3800", "end_exclusive": "0x000a4000"},
+  "reset_vector": {"host": "0x017ffffc", "local": "0x000ffffc", "value": "0x000a0000"},
+  "note": "Candidate only. Host S4, HOLD/RUN, V-MEM and V-C1 were not executed."
+}

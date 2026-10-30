@@ -2,9 +2,9 @@
 
 このディレクトリは、製品に将来同梱するFR30機械語を、固定したGNU binutilsと
 自作ソースから再生成・検査するための土台を示す。**この増分にはWidenの
-read/write handler候補の自作ソースと両bank画像がある。Core 0 / Core 1の
-ファームウェア、ROMパッチの適用、共有RAM配置はない。** 通常のCMakeビルドと
-配布物は、クロスアセンブラを要求しない。
+read/write handler候補と両bank画像、Core 1 I²CとCore 0 TS搬送の候補ソース・
+画像がある。ROMパッチの適用、Coreの実機起動、TS受信はまだない。**
+通常のCMakeビルドと配布物は、クロスアセンブラを要求しない。
 
 ## 固定入力
 
@@ -57,11 +57,16 @@ ctest --test-dir build --output-on-failure
 ```sh
 cmake -S . -B build-fr30 -G Ninja -DTORNE_FR30_BINUTILS_DIR=/path/to/binutils-build
 cmake --build build-fr30 --target torne_fr30_generate
+cmake --build build-fr30 --target torne_fr30_widen
+cmake --build build-fr30 --target torne_fr30_core1
+cmake --build build-fr30 --target torne_fr30_core0
 ```
 
-同じツールを指定してconfigureした場合だけ、`torne_fr30_generation`テストが
-CTestへ登録される。targetとテストは同じ`cmake/fr30_generate.cmake`を使い、
-2つの独立した出力ディレクトリへ生成してbyte一致を確認する。
+同じツールを指定してconfigureした場合だけ、`torne_fr30_generation`、
+`torne_widen_firmware`、`torne_core1_firmware`、`torne_core0_firmware`テストが
+CTestへ登録される。
+各targetとテストは対応する生成scriptで、2つの独立した出力ディレクトリへ
+生成してbyte一致を確認する。
 
 ## 検査対象のfixture
 
@@ -131,26 +136,93 @@ build_idは `+0x08` を0にした画像のSHA-256先頭4Bで、2回のリンク�
 候補であり、独立した実機観測ではない。ホストloader、ROMパッチ適用、実機
 ロードはこの増分に含めず、通常起動で自動ロードしない。
 
+## Core 1 I²C候補
+
+`fr30/src/core1.s` は、契約v0.2.2のCore 1 I²C初版を実装する自作FR30候補である。`fr30/ld/core1.ld` がコードを`0xA0000`へ置き、code+const 12KiB、stack `0xA3000`、shared data `0xA3800`、4B整列、entryをASSERTする。`fr30/generated/` に追跡する。
+
+| ファイル | 内容 |
+| --- | --- |
+| `src/core1.s` | 起動INFO、CTRL/STAT、session/heartbeat、NOP ack、8slot ring、byte I²C、HALTED/resume |
+| `ld/core1.ld` | entry `0xA0000`、12KiB上限、stack/shared非重複、4B整列 |
+| `generated/core1.elf`、`.bin` | ELF32/BE/EM_FR30とraw image |
+| `generated/core1-images.h` | byte配列、entry、build_id、SHA-256 |
+| `generated/core1-manifest.json` | source/linker/tool、画像hash、配置 |
+
+処理は契約§2.6/§3/§5/§7/§9.1の候補で、byte制御値・poll上限は固定coax `b118c14f` の`core1prog.go:28-113`と`regs/usb.go`に由来する。
+
+- INFO: magic `0x54493243`を最後、ABI `0x00010000`、build_id、`I2C_RING`、session echo、image_bytes、data_base `0xA3800`、param0 `0x40000`。
+- CTRL/STAT: session、NOP `cmd_seq`/`cmd_ack_seq`、heartbeat、8slot I²C ring、`i2c_progress`のbit31 HALTED、HALTED/resume。
+- I²C: busy待ち、START/repeated START、ACK/NACK、READ/WRITE/WRITE_READ、最大32B、STOP後idle、byte poll `0x40000`。ADDR/DATA NACK、BUS_ERROR、TIMEOUT、BUS_BUSY、INVALID、TORNを結果コードと段階で返す。
+- HALTEDでは新規要求を取らず、CONTINUE/DISCARDを`i2c_resume`のindex/action/serialで処理する。DISCARDは受理時の`CTRL.i2c_req_prod`で対象範囲を固定し、全SKIPPED完了を公開するまで`STAT.state`と`i2c_progress`のHALTED bitを維持し、`resume_ack`も完了後まで更新しない。CONTINUEも解除の公開後にackを出す。
+- hostのS4（I²C master初期化）はCoreへ移していない。通常起動へCore 1 RUNを自動接続しない。
+
+生成は明示targetで行う。通常buildは追跡画像を消費するだけで、クロスアセンブラを要求しない。
+
+```sh
+cmake -S . -B build-fr30 -G Ninja -DTORNE_FR30_BINUTILS_DIR=/path/to/binutils-build
+cmake --build build-fr30 --target torne_fr30_core1
+```
+
+ツール指定時だけCTest `torne_core1_firmware`が登録され、別出力で2回生成してbyte一致、追跡物一致、ELF32/BE/EM_FR30/entry `0xA0000`、4B整列、12KiB上限、build_idの0欄hash、容量超過・不正entryの拒否を確認する。`tests/core1_model.py`は開発者向けの任意モデルで、boot/INFO、WRITE/READ/WRITE_READ、32B、TORN、ADDR/DATA NACK、CONTINUE/DISCARDを確認する。CTestの必須条件ではない。
+
+**この画像は実CPUで動かしていない。** I²C MMIO値、byte poll時間、`A3800-A3FFF`のRAM実在・連続性、HOLD/RUN/vector、Core 1の実起動・NOP・I²Cは未確認である。V-MEM/V-C1は別の許可・担当で行う。
+
+## Core 0 TS搬送候補
+
+`fr30/src/core0.s` は、契約v0.2.2 §2/§4/§5/§7/§9.1のCore 0初版を実装する自作FR30候補である。`fr30/ld/core0.ld` がコードを`0xA0000`へ置き、code+const 12KiB、stack `0xA3000`、shared data `0xA3800`、4B整列、entryをASSERTする。`fr30/generated/` に追跡する。
+
+| ファイル | 内容 |
+| --- | --- |
+| `src/core0.s` | 起動INFO/CTRL/STAT、session/epoch/heartbeat/NOP/FAULT、内部DMA停止の有界待ち、FIFO/refill/packetizer、writer limit更新 |
+| `ld/core0.ld` | entry `0xA0000`、12KiB上限、stack/shared非重複、4B整列 |
+| `generated/core0.elf`、`.bin` | ELF32/BE/EM_FR30とraw image |
+| `generated/core0-images.h` | byte配列、entry、build_id、SHA-256 |
+| `generated/core0-manifest.json` | source/linker/tool、画像hash、配置 |
+
+処理は契約§2.6/§4/§5/§7/§9.1の候補で、内部DMA/FIFO/packetizerの初期値とevent bitは固定coax `b118c14f` の`core0prog.go:25-137`と`stream.go:160-173`に由来する。
+
+- INFO: magic `0x54545330`を最後、ABI `0x00010000`、build_id、`TS_RING`、session echo、image_bytes、data_base `0xA3800`、param0 FIFO容量 `0x840`。
+- CTRL: `session`の上位16bit非0、`stream_epoch`、`ring_base`/`ring_size`/`unit_size=192`、`writer_offset_reg`/`read_limit_reg`、`margin`、`report_every`を起動時に一度読み、不正なら`F_BAD_CTRL`でFAULT。
+- BOOT: 内部DMAの停止要求を`0x1068 & 0x300`で確認する。待ちは実装上の回数上限を持ち、超えたら`F_DMA_QUIESCE`でFAULT。現在のwriter offsetを読み位置と読み上限の初期値にする。
+- ループ: heartbeat、NOP応答、event bit29のrefill完了ACK、writer offsetからDMA読み上限を更新、FIFO空きが`0x470`を超えたら`0x460`補充、event bit5とpacketizer idleで192B単位を送出、`report_every`単位ごとに読取り位置−`margin`をwriter limitへ反映、`max_fill`/`near_full`を更新。
+- STAT: `epoch_echo`をRUNNING前に書き、`units_sent`/`refills`/`last_event`/`write_off`/`read_off`/水位を診断用に公開する。FAULT後はデータ経路へ触れず、heartbeatとNOP応答だけを続ける。
+- 初期補充はSTATの`refills`に数えない（固定sourceのdebug counterに合わせる）。refillの完了はevent bit29で受ける。
+
+生成は明示targetで行う。通常buildは追跡画像を消費するだけで、クロスアセンブラを要求しない。
+
+```sh
+cmake -S . -B build-fr30 -G Ninja -DTORNE_FR30_BINUTILS_DIR=/path/to/binutils-build
+cmake --build build-fr30 --target torne_fr30_core0
+```
+
+ツール指定時だけCTest `torne_core0_firmware`が登録され、別出力で2回生成してbyte一致、追跡物一致、ELF32/BE/EM_FR30/entry `0xA0000`、4B整列、12KiB上限、build_idの0欄hash、容量超過・不正entryの拒否を確認する。`tests/core0_model.py`は開発者向けの任意モデルで、boot/INFO、不正CTRL、DMA停止不能、ring wrap、refill、192B送出、10単位のlimit更新を確認する。CTestの必須条件ではない。
+
+**この画像は実CPUで動かしていない。** 内部DMA/FIFO/packetizerの値を含め、Core 0の実起動・INFO/heartbeat、SDRAMリングからの搬送、192B→188B、writer limitの実時間、HOLD後のDMA挙動は未確認である。V-C0は測定担当が行う。
+
 ## 将来の配布FWの位置と生成経路
 
-Widenは上記のとおり実ファイルを持つ。Core 0 / Core 1はまだ追加していない。
+Widen、Core 1、Core 0は上記のとおり実ファイルを持つ。
 将来の対象も同じ配置に揃える。
 
 ```text
 fr30/
 ├── README.md
 ├── src/widen.s                # 実装済み候補
-├── src/<core-target>.s        # Core 0 / Core 1（未追加）
+├── src/core1.s                # 実装済み候補
+├── src/core0.s                # 実装済み候補
 ├── ld/widen-bank0.ld          # 実装済み
 ├── ld/widen-bank1.ld          # 実装済み
-├── ld/<core-target>.ld        # 未追加
+├── ld/core1.ld                # 実装済み
+├── ld/core0.ld                # 実装済み
 ├── generated/widen-bank0.*    # 実装済みの追跡生成物
 ├── generated/widen-bank1.*    # 実装済みの追跡生成物
-└── generated/widen-images.h   # 埋込用の両画像
+├── generated/core1.*          # 実装済みの追跡生成物
+├── generated/core0.*          # 実装済みの追跡生成物
+└── generated/widen-images.h   # 埋込用のWiden両画像
 ```
 
-- Coreは`core0`、`core1`を独立に持つ。同じローカル番地でも別の物理CPUなので
-  別データにする。
+- Core 0とCore 1は独立に持つ。同じローカル番地でも別の物理CPUなので
+  別データにする。どちらも実装済み候補で、実機確認は別工程。
 - 生成は各対象の`.s`と`.ld`に固定binutilsを使い、`as --fatal-warnings` →
   `ld -m elf32fr30 -T ... -nostdlib` → `objcopy -O binary`の順で行う。
   生成物のSHA-256、入力hash、パッチ語をmanifestへ記録する。
@@ -162,7 +234,7 @@ fr30/
 
 ## この増分で決めないこと
 
-- Core 0 / Core 1の処理内容・ソース・画像
+- Core 0の実機起動・TS受信・DMA/FIFO挙動、Core 1の実機起動・NOP・I²C、I²C MMIO値・poll時間、Core RAMの実在・連続性
 - Widenの実機動作、ROM互換性、バンク1の未使用性・実容量、32bit/64B書込み
 - ROMパッチの適用、バンク切替手順、ホストloader
 - 共有RAMの容量・配置、メールボックス/レジスタの確定値

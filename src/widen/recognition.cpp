@@ -221,6 +221,8 @@ RecognitionResult recognize_read_only(Ep0Reader& reader,
         }
         five.push_back(read.value);
     }
+    for (std::size_t index = 0U; index < five.size(); ++index)
+        result.five[index] = five[index];
 
     bool pristine = true;
     for (std::size_t index = 0U; index < five.size(); ++index) {
@@ -239,6 +241,7 @@ RecognitionResult recognize_read_only(Ep0Reader& reader,
     }
     std::size_t matches = 0U;
     WidenState matched_state = WidenState::unknown;
+    const RegisteredImage* matched_image = nullptr;
     if (current != nullptr && valid_twdn_record(*current) &&
         matches_twdn_five(five, *current)) {
         const Verify verified = verify_twdn(reader, *current, result);
@@ -246,6 +249,7 @@ RecognitionResult recognize_read_only(Ep0Reader& reader,
         if (verified == Verify::match) {
             ++matches;
             matched_state = WidenState::ours_active;
+            matched_image = current;
         }
     }
     for (std::size_t index = 0U; index < known_count; ++index) {
@@ -258,6 +262,7 @@ RecognitionResult recognize_read_only(Ep0Reader& reader,
             if (verified == Verify::match) {
                 ++matches;
                 matched_state = WidenState::foreign_known;
+                matched_image = &image;
             }
         } else if (image.format == ImageFormat::twdn) {
             if (!valid_twdn_record(image) || !matches_twdn_five(five, image))
@@ -267,12 +272,14 @@ RecognitionResult recognize_read_only(Ep0Reader& reader,
             if (verified == Verify::match) {
                 ++matches;
                 matched_state = WidenState::foreign_known;
+                matched_image = &image;
             }
         }
     }
 
     result.classified = true;
     result.state = matches == 1U ? matched_state : WidenState::unknown;
+    result.matched = matches == 1U ? matched_image : nullptr;
     result.stage = RecognitionStage::image;
     result.failure = usb::TransferOutcome{};
     return result;

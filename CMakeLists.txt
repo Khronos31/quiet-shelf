@@ -80,9 +80,24 @@ torne_set_warnings(torne_usb)
 
 add_library(torne_widen STATIC
     src/widen/bridge.cpp
+    src/widen/loader.cpp
     src/widen/recognition.cpp)
 target_link_libraries(torne_widen PUBLIC torne_usb)
 torne_set_warnings(torne_widen)
+
+add_library(torne_core1 STATIC
+    src/core1/host_runtime.cpp
+    src/core1/i2c_backend.cpp)
+target_link_libraries(torne_core1 PUBLIC torne_widen)
+torne_set_warnings(torne_core1)
+
+add_library(torne_dib_frontend STATIC
+    src/dib/dib_frontend.c
+    src/dib/torne_dib.c
+    src/dib/torne_i2c_adapter.c)
+target_include_directories(torne_dib_frontend PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+torne_set_warnings(torne_dib_frontend)
 
 add_executable(torne_torned src/torned/main.cpp)
 set_target_properties(torne_torned PROPERTIES OUTPUT_NAME torned)
@@ -120,6 +135,24 @@ add_custom_target(torne_fr30_widen
     COMMENT "Generating tracked Widen candidate images with explicit GNU binutils"
     VERBATIM)
 
+add_custom_target(torne_fr30_core1
+    COMMAND ${CMAKE_COMMAND}
+        -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+        -DTORNE_CORE1_OUTPUT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
+        -DTORNE_CORE1_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-core1-scratch
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_core1.cmake"
+    COMMENT "Generating tracked Core 1 candidate image with explicit GNU binutils"
+    VERBATIM)
+
+add_custom_target(torne_fr30_core0
+    COMMAND ${CMAKE_COMMAND}
+        -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+        -DTORNE_CORE0_OUTPUT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
+        -DTORNE_CORE0_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-core0-scratch
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_core0.cmake"
+    COMMENT "Generating tracked Core 0 candidate image with explicit GNU binutils"
+    VERBATIM)
+
 if(TORNE_BUILD_TESTS)
     enable_testing()
 
@@ -148,6 +181,32 @@ if(TORNE_BUILD_TESTS)
     torne_set_warnings(torne_widen_recognition_tests)
     add_test(NAME torne_widen_recognition_tests COMMAND torne_widen_recognition_tests)
 
+    add_executable(torne_core1_host_runtime_tests
+        tests/core1_host_runtime_tests.cpp)
+    target_link_libraries(torne_core1_host_runtime_tests PRIVATE torne_core1)
+    torne_set_warnings(torne_core1_host_runtime_tests)
+    add_test(NAME torne_core1_host_runtime_tests
+        COMMAND torne_core1_host_runtime_tests)
+
+    add_executable(torne_core1_i2c_backend_tests
+        tests/core1_i2c_backend_tests.cpp)
+    target_link_libraries(torne_core1_i2c_backend_tests PRIVATE torne_core1)
+    torne_set_warnings(torne_core1_i2c_backend_tests)
+    add_test(NAME torne_core1_i2c_backend_tests
+        COMMAND torne_core1_i2c_backend_tests)
+
+    add_executable(torne_dib_frontend_tests tests/dib_frontend_tests.cpp)
+    target_link_libraries(torne_dib_frontend_tests PRIVATE torne_dib_frontend)
+    torne_set_warnings(torne_dib_frontend_tests)
+    add_test(NAME torne_dib_frontend_tests COMMAND torne_dib_frontend_tests)
+
+    add_executable(torne_widen_loader_tests tests/widen_loader_tests.cpp)
+    target_include_directories(torne_widen_loader_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(torne_widen_loader_tests PRIVATE torne_widen)
+    torne_set_warnings(torne_widen_loader_tests)
+    add_test(NAME torne_widen_loader_tests COMMAND torne_widen_loader_tests)
+
     add_test(NAME torne_cli_smoke
         COMMAND ${CMAKE_COMMAND}
             -DTORNED=$<TARGET_FILE:torne_torned>
@@ -169,6 +228,22 @@ if(TORNE_BUILD_TESTS)
                 -DTORNE_WIDEN_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-widen-test-scratch
                 -DTORNE_WIDEN_REFERENCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_widen.cmake")
+
+        add_test(NAME torne_core1_firmware
+            COMMAND ${CMAKE_COMMAND}
+                -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+                -DTORNE_CORE1_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-core1-test
+                -DTORNE_CORE1_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-core1-test-scratch
+                -DTORNE_CORE1_REFERENCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_core1.cmake")
+
+        add_test(NAME torne_core0_firmware
+            COMMAND ${CMAKE_COMMAND}
+                -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+                -DTORNE_CORE0_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-core0-test
+                -DTORNE_CORE0_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-core0-test-scratch
+                -DTORNE_CORE0_REFERENCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_core0.cmake")
     endif()
 endif()
 

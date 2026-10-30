@@ -59,6 +59,13 @@ struct RecognitionResult final {
     // Introduction and identification are separate gates. This increment has
     // no write path, so every classification keeps this false.
     bool introduction_allowed = false;
+    // The five words observed during this recognition. The loader rechecks
+    // these exact words instead of selecting another registered image.
+    std::array<std::uint32_t, 5U> five{};
+    // Set only when exactly one full image matched. It points into the caller's
+    // current or known record storage and remains valid only while that storage
+    // lives.
+    const RegisteredImage* matched = nullptr;
 };
 
 std::uint32_t make_jump_word(std::uint32_t entry) noexcept;

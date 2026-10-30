@@ -84,7 +84,7 @@ vendor しない。
 
 - `fr30/src/widen.s` と `fr30/ld/widen-bank*.ld` は torne-userland 用に
   書いた自作FR30ソース・リンカスクリプト。
-- 処理の根拠: 採用契約v0.2.2 `docs/torne-fr30-host-contract-draft.md`
+- 処理の根拠: 採用契約v0.2.2
   §6.1〜§6.3、固定 `coax` commit
   `b118c14f85e09ed0f98340a60dec0ae70aed3ea5` の
   `internal/coaxd/usb/bridge/mb86h47/addressing.go:44-159`。
@@ -93,10 +93,77 @@ vendor しない。
 - 生成物: `fr30/generated/` の画像・hash・manifest。manifestにソース・
   linker script・binutils版・5パッチ語を記録する。通常起動では自動ロードしない。
 
+## Core 1ソース
+
+- `fr30/src/core1.s` と `fr30/ld/core1.ld` は torne-userland 用に書いた
+  自作FR30ソース・リンカスクリプト。
+- 根拠: 採用契約v0.2.2 §2/§3/§5/§7/§9.1。
+  byte制御値・poll上限は固定 `coax` commit
+  `b118c14f85e09ed0f98340a60dec0ae70aed3ea5` の
+  `internal/coaxd/usb/bridge/mb86h47/core1prog.go:28-113` と
+  `internal/coaxd/usb/bridge/mb86h47/regs/usb.go`。
+- 由来: 旧coax 16語ring/旧mailbox、denpaのAGPLコード/生成FW、旧生成画像を
+  使わず、v0.2.2のwire・tag・slot・HALTED/resumeを実装した。Core 1の実機起動・
+  I²C成功は未確認。
+- 生成物: `fr30/generated/core1.*`。source/linker/tool/hashをmanifestへ記録し、
+  通常起動では自動ロードしない。`tests/core1_model.py` は任意の開発者向け
+  命令モデルで、製品の必須依存ではない。
+
+## Core 0ソース
+
+- `fr30/src/core0.s` と `fr30/ld/core0.ld` は torne-userland 用に書いた
+  自作FR30ソース・リンカスクリプト。
+- 根拠: 採用契約v0.2.2 §2/§4/§5/§7/§9.1。内部DMA/FIFO/packetizerの
+  初期値とevent bitは固定 `coax` commit
+  `b118c14f85e09ed0f98340a60dec0ae70aed3ea5` の
+  `internal/coaxd/usb/bridge/mb86h47/core0prog.go:25-137` と
+  `internal/coaxd/usb/bridge/mb86h47/stream.go:160-173`。
+- 由来: 旧coaxの生成済みFR30語、独自counter/mailbox wire、denpaのAGPLコードと
+  生成FWを転用せず、v0.2.2のINFO/CTRL/STAT、epoch、writer limit、refill、
+  packetizer送出を実装した。固定sourceの無限DMA停止待ちは採用せず、回数上限を
+  持つ`F_DMA_QUIESCE`へ置き換えた。Core 0の実機起動・TS受信は未確認。
+- 生成物: `fr30/generated/core0.*`。source/linker/tool/hashをmanifestへ記録し、
+  通常起動では自動ロードしない。`tests/core0_model.py` は任意の開発者向け
+  命令モデルで、製品の必須依存ではない。
+
+## Widen loader（host）
+
+- `src/widen/loader.h`、`src/widen/loader.cpp`、拡張した`src/widen/bridge.*`は
+  torne-userland用の自作hostコード。
+- 根拠: 採用契約v0.2.2 §5.3/§6/§7。
+- 範囲: 契約§6.3の導入transaction、5語/画像のreadback、32bit最大64B bridge、
+  旧24bit経路、失敗停止。実機USBはopen/claimせず、fakeだけで検証する。
+- 由来: PR6の識別APIとPR7の自作TWDN画像/manifestを使用する。旧FWやdenpaの
+  生成物をロード対象・rollback先にしない。
+
+## Core1 I2C backendの実測入力
+
+- D896=`0x01B3`、D897=`0x8002`、T1A ADDR_NACK、DISCARD後のD896再読、request/completionのbyte列は、実測に基づく。
+- prototypeはwire/順序の参照であり、製品コードへコピーしていない。Core1 FWの生成headerには依存しない。
+- 追加の外部runtime依存はない。S4/clock/GPIO初期化はbackendの前提で、実測値の自動初期化は行わない。
+
+## DiB8096 C11 frontend
+
+- 元実装: `torne_drv` commit `fc662902a3e4ad56566b00cae4a0ead922e3dd02`
+  の `driver/torne_dib.c`、`driver/torne_dib.h`、`driver/torne_core.h`、
+  `driver/torne_dib_tables_gen.h`（GPL-2.0-only）。
+- 元の系譜: Linux `dib8000` / `dib0090` / `dibx000_common`
+  （Copyright (C) 2005-9 DiBcom, SA et al）と、coax
+  `b118c14f85e09ed0f98340a60dec0ae70aed3ea5` のGPL-2.0-only側。
+- 変更: `src/dib/`へ配置し、kernel向け分岐を使わずC11でコンパイル。
+  `torne_core.h`へ注入式`torne_i2c_backend`とtimeoutを追加。GNUの`?:`を
+  標準C三項演算子へ置換。未使用引数の明示。`src/dib/torne_i2c_adapter.c`と
+  `src/dib/dib_frontend.c`は、submit/wait、32B/BE、flush、sleep/clock/log境界と
+  Core1/GPIO前提を追加する自作コード。
+- 生成表: `torne_dib_tables_gen.h`はcoax/Linux由来の係数表。denpaのAGPLコード、
+  生成FW、旧FR30/ROM mailbox、vendor依存は使っていない。
+- 実機境界: 実測T27はcoax GPL実装を使用した。このC11 frontendの
+  実機選局・lockは未実行で、fakeの初期化/register/status確認まで。
+- 上流表示: 固定`torne_drv`の`NOTICE`を`NOTICE`へ保存する。上流NOTICEのpx4_drv節は本snapshotに含まれない上流ファイルへの表示であり、px4_drv由来sourceは収録していない。
+
 ## この増分で採用していないもの
 
 - 旧 Draft PR #1 のコード、生成 FR30、`torne_fw_gen.h`。
 - denpa / NeToRne のコード・生成物・調整値。
 - Linux カーネルモジュール、usbfs/udev/IOKit/WinUSB の直接利用。
-- USB control/bulk transport、FR30、DiB8096、カード UART。libusb は列挙だけに
-  使い、機器の claim/初期化/転送には使わない。
+- 実機のWiden書込み・ROM patch適用、Core 0/1の製品自動RUN、DiB8096の実機選局/TS、カード UART、daemon/listener。

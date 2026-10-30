@@ -37,6 +37,17 @@
   PURE_READ/ABS_WRITE だけを1回再送し、未分類は拒否する。
 - 転送は同期の1回呼び出しだけで、TSリング、非同期転送、cancel、FR30/選局/
   カードの操作意味はまだ持たない。実データの bulk 受信は firmware/TS 増分。
+- `core1/` に Core 1 ホストruntimeを追加した。S2検証済みを前提に、注入された
+  画像metadata/byte列でHOLD→vector→共有data zero/CTRL→code load/全語readback→
+  RUN(TRIGGER)→INFO(ABI/build/session/image/data/capability)→heartbeat→NOP ack
+  を行う。起動ごとに上位16bit非0・前回異値のsessionを選び、旧echoを拒否する。
+  C1-Aの生成headerには依存せず、画像SHA/metadataを明示入力にする。不正画像や
+  S2未成立はI/O前に拒否する。通常daemonへの自動RUN接続はまだない。
+- `core1/i2c_backend` にC11の`torne_i2c_req/result/backend`と8slot host ringを
+  追加した。64bit内部ticket、16bit wire、8slot、session/tag両端、WRITE fast path、
+  READ/WRITE_READ完了slot、HALTED/CONTINUE/DISCARD/SKIPPED、NO_COMPLETION/
+  CORE_STALLを扱う。S4/clock/GPIO初期化は前提で、backendは自動初期化しない。
+  D896/D897/T1Aの実測wireをfakeで固定し、通常daemonへの接続はまだない。
 - `widen/` に read-only の EP0 bridge と登録画像識別を追加した。5語を24bit/4Bで
   読み、PRISTINE / OURS_ACTIVE / FOREIGN_KNOWN / UNKNOWN を内容で分類する。
   FOREIGN_KNOWN は登録レコードの固定長全画像SHA-256・両entry・5パッチ語の全一致、
@@ -45,13 +56,48 @@
   currentとknownの合計一致が2件以上ならUNKNOWN。登録bankは契約の
   `0xE1000`/`0xE1800`だけで、画像と両entryはその範囲に収める。読取り失敗/
   short/timeoutはUNKNOWNへ変換せず、独立した失敗として返す。識別は導入許可と
-  別ゲートで、この増分は書込みAPIを持たず `introduction_allowed=false` を
-  維持する。PARTIAL_OURSは切替文脈がないため生成しない。
+  別ゲートで、`introduction_allowed=false` を維持する。PARTIAL_OURSは切替文脈が
+  ないため生成しない。
+- `fr30/` にCore 1 I²C候補の自作ソースと明示生成targetを追加した。INFO/CTRL/
+  STAT、session/heartbeat、NOP ack、8slot ring、byte I²C、HALTED/resumeを
+  実装し、ELF/hash/2回生成一致/異常系をCTest `torne_core1_firmware`で確認する。
+  通常buildは追跡画像だけを使い、Core 1 RUNや実機I²Cへは接続しない。
+  任意の`tests/core1_model.py`はboot/NOP/byte ringの開発者向けモデル。
+- `dib/` にDiB8096（DiB8000+DiB0090）のC11 frontendを追加した。GPL-2.0-onlyの
+  `torne_drv` `torne_dib.c`と係数表をC11へ適応し、注入した`torne_i2c_backend`
+  のsubmit/wait（32B/BE、必要箇所flush）とsleep/clock/log境界で初期化・
+  identify・status・GPIO・tuneを呼べる。Core1/GPIO初期化済みを前提とし、
+  MB86H47 GPIOやCore 1 RUNは行わない。fakeで4B/3B write、2+2/1+2 read、
+  ゲート順序、GPIO read-modify-write、失敗伝播、statusを確認する。実機DiB
+  backend接続・選局/TS・daemon接続はまだない。
+- `fr30/` にCore 0 TS搬送候補の自作ソースと明示生成targetを追加した。INFO/CTRL/
+  STAT、session/epoch/heartbeat、NOP/FAULT、内部DMA停止の有界待ち、FIFO/refill、
+  packetizer、writer limit更新を実装し、ELF/hash/2回生成一致/異常系をCTest
+  `torne_core0_firmware`で確認する。通常buildは追跡画像だけを使い、Core 0 RUN、
+  TSエンジン/USB DMA/EP、実機へは接続しない。任意の`tests/core0_model.py`は
+  boot/不正CTRL/DMA停止不能/ring wrap/refill/10単位limitの開発者向けモデル。
+- `widen/loader` に契約v0.2.2 §6.3のオフライン導入transactionを追加した。
+  `IntroductionPolicy` は既定でbank書込み・機能確認とも不許可で、識別結果だけを
+  書込み許可に変換しない。PRISTINEはbank0、FOREIGN_KNOWNは現在の反対bankを
+  候補にし、OURS_ACTIVEは再ロードしない。画像全語の4B書込み/readback、5語の
+  順序書込み/readback、状態変化・短転送・timeout・切断・結果不明での停止、
+  TransportのPURE_READ/ABS_WRITE 1回retryを偽装 `UsbIo` で通す。再確認は
+  認識時に全画像で一意に特定したrecordと観測5語を保持して同じものを照合し、
+  別登録へ選び直さない。Widen後の32bit/最大64Bと旧24bit経路は明示的な段階と
+  して扱い、5語確認前はwide APIを呼ばない。成功を認定する機能確認は契約固定の
+  64B一括、Core 0/1の別HOLDアドレスと保持値、Core 1予約領域を入口で検査する。
+  wide bridgeはhigh 0x00/0x01、終端、4〜64B・4B倍数をI/O前に検査し、0xF0以上の
+  予約highを通常read/writeとして送らない。HOLDと64B予約領域試験は
+  `allow_functional_check` が真のfakeだけが実行し、既定の製品呼出側はまだ
+  存在しない。実機のopen/claim/書込みは行わない。
 
 未実装（後続の増分）:
 
-- MB86H47A bridge、DiB8096 frontend、カード UART、FR30、TSの非同期/cancel。
-- Widen画像のロード/ROM patch/切替、反対bankの空き・容量・書込み許可の判定。
+- MB86H47A bridge、カード UART、FR30、TSの非同期/cancel。
+- Core 1 I²C backendの実機接続、DiB frontendの実機backend接続・選局、Core 0 TSの
+  ホストruntime/製品接続、カード、daemon/listener。
+- 実機のWiden導入呼出側、V-W1/V-W2、ROM 5語・cold観測、bank用途/容量の判断、
+  ROM patch適用と物理復旧。loaderは候補画像とpolicyを受ける境界まで。
 - `UsbBackend::open_family`。現状は `UNSUPPORTED` を返し、transport の
   open/claim を listener や Core receiver へ接続しない。
 - Core `host_listener_context::EnclosureContext` の assemble、authority/worker
