@@ -41,8 +41,12 @@ vendor しない。
 - 使用 API: `libusb_init`、`libusb_exit`、`libusb_get_device_list`、
   `libusb_free_device_list`、`libusb_get_device_descriptor`、
   `libusb_get_bus_number`、`libusb_get_device_address`、
-  `libusb_get_port_numbers`。いずれも公開 API。デバイスの open/claim/reset/
-  transfer は行わない。
+  `libusb_get_port_numbers`、`libusb_open`、`libusb_close`、
+  `libusb_get_configuration`、`libusb_get_active_config_descriptor`、
+  `libusb_free_config_descriptor`、`libusb_claim_interface`、
+  `libusb_release_interface`、`libusb_control_transfer`、
+  `libusb_bulk_transfer`。いずれも公開 API。kernel driver の detach、reset、
+  set_configuration、非同期 transfer は使わない。
 - udev は無効化している。Linux の最終 ELF に libusb/libusb-1.0.so/libudev の
   動的依存が無いことを検査する。
 - CMake の cross target/sysroot/compiler 引数は libusb の configure へ渡す。
@@ -59,6 +63,35 @@ vendor しない。
 - 用途: `tests/fixtures/fr30/`の自作命令例からの生成・再生成一致検査
 - 配布: binutils自体を製品のruntime依存・同梱物にしない。生成手順、
   固定版、ハッシュ、自作ソースは[fr30/README.md](fr30/README.md)に記録する。
+
+## Widen識別データ
+
+- 登録済み旧coax bank0の識別tuple（`bank_base=0xE1000`、`image_bytes=340`、
+  `entry_read=0xE1000`、`entry_write=0xE1076`、全画像SHA-256
+  `6937805e74bf0ecc8f2a9e76750d4bd87ed2d53e85dbfb29376c2bc1145268e7`、
+  5パッチ語）は、契約v0.2.2と固定
+  `torne_drv` `fc662902a3e4ad56566b00cae4a0ead922e3dd02`
+  `driver/torne_fw_gen.h:221-245` に基づく。製品コードはhash/entry/語だけを保持し、
+  旧画像のbyte列を製品FWやロード対象へ埋め込まない。
+- SHA-256はCoreの `include/dtv/userland/detail/sha256.h`（Core入力
+  `301c4593...`、MIT範囲）を使用する。外部runtime依存は増やしていない。
+- `tests/widen_recognition_tests.cpp` に置く85語/340Bの旧画像は、登録tupleの
+  受理・変異試験専用の固定参照データであり、製品FWではない。出典は同じ
+  `torne_drv` commitの `torne_addressing0_code[85]`（GPL-2.0-only、coax/Linux由来）。
+  製品のビルドやインストールでこのfixtureをFWとして使用しない。
+
+## Widenソース
+
+- `fr30/src/widen.s` と `fr30/ld/widen-bank*.ld` は torne-userland 用に
+  書いた自作FR30ソース・リンカスクリプト。
+- 処理の根拠: 採用契約v0.2.2 `docs/torne-fr30-host-contract-draft.md`
+  §6.1〜§6.3、固定 `coax` commit
+  `b118c14f85e09ed0f98340a60dec0ae70aed3ea5` の
+  `internal/coaxd/usb/bridge/mb86h47/addressing.go:44-159`。
+- 由来: 旧FW・denpaのコードや生成物をコピーせず、ROMハンドラのABI候補と
+  分岐形式だけを固定sourceから参照した。実機ROM・動作の独立確認はない。
+- 生成物: `fr30/generated/` の画像・hash・manifest。manifestにソース・
+  linker script・binutils版・5パッチ語を記録する。通常起動では自動ロードしない。
 
 ## この増分で採用していないもの
 

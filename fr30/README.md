@@ -1,9 +1,10 @@
 # FR30生成の土台
 
 このディレクトリは、製品に将来同梱するFR30機械語を、固定したGNU binutilsと
-自作ソースから再生成・検査するための土台を示す。**この増分には製品用の
-Widen / Core 0 / Core 1ファームウェアも、ROMパッチ語も、共有RAM配置もない。**
-通常のCMakeビルドと配布物は、クロスアセンブラを要求しない。
+自作ソースから再生成・検査するための土台を示す。**この増分にはWidenの
+read/write handler候補の自作ソースと両bank画像がある。Core 0 / Core 1の
+ファームウェア、ROMパッチの適用、共有RAM配置はない。** 通常のCMakeビルドと
+配布物は、クロスアセンブラを要求しない。
 
 ## 固定入力
 
@@ -82,23 +83,77 @@ Core 0/1のローカルRAM容量は契約で未確定なので、製品の確定
 リンカスクリプトは`__fr30_text_limit`の明示指定を要求し、未指定のまま生成を
 通さない。
 
+## Widen候補（read/write handler）
+
+`fr30/src/widen.s` は、CECH-ZD1J主CPUのEP0メモリ要求ハンドラへ入れる
+read/write handlerの自作候補である。`fr30/ld/widen-bank0.ld` と
+`widen-bank1.ld` が、TWDNヘッダを含む画像をバンク0 `0xE1000`、バンク1
+`0xE1800`へ配置する。`fr30/generated/` に追跡する生成物を置く。
+
+| ファイル | 内容 |
+| --- | --- |
+| `src/widen.s` | 自作FR30 assembly。R4の24bitアドレス、R8/R10の要求状態を使う |
+| `ld/widen-bank0.ld`、`ld/widen-bank1.ld` | ヘッダ`+0x00`〜`+0x1F`、コード`+0x20`以降、entry・容量・4B整列のASSERT |
+| `generated/widen-bank0.elf`、`.bin` | バンク0のELFとTWDN画像 |
+| `generated/widen-bank1.elf`、`.bin` | バンク1のELFとTWDN画像 |
+| `generated/widen-images.h` | 両画像のbyte配列、entry、build_id、SHA-256 |
+| `generated/widen-manifest.json` | 画像hash、入力hash、5パッチ語、再生成情報 |
+
+処理は契約v0.2.2 §6.1〜§6.3の候補で、固定coax
+`b118c14f85e09ed0f98340a60dec0ae70aed3ea5` の
+`internal/coaxd/usb/bridge/mb86h47/addressing.go:44-159` を根拠にする。
+
+- 状態`+0x40`が非0なら、`R4 | (byte << 24)`を`+0x44`へ書く。書込み経路だけ
+  `+0x40`を0にする。
+- 0で`0x80000 <= R4 < 0xA0000`なら、`(R4 & 0x3FFFF) + 0xF00000`を`+0x44`へ書く。
+- それ以外はアドレスを変えず、固定resume（read `0xE9AE6`、write `0xE9E2E`）へ戻る。
+- 変更するレジスタはR0/R1/R4/R12だけ。`EXEC_READ`（`0xF0`以上）は実装しない。
+
+生成は明示targetで行い、追跡ファイルを更新する。通常のbuildはこのtargetを
+実行しない。
+
+```sh
+cmake -S . -B build-fr30 -G Ninja -DTORNE_FR30_BINUTILS_DIR=/path/to/binutils-build
+cmake --build build-fr30 --target torne_fr30_widen
+```
+
+同じツールを指定した場合だけ、CTest `torne_widen_firmware` が登録される。
+これは別ディレクトリで2回生成してbyte一致を確かめ、追跡済みの
+`fr30/generated/`と比較する。あわせてTWDNのmagic/ABI/build_id/
+capabilities/image_bytes/entry/reserved、ELF32・big endian・`EM_FR30`・
+entry、4B整列、容量上限、誤header・範囲外entry・容量超過の拒否を検査する。
+build_idは `+0x08` を0にした画像のSHA-256先頭4Bで、2回のリンクで
+それ以外のbyteが変わらないことを確認する。契約v0.2.2のTWDNヘッダにはCRC欄が
+ないため、整合はbuild_idとmanifestのSHA-256で確認する。
+
+**この画像は実機で動かしていない。** ROMの5語・resume・R4/R8/R10の状態、
+バンク1の未使用性・実容量、32bit/64B書込み、ROM互換性は固定source由来の
+候補であり、独立した実機観測ではない。ホストloader、ROMパッチ適用、実機
+ロードはこの増分に含めず、通常起動で自動ロードしない。
+
 ## 将来の配布FWの位置と生成経路
 
-製品FWを追加する増分では、次の構成を置く。**まだ実ファイルは作っていない。**
+Widenは上記のとおり実ファイルを持つ。Core 0 / Core 1はまだ追加していない。
+将来の対象も同じ配置に揃える。
 
 ```text
 fr30/
-├── README.md                  # この文書
-├── src/<target>.s             # 自作アセンブリ（Widen / Core 0 / Core 1）
-├── ld/<target>.ld             # 対象別の配置・容量検査
-└── generated/<target>.bin     # 生成物と<hash>（配布物へ同梱）
+├── README.md
+├── src/widen.s                # 実装済み候補
+├── src/<core-target>.s        # Core 0 / Core 1（未追加）
+├── ld/widen-bank0.ld          # 実装済み
+├── ld/widen-bank1.ld          # 実装済み
+├── ld/<core-target>.ld        # 未追加
+├── generated/widen-bank0.*    # 実装済みの追跡生成物
+├── generated/widen-bank1.*    # 実装済みの追跡生成物
+└── generated/widen-images.h   # 埋込用の両画像
 ```
 
-- `<target>`は`widen-bank0`、`widen-bank1`、`core0`、`core1`を独立に持つ。
-  同じローカル番地でもCore 0とCore 1は別の物理CPUなので別データにする。
-- `cmake/fr30_generate.cmake`を対象別ソースへ拡張し、固定binutilsで
-  `as --fatal-warnings` → `ld -m elf32fr30 -T ... -nostdlib` →
-  `objcopy -O binary`を実行する。生成物のSHA-256と入力版を記録する。
+- Coreは`core0`、`core1`を独立に持つ。同じローカル番地でも別の物理CPUなので
+  別データにする。
+- 生成は各対象の`.s`と`.ld`に固定binutilsを使い、`as --fatal-warnings` →
+  `ld -m elf32fr30 -T ... -nostdlib` → `objcopy -O binary`の順で行う。
+  生成物のSHA-256、入力hash、パッチ語をmanifestへ記録する。
 - 製品CMakeは生成済み`.bin`だけを読み、big endianの32bit語として埋込用
   データへ変換する。ホストはWidenの選択バンク、またはCore別のローカル命令RAMへ
   ロードする。配布環境にクロスアセンブラを要求しない。
@@ -107,13 +162,15 @@ fr30/
 
 ## この増分で決めないこと
 
-- 実際のWiden / Core 0 / Core 1の処理内容、使用命令一覧、実機動作
-- ROM側の変更箇所・パッチ語・期待元語、バンク切替手順
+- Core 0 / Core 1の処理内容・ソース・画像
+- Widenの実機動作、ROM互換性、バンク1の未使用性・実容量、32bit/64B書込み
+- ROMパッチの適用、バンク切替手順、ホストloader
 - 共有RAMの容量・配置、メールボックス/レジスタの確定値
 - 生成済みFWをリリースへ含める時期と、実機段階試験の結果
 
 ## CI
 
 `.github/workflows/fr30-generation.yml`は、固定ソースのハッシュと署名を確認し、
-binutils 2.47をビルドしてfixture生成と通常ビルド・CTestを実行する定義である。
-この増分では定義を置くだけで、GitHub Actionsでの実行結果はまだない。
+binutils 2.47をビルドしてfixture生成、Widen生成・追跡物比較、通常ビルド・CTestを
+実行する定義である。この増分では定義を置くだけで、GitHub Actionsでの実行結果は
+まだない。

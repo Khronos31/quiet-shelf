@@ -29,11 +29,31 @@
   device list 取得に失敗した場合は非ゼロで終了する。descriptor や topology が
   得られない対象は scan を incomplete にし、issue と ungrouped observation を
   残して、serial や port を捏造しない。
+- `usb/transport` に native transport を追加した。`--device usb:` の bus/port
+  で1台を選び、descriptor の interface/endpoint を検証してから interface 0 を
+  claim する。kernel driver の暗黙 detach、reset、set_configuration はしない。
+  open/claim/control/bulk/close と busy/access/disconnect/timeout/短転送/
+  RESULT_UNKNOWN の境界を持つ。`ControlKind` は FR30 契約 §7.1 の副作用分類で、
+  PURE_READ/ABS_WRITE だけを1回再送し、未分類は拒否する。
+- 転送は同期の1回呼び出しだけで、TSリング、非同期転送、cancel、FR30/選局/
+  カードの操作意味はまだ持たない。実データの bulk 受信は firmware/TS 増分。
+- `widen/` に read-only の EP0 bridge と登録画像識別を追加した。5語を24bit/4Bで
+  読み、PRISTINE / OURS_ACTIVE / FOREIGN_KNOWN / UNKNOWN を内容で分類する。
+  FOREIGN_KNOWN は登録レコードの固定長全画像SHA-256・両entry・5パッチ語の全一致、
+  OURS_ACTIVE は「今回の画像」として別引数で渡したTWDN画像のヘッダ・全内容・
+  entry由来5語の一致を要求する。known側のTWDNは一致してもFOREIGN_KNOWN。
+  currentとknownの合計一致が2件以上ならUNKNOWN。登録bankは契約の
+  `0xE1000`/`0xE1800`だけで、画像と両entryはその範囲に収める。読取り失敗/
+  short/timeoutはUNKNOWNへ変換せず、独立した失敗として返す。識別は導入許可と
+  別ゲートで、この増分は書込みAPIを持たず `introduction_allowed=false` を
+  維持する。PARTIAL_OURSは切替文脈がないため生成しない。
 
 未実装（後続の増分）:
 
-- USB control/bulk transport、MB86H47A bridge、DiB8096 frontend、カード UART、FR30。
-- `UsbBackend::open_family`。現状は `UNSUPPORTED` を返し、claim しない。
+- MB86H47A bridge、DiB8096 frontend、カード UART、FR30、TSの非同期/cancel。
+- Widen画像のロード/ROM patch/切替、反対bankの空き・容量・書込み許可の判定。
+- `UsbBackend::open_family`。現状は `UNSUPPORTED` を返し、transport の
+  open/claim を listener や Core receiver へ接続しない。
 - Core `host_listener_context::EnclosureContext` の assemble、authority/worker
   接続、control/stream socket の publish、`poll_once` ループ。
 - 実機なしで検証できる範囲を超える、PC/SC IFD、WinSCard DLL、配布物。
@@ -107,6 +127,10 @@ SHA 検証されない開発者向け入力であり、正式配布の入力監�
 Windows クロス確認は同じ Core 入力を固定し、`TORNE_BUILD_TESTS=OFF` で3 target
 だけをビルドする。正式配布は固定 llvm-mingw/UCRT で行う予定であり、この増分の
 クロスビルド成功を配布物の検証結果には読み替えない。
+
+実機 transport の開発者確認は `-DTORNE_BUILD_LIVE_USB_CHECK=ON` で
+`torne_usb_transport_live_check` をビルドし、`--device usb:BUS-PORT` を渡す。
+これは CTest ではなく、open/claim/標準descriptor読み/二重claim/再openだけを行う。
 
 ## ライセンスと出典
 

@@ -14,6 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(TORNE_BUILD_TESTS "Build offline CLI framework tests" ON)
+option(TORNE_BUILD_LIVE_USB_CHECK
+    "Build the developer USB transport live check (requires the assigned device)" OFF)
 
 # FR30 regeneration is an explicit maintainer operation. The normal build and
 # install do not require a cross assembler; this variable is only consulted by
@@ -70,9 +72,17 @@ torne_set_warnings(torne_daemon_core)
 
 add_library(torne_usb STATIC
     src/usb/discovery.cpp
-    src/usb/backend.cpp)
+    src/usb/backend.cpp
+    src/usb/libusb_io.cpp
+    src/usb/transport.cpp)
 target_link_libraries(torne_usb PUBLIC torne_daemon_core torne_libusb)
 torne_set_warnings(torne_usb)
+
+add_library(torne_widen STATIC
+    src/widen/bridge.cpp
+    src/widen/recognition.cpp)
+target_link_libraries(torne_widen PUBLIC torne_usb)
+torne_set_warnings(torne_widen)
 
 add_executable(torne_torned src/torned/main.cpp)
 set_target_properties(torne_torned PROPERTIES OUTPUT_NAME torned)
@@ -101,6 +111,15 @@ add_custom_target(torne_fr30_generate
     COMMENT "Generating and checking FR30 fixtures with explicit GNU binutils"
     VERBATIM)
 
+add_custom_target(torne_fr30_widen
+    COMMAND ${CMAKE_COMMAND}
+        -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+        -DTORNE_WIDEN_OUTPUT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
+        -DTORNE_WIDEN_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-widen-scratch
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_widen.cmake"
+    COMMENT "Generating tracked Widen candidate images with explicit GNU binutils"
+    VERBATIM)
+
 if(TORNE_BUILD_TESTS)
     enable_testing()
 
@@ -119,6 +138,16 @@ if(TORNE_BUILD_TESTS)
     torne_set_warnings(torne_ts_profile_tests)
     add_test(NAME torne_ts_profile_tests COMMAND torne_ts_profile_tests)
 
+    add_executable(torne_usb_transport_tests tests/usb_transport_tests.cpp)
+    target_link_libraries(torne_usb_transport_tests PRIVATE torne_usb)
+    torne_set_warnings(torne_usb_transport_tests)
+    add_test(NAME torne_usb_transport_tests COMMAND torne_usb_transport_tests)
+
+    add_executable(torne_widen_recognition_tests tests/widen_recognition_tests.cpp)
+    target_link_libraries(torne_widen_recognition_tests PRIVATE torne_widen)
+    torne_set_warnings(torne_widen_recognition_tests)
+    add_test(NAME torne_widen_recognition_tests COMMAND torne_widen_recognition_tests)
+
     add_test(NAME torne_cli_smoke
         COMMAND ${CMAKE_COMMAND}
             -DTORNED=$<TARGET_FILE:torne_torned>
@@ -132,7 +161,27 @@ if(TORNE_BUILD_TESTS)
                 -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
                 -DTORNE_FR30_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-test-generated
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_generate.cmake")
+
+        add_test(NAME torne_widen_firmware
+            COMMAND ${CMAKE_COMMAND}
+                -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+                -DTORNE_WIDEN_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-widen-test
+                -DTORNE_WIDEN_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-widen-test-scratch
+                -DTORNE_WIDEN_REFERENCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fr30/generated
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_widen.cmake")
     endif()
+endif()
+
+if(TORNE_BUILD_LIVE_USB_CHECK)
+    add_executable(torne_usb_transport_live_check
+        tests/usb_transport_live_check.cpp)
+    target_link_libraries(torne_usb_transport_live_check PRIVATE torne_usb)
+    torne_set_warnings(torne_usb_transport_live_check)
+
+    add_executable(torne_widen_recognition_live_check
+        tests/widen_recognition_live_check.cpp)
+    target_link_libraries(torne_widen_recognition_live_check PRIVATE torne_widen)
+    torne_set_warnings(torne_widen_recognition_live_check)
 endif()
 
 install(TARGETS torne_torned torne_tornectl torne_torne_ts
