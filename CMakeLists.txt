@@ -15,6 +15,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(TORNE_BUILD_TESTS "Build offline CLI framework tests" ON)
 
+# FR30 regeneration is an explicit maintainer operation. The normal build and
+# install do not require a cross assembler; this variable is only consulted by
+# the torne_fr30_generate target and the optional generation test.
+set(TORNE_FR30_BINUTILS_DIR "" CACHE PATH
+    "binutils 2.47 fr30-elf build tree for explicit FR30 generation")
+
 # Core features needed by the three product commands and the daemon seam. The
 # daemon does not assemble a listener yet, but the same input is already used
 # so that the later integration does not add a second Core configuration.
@@ -78,10 +84,22 @@ set_target_properties(torne_tornectl PROPERTIES OUTPUT_NAME tornectl)
 target_link_libraries(torne_tornectl PRIVATE torne_cli_common dtv::host_ctl)
 torne_set_warnings(torne_tornectl)
 
+add_library(torne_ts_entry STATIC src/torne_ts/profile.cpp)
+target_link_libraries(torne_ts_entry PUBLIC torne_cli_common dtv::host_ts)
+torne_set_warnings(torne_ts_entry)
+
 add_executable(torne_torne_ts src/torne_ts/main.cpp)
 set_target_properties(torne_torne_ts PROPERTIES OUTPUT_NAME torne-ts)
-target_link_libraries(torne_torne_ts PRIVATE torne_cli_common dtv::host_ts)
+target_link_libraries(torne_torne_ts PRIVATE torne_ts_entry)
 torne_set_warnings(torne_torne_ts)
+
+add_custom_target(torne_fr30_generate
+    COMMAND ${CMAKE_COMMAND}
+        -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+        -DTORNE_FR30_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-generated
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_generate.cmake"
+    COMMENT "Generating and checking FR30 fixtures with explicit GNU binutils"
+    VERBATIM)
 
 if(TORNE_BUILD_TESTS)
     enable_testing()
@@ -96,12 +114,25 @@ if(TORNE_BUILD_TESTS)
     torne_set_warnings(torne_usb_discovery_tests)
     add_test(NAME torne_usb_discovery_tests COMMAND torne_usb_discovery_tests)
 
+    add_executable(torne_ts_profile_tests tests/torne_ts_profile_tests.cpp)
+    target_link_libraries(torne_ts_profile_tests PRIVATE torne_ts_entry)
+    torne_set_warnings(torne_ts_profile_tests)
+    add_test(NAME torne_ts_profile_tests COMMAND torne_ts_profile_tests)
+
     add_test(NAME torne_cli_smoke
         COMMAND ${CMAKE_COMMAND}
             -DTORNED=$<TARGET_FILE:torne_torned>
             -DTORNECTL=$<TARGET_FILE:torne_tornectl>
             -DTORNE_TS=$<TARGET_FILE:torne_torne_ts>
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_smoke.cmake")
+
+    if(TORNE_FR30_BINUTILS_DIR)
+        add_test(NAME torne_fr30_generation
+            COMMAND ${CMAKE_COMMAND}
+                -DTORNE_FR30_BINUTILS_DIR=${TORNE_FR30_BINUTILS_DIR}
+                -DTORNE_FR30_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/fr30-test-generated
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fr30_generate.cmake")
+    endif()
 endif()
 
 install(TARGETS torne_torned torne_tornectl torne_torne_ts

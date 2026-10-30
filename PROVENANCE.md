@@ -50,6 +50,16 @@ vendor しない。
   IOKit/CoreFoundation/Security の framework を、静的アーカイブに残らないため
   `torne_libusb` の INTERFACE から最終リンクへ伝播する。
 
+## FR30生成ツール
+
+- ツール: GNU binutils 2.47（`fr30-elf`ターゲット）
+- 配布元: `https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz`
+- SHA-256: `154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff`
+- 署名: Nick Clifton、`3A24BC1E8FB409FA9F14371813FCEF89DD9E3C4F`
+- 用途: `tests/fixtures/fr30/`の自作命令例からの生成・再生成一致検査
+- 配布: binutils自体を製品のruntime依存・同梱物にしない。生成手順、
+  固定版、ハッシュ、自作ソースは[fr30/README.md](fr30/README.md)に記録する。
+
 ## この増分で採用していないもの
 
 - 旧 Draft PR #1 のコード、生成 FR30、`torne_fw_gen.h`。

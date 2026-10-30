@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <dtv/host_ts/px4_ts_core.h>
 #include <dtv/userland/host_facade/px4d_signals.h>
-#include <dtv/userland/identity.h>
+#include "torne_ts/profile.h"
 
 #include <chrono>
 #include <cstdint>
@@ -27,18 +27,6 @@ namespace {
 
 using namespace px4::userland;
 using namespace px4::userland::cli;
-
-// Serial selection is unsupported because the device has no serial descriptor.
-// -f still requires --system; the product rejects ISDB-S after parsing.
-const TsClientProfile kProfile{
-    "torne-ts",
-    "torne-userland",
-    dtv::userland::identity::Product::torne,
-    false,
-    true,
-    nullptr,
-    false,
-};
 
 class SteadyClock final : public Px4TsClock {
 public:
@@ -86,34 +74,29 @@ int main(int argc, char** argv)
     argv_views.reserve(owned_argv.size());
     for (const std::string& value : owned_argv) argv_views.push_back(value.c_str());
     Px4TsArguments arguments = parse_px4_ts_product_arguments(
-        static_cast<int>(argv_views.size()), argv_views.data(), kProfile);
+        static_cast<int>(argv_views.size()), argv_views.data(),
+        torne::ts::kProfile);
 #else
     Px4TsArguments arguments = parse_px4_ts_product_arguments(
-        argc, const_cast<const char* const*>(argv), kProfile);
+        argc, const_cast<const char* const*>(argv), torne::ts::kProfile);
 #endif
     if (!arguments.valid) {
         std::fprintf(stderr, "torne-ts: %s\n", arguments.error.c_str());
-        print_px4_ts_usage(kProfile, stderr);
+        print_px4_ts_usage(torne::ts::kProfile, stderr);
         return 2;
     }
     if (arguments.help) {
-        print_px4_ts_usage(kProfile, stdout);
+        print_px4_ts_usage(torne::ts::kProfile, stdout);
         return 0;
     }
     if (arguments.version) {
         std::printf("torne-ts %s\n", TORNE_USERLAND_PRODUCT_VERSION);
         return 0;
     }
-    if (!arguments.instance.empty()) {
-        const auto instance =
-            dtv::userland::identity::canonicalize_instance(arguments.instance);
-        if (!instance) {
-            std::fprintf(stderr, "torne-ts: invalid --instance token\n");
-            print_px4_ts_usage(kProfile, stderr);
-            return 2;
-        }
-        arguments.instance.assign(instance.value().bytes.data(),
-                                  instance.value().length);
+    if (!torne::ts::normalize_instance(arguments)) {
+        std::fprintf(stderr, "torne-ts: invalid --instance token\n");
+        print_px4_ts_usage(torne::ts::kProfile, stderr);
+        return 2;
     }
     if (arguments.system != ipc::System::ISDB_T) {
         std::fprintf(stderr,
@@ -177,7 +160,8 @@ int main(int argc, char** argv)
     Px4TsFailureKind failure_kind = Px4TsFailureKind::ipc;
     Px4TsRunDiagnostics diagnostics;
     const auto result = Px4TsRunner::run_wire(
-        arguments, kProfile, *output, clock, signal, &failure_kind, &diagnostics);
+        arguments, torne::ts::kProfile, *output, clock, signal,
+        &failure_kind, &diagnostics);
 
 #if defined(_WIN32)
     const auto flushed = windows_sink->finish();
@@ -188,7 +172,8 @@ int main(int argc, char** argv)
 #endif
 
     if (!result) {
-        print_px4_ts_run_diagnostic(stderr, kProfile.tool_name, result.error(),
+        print_px4_ts_run_diagnostic(stderr, torne::ts::kProfile.tool_name,
+                                    result.error(),
                                     diagnostics);
         std::fprintf(stderr, "torne-ts: %s\n",
                      dtv::userland::error_string(result.error()));

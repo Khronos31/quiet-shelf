@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Public snapshot copy. This workflow is manual-only so that a push to
+# ci/torne-userland runs only the six jobs in ci.yml. A manual run adds one
+# job, generate, and does not share a matrix with ci.yml.
+name: fr30-generation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out public CI snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex texinfo gettext gpgv ninja-build cmake
+
+      - name: Fetch and verify GNU binutils 2.47
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -eu
+          curl -fsSLO https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz
+          curl -fsSLO https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz.sig
+          curl -fsSL https://ftp.gnu.org/gnu/gnu-keyring.gpg -o gnu-keyring.gpg
+          echo "154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff  binutils-2.47.tar.xz" | sha256sum -c -
+          gpgv --status-fd=1 --keyring ./gnu-keyring.gpg \
+            binutils-2.47.tar.xz.sig binutils-2.47.tar.xz > gpgv.out 2> gpgv.err
+          cat gpgv.err
+          grep -q '^\[GNUPG:\] VALIDSIG 3A24BC1E8FB409FA9F14371813FCEF89DD9E3C4F' gpgv.out
+          tar -xf binutils-2.47.tar.xz
+
+      - name: Build fr30-elf binutils
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir binutils-build
+          cd binutils-build
+          ../binutils-2.47/configure --target=fr30-elf --disable-nls \
+            --disable-werror --disable-gdb --disable-gdbserver --disable-sim \
+            --disable-gprofng
+          make -j2 all-binutils all-gas all-ld
+
+      - name: Configure product with explicit FR30 tools
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DTORNE_BUILD_TESTS=ON \
+            -DTORNE_FR30_BINUTILS_DIR="${{ runner.temp }}/binutils-build"
+
+      - name: Normal product build
+        run: cmake --build build
+
+      - name: FR30 generation target
+        run: cmake --build build --target torne_fr30_generate
+
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure

@@ -119,19 +119,16 @@ expect_result(ts_case 3)
 expect_not_contains(ts_case ts_case_error "invalid --instance")
 
 if(UNIX)
-    # torne-ts must connect to the exact instance spelling, not a lowercased alias.
+    # Runtime smoke only: the exact instance directory must be found. The
+    # spelling itself is verified by torne_ts_profile_tests without relying on
+    # the filesystem's case sensitivity (macOS volumes may fold case).
     string(RANDOM LENGTH 8 smoke_suffix)
     set(smoke_root "/tmp/torne-cli-smoke-${smoke_suffix}")
-    make_private_instance_dir("${smoke_root}/upper" Abc)
-    run_cli(ts_upper_result ts_upper_output ts_upper_error
-        ${TORNE_TS} --runtime-dir "${smoke_root}/upper" --instance Abc -c 27)
-    expect_result(ts_upper 3)
-    expect_not_contains(ts_upper ts_upper_error "runtime namespace is missing")
-
-    make_private_instance_dir("${smoke_root}/lower" abc)
-    run_cli(ts_lower_result ts_lower_output ts_lower_error
-        ${TORNE_TS} --runtime-dir "${smoke_root}/lower" --instance Abc -c 27)
-    expect_result(ts_lower 3)
-    expect_contains(ts_lower ts_lower_error "runtime namespace is missing")
+    make_private_instance_dir("${smoke_root}" Abc)
+    run_cli(ts_instance_dir_result ts_instance_dir_output ts_instance_dir_error
+        ${TORNE_TS} --runtime-dir "${smoke_root}" --instance Abc -c 27)
+    expect_result(ts_instance_dir 3)
+    expect_not_contains(ts_instance_dir ts_instance_dir_error
+        "runtime namespace is missing")
     file(REMOVE_RECURSE "${smoke_root}")
 endif()
