@@ -64,6 +64,7 @@ struct torne_bridge {
 	u8 sequence;	 /* last mailbox sequence number */
 	const struct torne_i2c_backend *i2c; /* injected C11 Core 1 ring backend */
 	uint32_t i2c_timeout_ms;
+	u64 deadline_ms;
 	bool core0_loaded;
 	bool streaming;
 	int log_level;

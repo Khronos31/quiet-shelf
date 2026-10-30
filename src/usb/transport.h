@@ -58,6 +58,14 @@ public:
                              std::size_t length,
                              std::uint32_t timeout_ms) noexcept;
 
+    int async_bulk_in_submit(std::uint8_t endpoint, std::uint8_t* data,
+                             std::size_t length, std::uint32_t timeout_ms,
+                             std::uint64_t& id) noexcept;
+    int async_bulk_cancel_all() noexcept;
+    int async_bulk_poll(UsbIo::AsyncBulkEvent& event) noexcept;
+    std::size_t async_bulk_active() const noexcept;
+    int async_bulk_drain(std::uint32_t timeout_ms) noexcept;
+
     void close() noexcept;
     bool claimed() const noexcept { return claimed_; }
     const DeviceSummary& summary() const noexcept { return summary_; }

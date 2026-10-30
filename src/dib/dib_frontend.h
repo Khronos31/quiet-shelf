@@ -49,6 +49,10 @@ int torne_dib_frontend_set_gpio(struct torne_dib_frontend *frontend,
 				uint8_t pin, bool high);
 int torne_dib_frontend_tune(struct torne_dib_frontend *frontend,
 			    uint32_t frequency_hz);
+/* Bounds the frontend/I2C tune sequence by one monotonic deadline. */
+int torne_dib_frontend_tune_timeout(struct torne_dib_frontend *frontend,
+				    uint32_t frequency_hz,
+				    uint32_t timeout_ms);
 int torne_dib_frontend_status(struct torne_dib_frontend *frontend,
 			      struct torne_dib_status *status);
 int torne_dib_frontend_sleep(struct torne_dib_frontend *frontend);

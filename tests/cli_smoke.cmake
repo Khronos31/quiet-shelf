@@ -105,8 +105,10 @@ foreach(instance com1 COM1 .abc abc.)
     expect_result(ts_bad_instance 2)
 endforeach()
 
+# A syntactically valid but absent topology keeps this smoke away from any
+# attached receiver. PR16's UsbBackend still returns UNSUPPORTED without USB.
 run_cli(torned_case_result torned_case_output torned_case_error
-    ${TORNED} --instance Abc)
+    ${TORNED} --device usb:255-99 --instance Abc)
 expect_result(torned_case 3)
 expect_contains(torned_case torned_case_error "hardware backend open failed")
 

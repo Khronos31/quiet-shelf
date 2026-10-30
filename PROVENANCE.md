@@ -91,7 +91,7 @@ vendor しない。
 - 由来: 旧FW・denpaのコードや生成物をコピーせず、ROMハンドラのABI候補と
   分岐形式だけを固定sourceから参照した。実機ROM・動作の独立確認はない。
 - 生成物: `fr30/generated/` の画像・hash・manifest。manifestにソース・
-  linker script・binutils版・5パッチ語を記録する。通常起動では自動ロードしない。
+  linker script・binutils版・5パッチ語を記録する。通常buildは画像を生成も自動ロードもしない。直接CLIの起動経路が追跡画像を実機で使用する。
 
 ## Core 1ソース
 
@@ -103,10 +103,9 @@ vendor しない。
   `internal/coaxd/usb/bridge/mb86h47/core1prog.go:28-113` と
   `internal/coaxd/usb/bridge/mb86h47/regs/usb.go`。
 - 由来: 旧coax 16語ring/旧mailbox、denpaのAGPLコード/生成FW、旧生成画像を
-  使わず、v0.2.2のwire・tag・slot・HALTED/resumeを実装した。Core 1の実機起動・
-  I²C成功は未確認。
+  使わず、v0.2.2のwire・tag・slot・HALTED/resumeを実装した。直接CLIの起動経路はCore 1を起動しI²C backendへ接続する。詳細な実機検証範囲は測定担当の報告に従う。
 - 生成物: `fr30/generated/core1.*`。source/linker/tool/hashをmanifestへ記録し、
-  通常起動では自動ロードしない。`tests/core1_model.py` は任意の開発者向け
+  通常buildは画像を生成も自動ロードもしない。直接CLIの起動経路が追跡画像を実機で使用する。`tests/core1_model.py` は任意の開発者向け
   命令モデルで、製品の必須依存ではない。
 
 ## Core 0ソース
@@ -121,9 +120,9 @@ vendor しない。
 - 由来: 旧coaxの生成済みFR30語、独自counter/mailbox wire、denpaのAGPLコードと
   生成FWを転用せず、v0.2.2のINFO/CTRL/STAT、epoch、writer limit、refill、
   packetizer送出を実装した。固定sourceの無限DMA停止待ちは採用せず、回数上限を
-  持つ`F_DMA_QUIESCE`へ置き換えた。Core 0の実機起動・TS受信は未確認。
+  持つ`F_DMA_QUIESCE`へ置き換えた。直接CLIの起動経路はCore 0を起動してTSを搬送する。詳細な実機検証範囲は測定担当の報告に従う。
 - 生成物: `fr30/generated/core0.*`。source/linker/tool/hashをmanifestへ記録し、
-  通常起動では自動ロードしない。`tests/core0_model.py` は任意の開発者向け
+  通常buildは画像を生成も自動ロードもしない。直接CLIの起動経路が追跡画像を実機で使用する。`tests/core0_model.py` は任意の開発者向け
   命令モデルで、製品の必須依存ではない。
 
 ## Widen loader（host）
@@ -132,7 +131,7 @@ vendor しない。
   torne-userland用の自作hostコード。
 - 根拠: 採用契約v0.2.2 §5.3/§6/§7。
 - 範囲: 契約§6.3の導入transaction、5語/画像のreadback、32bit最大64B bridge、
-  旧24bit経路、失敗停止。実機USBはopen/claimせず、fakeだけで検証する。
+  旧24bit経路、失敗停止。loader単体の試験はfakeで行い、直接CLIの起動経路が実機USBでopen/claim・Widen導入を行う。
 - 由来: PR6の識別APIとPR7の自作TWDN画像/manifestを使用する。旧FWやdenpaの
   生成物をロード対象・rollback先にしない。
 
@@ -141,6 +140,29 @@ vendor しない。
 - D896=`0x01B3`、D897=`0x8002`、T1A ADDR_NACK、DISCARD後のD896再読、request/completionのbyte列は、実測に基づく。
 - prototypeはwire/順序の参照であり、製品コードへコピーしていない。Core1 FWの生成headerには依存しない。
 - 追加の外部runtime依存はない。S4/clock/GPIO初期化はbackendの前提で、実測値の自動初期化は行わない。
+
+## Core0 TS host runtimeの入力
+
+- TS engine/USB DMA/EP1/Core0配置の値と順序は、契約v0.2.2 §2/§4と固定coax `b118c14f...` の `stream.go`/`core0prog.go`、torne_drv `fc662902...` の `torne_bridge.c` を参照した。coaxはGPL-2.0-or-later側で利用し、生成FW・旧mailbox・denpaコードは取り込まない。
+- C0-A画像は注入境界で受け、生成headerに依存しない。テストの画像は合成fixtureで、製品FWではない。
+
+## カードUART土台（host）
+
+- `src/card/uart.*` は torne-userland 用に書いた自作hostコード。ATR構文、T=1、
+  APDUは実装せず、共有Coreの実在APIへ後で写像するUART境界だけを持つ。
+- 根拠: 採用FR30契約
+  §7.1、製品仕様CARD-01〜08。UART番地・冷reset順・10/2/1ms・初期9600と
+  19200/38400のbaud候補は、固定 `torne_drv`
+  `fc662902a3e4ad56566b00cae4a0ead922e3dd02` の `driver/torne_card.c:11-39,
+  114-164` と固定 `coax` `b118c14f85e09ed0f98340a60dec0ae70aed3ea5` の
+  `internal/coaxd/usb/bridge/mb86h47/card.go:13-51,92-184`。
+- 由来: 両固定sourceはGPL互換。旧mailbox経由のカード命令、別USB claim、
+  T=1の複製、カード専用FR30画像は使わない。`torne_drv`由来NOTICEは既存の
+  `NOTICE`をそのまま保持する。
+- 境界: RXはCONSUMING_READ、TXはFIFO_WRITE、SEND/FIFO reset/IRQ clearは
+  TRIGGERとして再送しない。不正・short・unknown後はセッションを無効化し、
+  後続操作を止める。実カード、presence極性、FIFO上限、byte lane、ATR/T=1は
+  未実測。fake EP0/clockのみで検証し、製品daemon/CardServiceへは未接続。
 
 ## DiB8096 C11 frontend
 
@@ -158,7 +180,7 @@ vendor しない。
 - 生成表: `torne_dib_tables_gen.h`はcoax/Linux由来の係数表。denpaのAGPLコード、
   生成FW、旧FR30/ROM mailbox、vendor依存は使っていない。
 - 実機境界: 実測T27はcoax GPL実装を使用した。このC11 frontendの
-  実機選局・lockは未実行で、fakeの初期化/register/status確認まで。
+  直接CLIの起動経路はDiB init/tune/statusを実機で行う。詳細な実機検証範囲は測定担当の報告に従う。
 - 上流表示: 固定`torne_drv`の`NOTICE`を`NOTICE`へ保存する。上流NOTICEのpx4_drv節は本snapshotに含まれない上流ファイルへの表示であり、px4_drv由来sourceは収録していない。
 
 ## この増分で採用していないもの
@@ -166,4 +188,5 @@ vendor しない。
 - 旧 Draft PR #1 のコード、生成 FR30、`torne_fw_gen.h`。
 - denpa / NeToRne のコード・生成物・調整値。
 - Linux カーネルモジュール、usbfs/udev/IOKit/WinUSB の直接利用。
-- 実機のWiden書込み・ROM patch適用、Core 0/1の製品自動RUN、DiB8096の実機選局/TS、カード UART、daemon/listener。
+- daemon/listener とカードATR/T=1/CardService（PR18 Core/familyは本snapshotに含まない）。
+- CIでの実USB open/claim/tune/TS。通常buildはFR30画像を生成せず、追跡済み画像を使用する。

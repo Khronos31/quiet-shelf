@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <dtv/host_ts/px4_ts_core.h>
 #include <dtv/userland/host_facade/px4d_signals.h>
+#include "product/device.h"
+#include "product/runner.h"
 #include "torne_ts/profile.h"
 
 #include <chrono>
@@ -51,6 +53,22 @@ public:
     }
 };
 
+class ProductClock final : public torne::product::Clock {
+public:
+    explicit ProductClock(Px4TsClock& clock) noexcept : clock_(clock) {}
+    std::uint64_t monotonic_ms() noexcept override
+    {
+        return clock_.monotonic_ms();
+    }
+    void sleep_ms(std::uint32_t milliseconds) noexcept override
+    {
+        clock_.sleep_ms(milliseconds);
+    }
+
+private:
+    Px4TsClock& clock_;
+};
+
 bool install_signals() noexcept
 {
 #if !defined(_WIN32)
@@ -87,6 +105,9 @@ int main(int argc, char** argv)
     }
     if (arguments.help) {
         print_px4_ts_usage(torne::ts::kProfile, stdout);
+        std::fputs("  Torne direct hardware: --device usb:BUS-PORT owns the "
+                   "device directly; --instance remains the Core IPC client.\n",
+                   stdout);
         return 0;
     }
     if (arguments.version) {
@@ -157,6 +178,45 @@ int main(int argc, char** argv)
 
     SteadyClock clock;
     StopSignal signal;
+
+    if (arguments.device.rfind("usb:", 0U) == 0U) {
+        if (arguments.receiver != 0U) {
+            std::fprintf(stderr,
+                "torne-ts: direct mode has one receiver (0)\n");
+            return 3;
+        }
+        ProductClock product_clock(clock);
+        auto device = torne::product::open_hardware(arguments.device, product_clock);
+        if (!device) {
+            std::fprintf(stderr, "torne-ts: direct hardware open: %s\n",
+                         dtv::userland::error_string(device.error()));
+            return px4_ts_exit_status(device.error());
+        }
+        torne::product::RunOptions options;
+        options.frequency_hz = arguments.frequency_hz;
+        options.tune_timeout_ms = arguments.tune_timeout_ms;
+        options.duration_seconds = arguments.duration_seconds;
+        options.packet_count = arguments.packet_count;
+        options.duration_set = arguments.duration_set;
+        options.packet_count_set = arguments.packet_count_set;
+        const auto direct = torne::product::run(
+            *device.value(), options, *output, clock, signal);
+
+#if defined(_WIN32)
+        const auto flushed_direct = windows_sink->finish();
+        if (direct && !flushed_direct) {
+            std::fprintf(stderr, "torne-ts: output flush failed\n");
+            return 70;
+        }
+#endif
+        if (!direct) {
+            std::fprintf(stderr, "torne-ts: direct run: %s\n",
+                         dtv::userland::error_string(direct.error()));
+            return px4_ts_exit_status(direct.error());
+        }
+        return 0;
+    }
+
     Px4TsFailureKind failure_kind = Px4TsFailureKind::ipc;
     Px4TsRunDiagnostics diagnostics;
     const auto result = Px4TsRunner::run_wire(

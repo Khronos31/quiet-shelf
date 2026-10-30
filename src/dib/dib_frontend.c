@@ -66,6 +66,7 @@ int torne_dib_frontend_init(struct torne_dib_frontend *frontend,
 	frontend->bridge.priv = frontend;
 	frontend->bridge.i2c = config->backend;
 	frontend->bridge.i2c_timeout_ms = config->i2c_timeout_ms;
+	frontend->bridge.deadline_ms = 0U;
 	frontend->bridge.err = 0;
 	frontend->bridge.log_level = TORNE_LOG_ERR;
 
@@ -92,6 +93,18 @@ int torne_dib_frontend_tune(struct torne_dib_frontend *frontend,
 {
 	if (!frontend) return -EINVAL;
 	return torne_dib_tune(&frontend->dib, frequency_hz);
+}
+
+int torne_dib_frontend_tune_timeout(struct torne_dib_frontend *frontend,
+				    uint32_t frequency_hz,
+				    uint32_t timeout_ms)
+{
+	if (!frontend || !frontend->now) return -EINVAL;
+	frontend->bridge.deadline_ms =
+		frontend->now(frontend->priv) + (u64)timeout_ms;
+	const int rc = torne_dib_frontend_tune(frontend, frequency_hz);
+	frontend->bridge.deadline_ms = 0U;
+	return rc;
 }
 
 int torne_dib_frontend_status(struct torne_dib_frontend *frontend,

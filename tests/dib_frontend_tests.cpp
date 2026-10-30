@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "dib/dib_frontend.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,7 @@ struct Fake final {
     int sleep_calls = 0;
     int flush_calls = 0;
     std::uint64_t now = 1000;
+    std::uint32_t wait_cost_ms = 0;
 };
 
 std::uint16_t be16(const std::uint8_t* p)
@@ -57,6 +59,7 @@ int wait_cb(void* ctx, std::uint32_t ticket, torne_i2c_result* result,
             std::uint32_t)
 {
     Fake* fake = static_cast<Fake*>(ctx);
+    if (fake->wait_cost_ms != 0U) fake->now += fake->wait_cost_ms;
     if (!result || ticket >= fake->requests.size())
         return TORNE_I2C_ERR_INTERNAL;
     const torne_i2c_req& req = fake->requests[ticket].req;
@@ -272,6 +275,20 @@ void test_failure_propagates_and_stops()
     CHECK(fake.requests.size() <= 1U);
 }
 
+void test_tune_timeout_bounds_i2c_wait()
+{
+    Fake fake = make_fake();
+    fake.wait_cost_ms = 200U;
+    torne_i2c_backend backend = make_backend(fake);
+    torne_dib_frontend_config config = make_config(fake, backend);
+    torne_dib_frontend frontend{};
+    CHECK(torne_dib_frontend_init(&frontend, &config) == 0);
+    fake.now = 1000U;
+    const int rc = torne_dib_frontend_tune_timeout(&frontend, 473142857U, 100U);
+    CHECK(rc == -ETIMEDOUT);
+    CHECK(fake.now >= 1100U);
+}
+
 void test_preconditions_and_tune_range()
 {
     Fake fake = make_fake();
@@ -321,6 +338,7 @@ int main()
     test_init_and_register_paths();
     test_set_gpio_uses_register_read_modify_write();
     test_failure_propagates_and_stops();
+    test_tune_timeout_bounds_i2c_wait();
     test_preconditions_and_tune_range();
     test_status_exposes_only_measured_fields();
     if (failures != 0) {

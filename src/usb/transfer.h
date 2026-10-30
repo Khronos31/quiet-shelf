@@ -133,6 +133,26 @@ public:
                                      const std::uint8_t* data,
                                      std::size_t length,
                                      std::uint32_t timeout_ms) noexcept = 0;
+
+    // Optional asynchronous Bulk IN path. Default implementations are
+    // unsupported so existing sync-only implementations stay valid. The
+    // caller owns data until the completion event is polled.
+    struct AsyncBulkEvent final {
+        std::uint64_t id = 0U;
+        std::uint8_t* data = nullptr;
+        std::size_t length = 0U;
+        TransferOutcome transfer{};
+    };
+    virtual int async_bulk_in_submit(std::uint8_t, std::uint8_t*, std::size_t,
+                                     std::uint32_t, std::uint64_t*) noexcept
+    {
+        return -1;
+    }
+    virtual int async_bulk_cancel_all() noexcept { return -1; }
+    virtual int async_bulk_poll(AsyncBulkEvent&) noexcept { return -1; }
+    virtual std::size_t async_bulk_active() const noexcept { return 0U; }
+    virtual int async_bulk_drain(std::uint32_t) noexcept { return 0; }
+
     virtual void release_interface(std::uint8_t number) noexcept = 0;
     virtual void close() noexcept = 0;
 };

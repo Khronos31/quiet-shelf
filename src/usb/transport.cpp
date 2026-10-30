@@ -146,14 +146,45 @@ Transport::~Transport() noexcept
     close();
 }
 
+int Transport::async_bulk_in_submit(std::uint8_t endpoint, std::uint8_t* data,
+                                    std::size_t length, std::uint32_t timeout_ms,
+                                    std::uint64_t& id) noexcept
+{
+    if (!claimed_ || !io_) return -1;
+    return io_->async_bulk_in_submit(endpoint, data, length, timeout_ms, &id);
+}
+
+int Transport::async_bulk_cancel_all() noexcept
+{
+    if (!io_) return -1;
+    return io_->async_bulk_cancel_all();
+}
+
+int Transport::async_bulk_poll(UsbIo::AsyncBulkEvent& event) noexcept
+{
+    if (!io_) return -1;
+    return io_->async_bulk_poll(event);
+}
+
+std::size_t Transport::async_bulk_active() const noexcept
+{
+    return io_ ? io_->async_bulk_active() : 0U;
+}
+
+int Transport::async_bulk_drain(std::uint32_t timeout_ms) noexcept
+{
+    return io_ ? io_->async_bulk_drain(timeout_ms) : -1;
+}
+
 void Transport::close() noexcept
 {
-    if (claimed_ && io_) io_->release_interface(0U);
+    if (!io_) return;
+    (void)io_->async_bulk_cancel_all();
+    if (io_->async_bulk_drain(100U) != 0) return;
+    if (claimed_) io_->release_interface(0U);
     claimed_ = false;
-    if (io_) {
-        io_->close();
-        io_.reset();
-    }
+    io_->close();
+    io_.reset();
 }
 
 bool Transport::endpoint_supported(std::uint8_t endpoint,

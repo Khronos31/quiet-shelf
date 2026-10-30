@@ -3,7 +3,7 @@
 このディレクトリは、製品に将来同梱するFR30機械語を、固定したGNU binutilsと
 自作ソースから再生成・検査するための土台を示す。**この増分にはWidenの
 read/write handler候補と両bank画像、Core 1 I²CとCore 0 TS搬送の候補ソース・
-画像がある。ROMパッチの適用、Coreの実機起動、TS受信はまだない。**
+画像がある。通常buildは画像を生成も自動ロードもしない。直接CLIの起動経路は実機でWiden/Core/RF/TSを実行する。CIは実機open/claim/tune/TSを行わない。**
 通常のCMakeビルドと配布物は、クロスアセンブラを要求しない。
 
 ## 固定入力
@@ -131,10 +131,11 @@ build_idは `+0x08` を0にした画像のSHA-256先頭4Bで、2回のリンク�
 それ以外のbyteが変わらないことを確認する。契約v0.2.2のTWDNヘッダにはCRC欄が
 ないため、整合はbuild_idとmanifestのSHA-256で確認する。
 
-**この画像は実機で動かしていない。** ROMの5語・resume・R4/R8/R10の状態、
-バンク1の未使用性・実容量、32bit/64B書込み、ROM互換性は固定source由来の
-候補であり、独立した実機観測ではない。ホストloader、ROMパッチ適用、実機
-ロードはこの増分に含めず、通常起動で自動ロードしない。
+**通常build/CIはこの画像を実機実行しない。** ROMの5語・resume・R4/R8/R10の状態、
+バンク1の未使用性・実容量、32bit/64B書込み、ROM互換性の詳細は固定source由来の
+候補であり、独立した実機検証範囲は測定担当の報告に従う。直接CLIの起動経路は
+追跡画像を実機で使用し、Widen導入/機能確認を行う。通常buildは画像を生成も
+自動ロードもしない。CIはopen/claim/tune/TSを行わない。
 
 ## Core 1 I²C候補
 
@@ -154,7 +155,7 @@ build_idは `+0x08` を0にした画像のSHA-256先頭4Bで、2回のリンク�
 - CTRL/STAT: session、NOP `cmd_seq`/`cmd_ack_seq`、heartbeat、8slot I²C ring、`i2c_progress`のbit31 HALTED、HALTED/resume。
 - I²C: busy待ち、START/repeated START、ACK/NACK、READ/WRITE/WRITE_READ、最大32B、STOP後idle、byte poll `0x40000`。ADDR/DATA NACK、BUS_ERROR、TIMEOUT、BUS_BUSY、INVALID、TORNを結果コードと段階で返す。
 - HALTEDでは新規要求を取らず、CONTINUE/DISCARDを`i2c_resume`のindex/action/serialで処理する。DISCARDは受理時の`CTRL.i2c_req_prod`で対象範囲を固定し、全SKIPPED完了を公開するまで`STAT.state`と`i2c_progress`のHALTED bitを維持し、`resume_ack`も完了後まで更新しない。CONTINUEも解除の公開後にackを出す。
-- hostのS4（I²C master初期化）はCoreへ移していない。通常起動へCore 1 RUNを自動接続しない。
+- hostのS4（I²C master初期化）はCoreへ移していない。通常build/daemonはCore 1 RUNを自動接続しない。直接CLIの起動経路はCore 1/Core 0を起動する。
 
 生成は明示targetで行う。通常buildは追跡画像を消費するだけで、クロスアセンブラを要求しない。
 
@@ -165,7 +166,7 @@ cmake --build build-fr30 --target torne_fr30_core1
 
 ツール指定時だけCTest `torne_core1_firmware`が登録され、別出力で2回生成してbyte一致、追跡物一致、ELF32/BE/EM_FR30/entry `0xA0000`、4B整列、12KiB上限、build_idの0欄hash、容量超過・不正entryの拒否を確認する。`tests/core1_model.py`は開発者向けの任意モデルで、boot/INFO、WRITE/READ/WRITE_READ、32B、TORN、ADDR/DATA NACK、CONTINUE/DISCARDを確認する。CTestの必須条件ではない。
 
-**この画像は実CPUで動かしていない。** I²C MMIO値、byte poll時間、`A3800-A3FFF`のRAM実在・連続性、HOLD/RUN/vector、Core 1の実起動・NOP・I²Cは未確認である。V-MEM/V-C1は別の許可・担当で行う。
+**通常build/CIはこの画像を実機実行しない。** 直接CLIの起動経路は追跡画像を実機で使用する。CIはopen/claim/tune/TSを行わない。I²C MMIO値、byte poll時間、`A3800-A3FFF`のRAM実在・連続性、HOLD/RUN/vector、Core 1のNOP/I²Cの詳細確認は測定担当の報告に従う。
 
 ## Core 0 TS搬送候補
 
@@ -197,7 +198,7 @@ cmake --build build-fr30 --target torne_fr30_core0
 
 ツール指定時だけCTest `torne_core0_firmware`が登録され、別出力で2回生成してbyte一致、追跡物一致、ELF32/BE/EM_FR30/entry `0xA0000`、4B整列、12KiB上限、build_idの0欄hash、容量超過・不正entryの拒否を確認する。`tests/core0_model.py`は開発者向けの任意モデルで、boot/INFO、不正CTRL、DMA停止不能、ring wrap、refill、192B送出、10単位のlimit更新を確認する。CTestの必須条件ではない。
 
-**この画像は実CPUで動かしていない。** 内部DMA/FIFO/packetizerの値を含め、Core 0の実起動・INFO/heartbeat、SDRAMリングからの搬送、192B→188B、writer limitの実時間、HOLD後のDMA挙動は未確認である。V-C0は測定担当が行う。
+**通常build/CIはこの画像を実機実行しない。** 直接CLIの起動経路は追跡画像を実機で使用する。CIはopen/claim/tune/TSを行わない。内部DMA/FIFO/packetizer、SDRAMリング、192B→188B、writer limit、HOLD後のDMA挙動の詳細確認は測定担当の報告に従う。
 
 ## 将来の配布FWの位置と生成経路
 
@@ -222,7 +223,7 @@ fr30/
 ```
 
 - Core 0とCore 1は独立に持つ。同じローカル番地でも別の物理CPUなので
-  別データにする。どちらも実装済み候補で、実機確認は別工程。
+  別データにする。どちらも実装済み候補で、直接CLIの起動経路が実機で使用する。詳細確認は別工程。
 - 生成は各対象の`.s`と`.ld`に固定binutilsを使い、`as --fatal-warnings` →
   `ld -m elf32fr30 -T ... -nostdlib` → `objcopy -O binary`の順で行う。
   生成物のSHA-256、入力hash、パッチ語をmanifestへ記録する。
@@ -234,9 +235,9 @@ fr30/
 
 ## この増分で決めないこと
 
-- Core 0の実機起動・TS受信・DMA/FIFO挙動、Core 1の実機起動・NOP・I²C、I²C MMIO値・poll時間、Core RAMの実在・連続性
-- Widenの実機動作、ROM互換性、バンク1の未使用性・実容量、32bit/64B書込み
-- ROMパッチの適用、バンク切替手順、ホストloader
+- Core 0/1のDMA/FIFO/packetizer・I²C MMIO/poll・Core RAM連続性・HOLD/RUN/vectorの詳細確認
+- Widen bank1の未使用性・実容量、32bit/64B書込み、ROM互換性の詳細
+- V-W1/V-W2/V-C0/V-C1、物理復旧、実機段階試験の結果
 - 共有RAMの容量・配置、メールボックス/レジスタの確定値
 - 生成済みFWをリリースへ含める時期と、実機段階試験の結果
 

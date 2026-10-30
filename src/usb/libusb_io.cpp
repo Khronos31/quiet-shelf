@@ -6,6 +6,8 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 
 namespace torne::usb {
 namespace {
@@ -30,6 +32,20 @@ TransferCause cause_for_error(int error) noexcept
 TransferOutcome outcome_for_error(int error) noexcept
 {
     return TransferOutcome{TransferState::failed, cause_for_error(error), 0U, false};
+}
+
+TransferCause cause_for_transfer_status(libusb_transfer_status status) noexcept
+{
+    switch (status) {
+    case LIBUSB_TRANSFER_COMPLETED: return TransferCause::none;
+    case LIBUSB_TRANSFER_TIMED_OUT: return TransferCause::timeout;
+    case LIBUSB_TRANSFER_STALL: return TransferCause::pipe;
+    case LIBUSB_TRANSFER_NO_DEVICE: return TransferCause::no_device;
+    case LIBUSB_TRANSFER_OVERFLOW: return TransferCause::overflow;
+    case LIBUSB_TRANSFER_ERROR:
+    case LIBUSB_TRANSFER_CANCELLED:
+    default: return TransferCause::other;
+    }
 }
 
 OpenOutcome open_outcome_for_error(int error) noexcept
@@ -214,6 +230,93 @@ public:
         return bulk(endpoint, const_cast<std::uint8_t*>(data), length, timeout_ms);
     }
 
+    int async_bulk_in_submit(std::uint8_t endpoint, std::uint8_t* data,
+                             std::size_t length, std::uint32_t timeout_ms,
+                             std::uint64_t* id) noexcept override
+    {
+        if (handle_ == nullptr || data == nullptr || id == nullptr ||
+            (endpoint & 0x80U) == 0U ||
+            length > static_cast<std::size_t>(INT_MAX))
+            return -1;
+        std::unique_ptr<AsyncTransfer> item(new AsyncTransfer());
+        item->id = next_async_id_++;
+        item->data = data;
+        item->length = length;
+        item->transfer = libusb_alloc_transfer(0);
+        if (item->transfer == nullptr) return -1;
+        libusb_fill_bulk_transfer(
+            item->transfer, handle_, endpoint, data, static_cast<int>(length),
+            &LibusbIo::async_callback, item.get(), timeout_ms);
+        const int status = libusb_submit_transfer(item->transfer);
+        if (status != LIBUSB_SUCCESS) {
+            libusb_free_transfer(item->transfer);
+            item->transfer = nullptr;
+            return -1;
+        }
+        *id = item->id;
+        async_[item->id] = std::move(item);
+        return 0;
+    }
+
+    int async_bulk_cancel_all() noexcept override
+    {
+        int result = 0;
+        for (auto& entry : async_) {
+            if (!entry.second->completed &&
+                libusb_cancel_transfer(entry.second->transfer) != LIBUSB_SUCCESS)
+                result = -1;
+        }
+        return result;
+    }
+
+    int async_bulk_poll(AsyncBulkEvent& event) noexcept override
+    {
+        if (context_ == nullptr) return -1;
+        timeval timeout{0, 0};
+        (void)libusb_handle_events_timeout_completed(context_, &timeout, nullptr);
+        for (auto item = async_.begin(); item != async_.end(); ++item) {
+            AsyncTransfer& transfer = *item->second;
+            if (!transfer.completed) continue;
+            event.id = transfer.id;
+            event.data = transfer.data;
+            event.length = transfer.length;
+            event.transfer = transfer.outcome;
+            libusb_free_transfer(transfer.transfer);
+            async_.erase(item);
+            return 1;
+        }
+        return 0;
+    }
+
+    std::size_t async_bulk_active() const noexcept override
+    {
+        return async_.size();
+    }
+
+    int async_bulk_drain(std::uint32_t timeout_ms) noexcept override
+    {
+        if (async_.empty()) return 0;
+        for (auto& entry : async_) {
+            if (!entry.second->completed)
+                (void)libusb_cancel_transfer(entry.second->transfer);
+        }
+        const int attempts = static_cast<int>(timeout_ms / 10U) + 1;
+        for (int attempt = 0; attempt < attempts && !async_.empty(); ++attempt) {
+            timeval timeout{0, 10000};
+            if (context_ != nullptr)
+                (void)libusb_handle_events_timeout_completed(context_, &timeout, nullptr);
+            for (auto item = async_.begin(); item != async_.end();) {
+                if (!item->second->completed) {
+                    ++item;
+                    continue;
+                }
+                libusb_free_transfer(item->second->transfer);
+                item = async_.erase(item);
+            }
+        }
+        return async_.empty() ? 0 : -1;
+    }
+
     void release_interface(std::uint8_t number) noexcept override
     {
         if (handle_ != nullptr)
@@ -222,6 +325,15 @@ public:
 
     void close() noexcept override
     {
+        if (unrecovered_) return;
+        if (async_bulk_drain(100U) != 0) {
+            // A callback has not completed. Keep the handle/context and
+            // transfer/user_data storage alive rather than freeing it first.
+            (void)new std::map<std::uint64_t, std::unique_ptr<AsyncTransfer>>(
+                std::move(async_));
+            unrecovered_ = true;
+            return;
+        }
         if (handle_ != nullptr) {
             libusb_close(handle_);
             handle_ = nullptr;
@@ -267,8 +379,37 @@ private:
         return bulk_transfer_outcome(status, transferred, length);
     }
 
+    struct AsyncTransfer final {
+        std::uint64_t id = 0U;
+        libusb_transfer* transfer = nullptr;
+        std::uint8_t* data = nullptr;
+        std::size_t length = 0U;
+        bool completed = false;
+        TransferOutcome outcome{};
+    };
+
+    static void LIBUSB_CALL async_callback(libusb_transfer* transfer) noexcept
+    {
+        auto* item = static_cast<AsyncTransfer*>(transfer->user_data);
+        if (item == nullptr) return;
+        item->completed = true;
+        item->outcome.cause = cause_for_transfer_status(transfer->status);
+        item->outcome.transferred = transfer->actual_length;
+        if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+            item->outcome.state =
+                transfer->actual_length == static_cast<int>(item->length)
+                    ? TransferState::complete
+                    : TransferState::short_transfer;
+        } else {
+            item->outcome.state = TransferState::failed;
+        }
+    }
+
     libusb_context* context_ = nullptr;
     libusb_device_handle* handle_ = nullptr;
+    std::map<std::uint64_t, std::unique_ptr<AsyncTransfer>> async_;
+    std::uint64_t next_async_id_ = 1U;
+    bool unrecovered_ = false;
 };
 
 }  // namespace
