@@ -10,6 +10,8 @@ Sony CECH-ZD1 J（USB 054c:04b2）用の、カーネルドライバに依存し�
 
 libusb は 1.0.30 を固定 URL/SHA-256 から取得し、udev 無効の静的ライブラリとしてリンクします（[PROVENANCE.md](PROVENANCE.md)）。
 
+PR22候補はcold起動のWiden clock gate初期化を`src/product/clock_gate.*`へ追加し、fake/CTestで順序・失敗停止を確認する。実機cold起動/F3成功の証拠ではない。
+
 ```sh
 cmake -S . -B build -G Ninja
 cmake --build build

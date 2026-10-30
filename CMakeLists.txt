@@ -242,6 +242,7 @@ torne_set_warnings(torne_dib_frontend)
 
 add_library(torne_product STATIC
     src/card/service.cpp
+    src/product/clock_gate.cpp
     src/product/core_family.cpp
     src/product/daemon_backend.cpp
     src/product/hardware_device.cpp
@@ -382,6 +383,11 @@ if(TORNE_BUILD_TESTS)
     target_link_libraries(torne_product_entry_tests PRIVATE torne_product)
     torne_set_warnings(torne_product_entry_tests)
     add_test(NAME torne_product_entry_tests COMMAND torne_product_entry_tests)
+
+    add_executable(torne_clock_gate_tests tests/clock_gate_tests.cpp)
+    target_link_libraries(torne_clock_gate_tests PRIVATE torne_product)
+    torne_set_warnings(torne_clock_gate_tests)
+    add_test(NAME torne_clock_gate_tests COMMAND torne_clock_gate_tests)
 
     add_executable(torne_card_service_tests tests/card_service_tests.cpp)
     target_link_libraries(torne_card_service_tests PRIVATE torne_product)

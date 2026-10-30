@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "product/device.h"
+#include "product/clock_gate.h"
 
 #include "product/packet_queue.h"
 
@@ -345,6 +346,7 @@ Result<void> HardwareDevice::startup() noexcept
     }
 
     if (!i2c_init(bridge_)) return fail(Error::USB_IO);
+    if (!clock_gate_init(bridge_)) return fail(Error::USB_IO);
 
     {
         const widen::RegisteredImage images[] = {bank0};
