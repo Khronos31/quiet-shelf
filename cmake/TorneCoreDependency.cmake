@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Single source of truth for the dtv-userland-core input. 9d8e02c4 is the
-# intermediate card/T=1 development pin, not the final five-product pin.
+# Single source of truth for the dtv-userland-core input. 1d5569ee is the
+# adopted intermediate Core141 pin for the torne Unix IFD profile, not the
+# final five-product pin.
 set(TORNE_CORE_REPOSITORY "https://github.com/Khronos31/dtv-userland-core.git")
-set(TORNE_CORE_COMMIT "9d8e02c4f113568012e257ed46d72c9a55751958")
+set(TORNE_CORE_COMMIT "1d5569ee303204cbb2d660517152d8a5b5878041")
 
 set(TORNE_CORE_SOURCE_DIR "" CACHE PATH
     "Developer-supplied dtv-userland-core tree for offline builds; NOT SHA-verified, must be TORNE_CORE_COMMIT")

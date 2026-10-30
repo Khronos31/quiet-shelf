@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Install build tools
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential make
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential make libpcsclite-dev
 
       - name: Configure
         env:
@@ -51,6 +51,34 @@ jobs:
           set -euo pipefail
           for exe in torned tornectl torne-ts; do
             "./build/$exe" --version
+          done
+
+      - name: Configure PC/SC IFD stage
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: |
+          cmake -S . -B build-pcsc -DCMAKE_BUILD_TYPE="$CONFIG" \
+            -DTORNE_BUILD_TESTS=OFF -DTORNE_BUILD_PCSC_IFD=ON
+
+      - name: Build PC/SC IFD stage
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: cmake --build build-pcsc --config "$CONFIG" --target torne_pcsc_stage --parallel 2
+
+      - name: Check PC/SC IFD stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build-pcsc/pcsc/unix/libdtv_userland_unix_pcsc_ifd.so
+          for file in COPYING UNIX_PCSC_IFD_PROVENANCE.json LICENSE.dtv-userland-core torne.reader.conf.in; do
+            test -s "build-pcsc/pcsc/unix/$file"
+          done
+          symbols=$(nm -D --defined-only build-pcsc/pcsc/unix/libdtv_userland_unix_pcsc_ifd.so)
+          for symbol in IFDHCreateChannel IFDHCreateChannelByName IFDHCloseChannel IFDHGetCapabilities IFDHSetCapabilities IFDHSetProtocolParameters IFDHPowerICC IFDHTransmitToICC IFDHControl IFDHICCPresence; do
+            if ! grep -Eq " T ${symbol}$" <<<"$symbols"; then
+              echo "missing IFD ABI symbol: $symbol" >&2
+              exit 1
+            fi
           done
 
       - name: Scan dynamic dependencies
@@ -104,12 +132,43 @@ jobs:
             -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
             -DCMAKE_BUILD_TYPE="$CONFIG" \
             -DTORNE_BUILD_TESTS=OFF \
-            -DCMAKE_EXE_LINKER_FLAGS="-static"
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DTORNE_BUILD_WINSCARD=ON
 
       - name: Build
         env:
           CONFIG: ${{ matrix.config }}
         run: cmake --build build --config "$CONFIG" --parallel 2
+
+      - name: Build PC/SC WinSCard DLL stage
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: cmake --build build --config "$CONFIG" --target torne_pcsc_stage --parallel 2
+
+      - name: Check PC/SC WinSCard DLL stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage=build/pcsc/windows
+          test -s "$stage/WinSCard.dll"
+          for file in COPYING README.md LICENSE.dtv-userland-core COPYING.MinGW-w64-runtime.txt; do
+            test -s "$stage/$file"
+          done
+          exports=$(x86_64-w64-mingw32-objdump -p "$stage/WinSCard.dll" |
+            awk '/^Export Table:/ {in_table=1; next} in_table && /^$/ {exit} in_table && /^[[:space:]]*[0-9]+[[:space:]]+0x[0-9a-fA-F]+[[:space:]]+/ {print $NF}' |
+            sort)
+          expected=$(printf '%s\n' SCardConnectA SCardConnectW SCardDisconnect SCardEstablishContext SCardFreeMemory SCardGetStatusChangeW SCardIsValidContext SCardListReadersA SCardListReadersW SCardReleaseContext SCardStatusW SCardTransmit g_rgSCardT1Pci | sort)
+          if [ "$exports" != "$expected" ]; then
+            echo "WinSCard.dll export set mismatch" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$exports") || true
+            exit 1
+          fi
+          imports=$(x86_64-w64-mingw32-objdump -p "$stage/WinSCard.dll" |
+            awk '/DLL Name/{print $3}')
+          if printf '%s\n' "$imports" | grep -E 'libusb|libstdc\+\+|libgcc|libwinpthread|libc\+\+'; then
+            echo "unexpected runtime DLL import in WinSCard.dll" >&2
+            exit 1
+          fi
 
       - name: Check linked DLL imports
         shell: bash

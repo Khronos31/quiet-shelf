@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Template only. CMake does not install or register this file, and this
+# project does not start or reconfigure pcscd.
+#
+# Fill the @...@ values for the target deployment. DEVICENAME follows the Core
+# IFD grammar torne-userland:runtime=...:instance=...:access=...
+# LIBPATH must name the matching torne-profile Core IFD shared library.
+FRIENDLYNAME "DTV userland (torne-userland)"
+DEVICENAME torne-userland:runtime=@TORNE_PCSC_RUNTIME_DIR@:instance=@TORNE_PCSC_INSTANCE@:access=@TORNE_PCSC_ACCESS@
+LIBPATH @TORNE_PCSC_IFD_LIBRARY@
+CHANNELID 0

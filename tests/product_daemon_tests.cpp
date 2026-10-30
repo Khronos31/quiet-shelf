@@ -25,6 +25,10 @@
 #include <string>
 #include <thread>
 
+#if !defined(_WIN32)
+#include <sys/un.h>
+#endif
+
 namespace {
 
 using dtv::userland::Error;
@@ -266,15 +270,6 @@ void test_daemon_publishes_and_closes()
     return;
 #else
     namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() /
-        ("tda-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::error_code error;
-    CHECK(fs::create_directories(root, error) && !error);
-    fs::permissions(root, fs::perms::owner_all,
-                    fs::perm_options::replace, error);
-    CHECK(!error);
-
     const auto selector = dtv::userland::identity::parse_device_selector("usb:1-2");
     CHECK(selector);
     if (!selector) return;
@@ -287,6 +282,44 @@ void test_daemon_publishes_and_closes()
     if (!automatic) return;
     const std::string instance(automatic.value().bytes.data(),
                                automatic.value().length);
+
+    // AF_UNIX path limits are smaller than some CI TMPDIR trees. Prefer a
+    // short, writable temporary directory; fall back to a short /tmp only
+    // when TMPDIR is too long or cannot be created. Never force /tmp when a
+    // valid short TMPDIR exists.
+    const std::string leaf = "tda-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto fits = [&](const fs::path& base) {
+        const fs::path candidate = base / leaf;
+        const auto endpoint =
+            (candidate / "torne-userland" / "v1" / instance / "control.sock")
+                .string();
+        // sun_path includes the terminating NUL. Use the native platform
+        // capacity (104 on macOS, 108 on Linux) instead of a shared hardcode.
+        return endpoint.size() < sizeof(sockaddr_un::sun_path);
+    };
+    std::vector<fs::path> bases;
+    std::error_code temporary_error;
+    const fs::path temporary = fs::temp_directory_path(temporary_error);
+    if (!temporary_error) bases.push_back(temporary);
+    bases.push_back(fs::path("/tmp"));
+
+    fs::path root;
+    std::error_code error;
+    for (const fs::path& base : bases) {
+        if (!fits(base)) continue;
+        const fs::path candidate = base / leaf;
+        error.clear();
+        if (fs::create_directories(candidate, error) && !error) {
+            root = candidate;
+            break;
+        }
+    }
+    CHECK(!root.empty());
+    if (root.empty()) return;
+    fs::permissions(root, fs::perms::owner_all,
+                    fs::perm_options::replace, error);
+    CHECK(!error);
 
     torne::daemon::DaemonConfig config;
     config.runtime_directory = root.string();
@@ -534,7 +567,7 @@ void test_daemon_publishes_and_closes()
     CHECK(finished.load(std::memory_order_acquire));
     CHECK(exit_code == 0);
     CHECK(FakeDevice::close_calls.load() == 1);
-    CHECK(!fs::exists(endpoint_path.value()));
+    if (endpoint_path) CHECK(!fs::exists(endpoint_path.value()));
 
     fs::remove_all(root, error);
 #endif

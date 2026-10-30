@@ -96,7 +96,7 @@ CIは実open/claim/tune/TSを行わない。
   presence、冷resetの10/2/1ms、電源断、FIFO count/RX/TX、SEND一度、
   9600/19200/38400のbaud、注入clockを実装し、short/timeout/USB喪失/unknownの
   非再送・セッション無効化をfakeで確認する。
-- `card/service` で製品UARTをCore 9d8の`CardHardware`/`CardTime`/
+- `card/service` で製品UARTをCore 1d5569eeの`CardHardware`/`CardTime`/
   `CardSession`/`CardProtocolSessionAdapter`へ接続した。`EnclosureFamily`の
   card backend/protocolを`CardService`へ渡し、通常daemonのCore listener経路に
   乗る。ATR構文/T=1/APDU/IFSD/WTXはCore既存APIに任せ、CONSUMING_READ/
@@ -126,26 +126,27 @@ CIは実open/claim/tune/TSを行わない。
   bank用途/容量の判断、ROM patch適用と物理復旧。
 - `DaemonBackend`の実機open/claim、Core listenerの実機検証、長時間安定性。
   fakeとLinux CTestは収録済み。
-- PC/SC IFD、WinSCard DLL、OS包装、配布物（C3は別作業）。
+- PC/SC IFD/OS包装の実機登録・pcscd・macOS loader、実カードI/O、配布物。Linux IFD/Windows DLLの限定CI stageは候補として収録するが、OS登録は行わない。
 
 ## Core 入力（暫定）
 
 | 項目 | 値 |
 | --- | --- |
 | repository | `https://github.com/Khronos31/dtv-userland-core.git` |
-| commit | `9d8e02c4f113568012e257ed46d72c9a55751958`（Card/T=1開発branch用の中間pin） |
+| commit | `1d5569ee303204cbb2d660517152d8a5b5878041`（Core141、Unix IFD torne profileを含む採用中間pin） |
 | 定義場所 | `cmake/TorneCoreDependency.cmake` の1か所 |
 
-9d8e02c4 はCardService接続のための中間pinであり、最終5製品同pin・製品main
-採用ではない。最終pin確定後に5製品と同じ新Coreへ揃える。更新するときは上記のファイルだけを
-変える。
+1d5569ee はUnix IFDのtorne profileを含む採用中間pinであり、最終5製品同pin・
+tagではない。最終pin確定後に5製品と同じ新Coreへ揃える。更新するときは上記の
+ファイルだけを変える。
 
 既定の FetchContent 経路は `GIT_TAG` で上記 commit を取得する。一方
 `TORNE_CORE_SOURCE_DIR` は**開発者が指定する未検証の入力**であり、CMake は
 checkout の commit や内容を機械検証しない。指定する開発者の責任で、上記
-commit を checkout したツリーを渡す。正式配布物の入力監査（固定版・ハッシュ・
-対応ソースの確認）は、この開発者向け近道とは別の工程で行う。今回の増分では
-SHA 検証コードや強制的な checkout 制約を追加していない。
+commit（torne profileを含む現行Core）を checkout したツリーを渡す。正式配布物の
+入力監査（固定版・ハッシュ・対応ソースの確認）は、この開発者向け近道とは別の
+工程で行う。今回の増分では SHA 検証コードや強制的な checkout 制約を追加して
+いない。
 
 ## Core への接続方針（実在 API）
 

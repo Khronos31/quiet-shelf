@@ -23,6 +23,17 @@ option(TORNE_BUILD_LIVE_USB_CHECK
 set(TORNE_FR30_BINUTILS_DIR "" CACHE PATH
     "binutils 2.47 fr30-elf build tree for explicit FR30 generation")
 
+if(WIN32)
+    set(_torne_winscard_default ON)
+else()
+    set(_torne_winscard_default OFF)
+endif()
+option(TORNE_BUILD_WINSCARD
+    "Build and stage the shared Core WinSCard.dll for local application use"
+    ${_torne_winscard_default})
+option(TORNE_BUILD_PCSC_IFD
+    "Build the optional Unix PC/SC IFD; requires a Core torne profile" OFF)
+
 # Core features needed by the three product commands and the daemon seam. The
 # daemon does not assemble a listener yet, but the same input is already used
 # so that the later integration does not add a second Core configuration.
@@ -43,11 +54,123 @@ set(DTV_USERLAND_BUILD_HOST_AUTHORITY_OWNER ON)
 set(DTV_USERLAND_BUILD_HOST_AUTHORITY_BRIDGE ON)
 set(DTV_USERLAND_BUILD_HOST_LISTENER_CONTEXT ON)
 
+if(WIN32 AND TORNE_BUILD_WINSCARD)
+    set(DTV_USERLAND_BUILD_WINDOWS_WINSCARD ON)
+endif()
+if(TORNE_BUILD_PCSC_IFD)
+    set(DTV_USERLAND_BUILD_UNIX_PCSC_IFD ON)
+    set(DTV_USERLAND_UNIX_PCSC_TORNE_PROFILE ON)
+endif()
+
 include(cmake/TorneCoreDependency.cmake)
 torne_add_core()
 
 include(cmake/TorneLibusb.cmake)
 torne_add_libusb()
+
+get_target_property(TORNE_CORE_ROOT dtv_userland_core SOURCE_DIR)
+if(NOT TORNE_CORE_ROOT)
+    message(FATAL_ERROR "Could not locate the Core source root")
+endif()
+
+if(WIN32 AND TORNE_BUILD_WINSCARD)
+    if(NOT TARGET dtv_windows_winscard)
+        message(FATAL_ERROR
+            "Core did not provide dtv_windows_winscard; update the fixed Core input")
+    endif()
+    dtv_add_windows_winscard_dll(torne_winscard)
+    if(NOT MSVC)
+        target_link_options(dtv_windows_winscard PRIVATE -static)
+        get_filename_component(_torne_compiler_bin_dir
+            "${CMAKE_C_COMPILER}" DIRECTORY)
+        set(_torne_mingw_runtime_default
+            "${_torne_compiler_bin_dir}/../x86_64-w64-mingw32/share/mingw32/COPYING.MinGW-w64-runtime.txt")
+        get_filename_component(_torne_mingw_runtime_default
+            "${_torne_mingw_runtime_default}" ABSOLUTE)
+    endif()
+    set(TORNE_MINGW_RUNTIME_LICENSE
+        "${_torne_mingw_runtime_default}" CACHE FILEPATH
+        "MinGW-w64 runtime license text for the statically linked Windows runtime")
+    if(NOT MSVC AND NOT EXISTS "${TORNE_MINGW_RUNTIME_LICENSE}")
+        message(FATAL_ERROR
+            "MinGW-w64 runtime license not found: ${TORNE_MINGW_RUNTIME_LICENSE}")
+    endif()
+    set(TORNE_PCSC_WINDOWS_STAGE_DIR "${CMAKE_BINARY_DIR}/pcsc/windows")
+    set(TORNE_PCSC_WINDOWS_STAGE_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TORNE_PCSC_WINDOWS_STAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:dtv_windows_winscard>"
+            "${TORNE_PCSC_WINDOWS_STAGE_DIR}/WinSCard.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DTV_WINDOWS_WINSCARD_ADAPTER_DIR}/COPYING"
+            "${TORNE_PCSC_WINDOWS_STAGE_DIR}/COPYING"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DTV_WINDOWS_WINSCARD_ADAPTER_DIR}/README.md"
+            "${TORNE_PCSC_WINDOWS_STAGE_DIR}/README.md"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${TORNE_CORE_ROOT}/LICENSE"
+            "${TORNE_PCSC_WINDOWS_STAGE_DIR}/LICENSE.dtv-userland-core")
+    if(NOT MSVC)
+        list(APPEND TORNE_PCSC_WINDOWS_STAGE_COMMANDS
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${TORNE_MINGW_RUNTIME_LICENSE}"
+                "${TORNE_PCSC_WINDOWS_STAGE_DIR}/COPYING.MinGW-w64-runtime.txt")
+    endif()
+    add_custom_target(torne_pcsc_stage
+        ${TORNE_PCSC_WINDOWS_STAGE_COMMANDS}
+        DEPENDS torne_winscard
+        COMMENT "Staging WinSCard.dll and its GPL provenance for local application use"
+        VERBATIM)
+    install(TARGETS dtv_windows_winscard
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES
+        "${DTV_WINDOWS_WINSCARD_ADAPTER_DIR}/COPYING"
+        "${DTV_WINDOWS_WINSCARD_ADAPTER_DIR}/README.md"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/dtv_userland_core/windows_winscard")
+    install(FILES
+        "${TORNE_CORE_ROOT}/LICENSE"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/dtv_userland_core")
+    if(NOT MSVC)
+        install(FILES
+            "${TORNE_MINGW_RUNTIME_LICENSE}"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/llvm-mingw")
+    endif()
+endif()
+if(TORNE_BUILD_PCSC_IFD)
+    if(NOT TARGET dtv::unix_pcsc_ifd)
+        message(FATAL_ERROR
+            "Core did not provide dtv::unix_pcsc_ifd; update the fixed Core input")
+    endif()
+    get_target_property(TORNE_CORE_UNIX_IFD_SOURCE_DIR
+        dtv_userland_unix_pcsc_ifd SOURCE_DIR)
+    if(NOT TORNE_CORE_UNIX_IFD_SOURCE_DIR)
+        message(FATAL_ERROR
+            "Could not locate the Core Unix IFD source directory")
+    endif()
+    set(TORNE_PCSC_UNIX_STAGE_DIR "${CMAKE_BINARY_DIR}/pcsc/unix")
+    add_custom_target(torne_pcsc_stage
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TORNE_PCSC_UNIX_STAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:dtv::unix_pcsc_ifd>"
+            "${TORNE_PCSC_UNIX_STAGE_DIR}/$<TARGET_FILE_NAME:dtv::unix_pcsc_ifd>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${TORNE_CORE_UNIX_IFD_SOURCE_DIR}/adapters/unix_pcsc_ifd/COPYING"
+            "${TORNE_PCSC_UNIX_STAGE_DIR}/COPYING"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${TORNE_CORE_UNIX_IFD_SOURCE_DIR}/adapters/unix_pcsc_ifd/UNIX_PCSC_IFD_PROVENANCE.json"
+            "${TORNE_PCSC_UNIX_STAGE_DIR}/UNIX_PCSC_IFD_PROVENANCE.json"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${TORNE_CORE_ROOT}/LICENSE"
+            "${TORNE_PCSC_UNIX_STAGE_DIR}/LICENSE.dtv-userland-core"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/packaging/pcsc/torne.reader.conf.in"
+            "${TORNE_PCSC_UNIX_STAGE_DIR}/torne.reader.conf.in"
+        COMMENT "Staging Unix PC/SC IFD and its GPL provenance"
+        VERBATIM)
+    if(APPLE)
+        include(packaging/macos/CMakeLists.txt)
+    endif()
+endif()
 
 function(torne_set_warnings target)
     if(MSVC)
