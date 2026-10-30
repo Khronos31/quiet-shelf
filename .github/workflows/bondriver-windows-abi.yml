@@ -1,0 +1,133 @@
+name: bondriver-windows-abi
+
+# Diagnostic only: dedicated branch and path filter.  It does not modify the
+# root quiet-shelf project, other branches, hardware or Home Assistant.
+on:
+  push:
+    branches:
+      - bondriver-abi-20261030
+    paths:
+      - 'diagnostics/windows-abi/**'
+      - '.github/workflows/bondriver-windows-abi.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bondriver-windows-abi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Tool versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --version
+          ninja --version
+          python --version
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, Architecture
+
+      - name: Download and verify llvm-mingw
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-x86_64.zip'
+          $expected = 'fd5462b7f5d93b2ff981fcd3f9c7e427e47f3203c64ea91c27bcc444eebd74cd'
+          $zip = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'llvm-mingw'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "llvm-mingw sha256 mismatch: $actual"
+          }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $tc = Join-Path $dest 'llvm-mingw-20261020-ucrt-x86_64'
+          if (-not (Test-Path (Join-Path $tc 'bin\clang++.exe'))) {
+            throw "llvm-mingw layout mismatch under $dest"
+          }
+          "LLVM_MINGW=$tc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & (Join-Path $tc 'bin\clang++.exe') --version
+
+      - name: Build MSVC host and DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S diagnostics/windows-abi -B build-msvc `
+            -G 'Visual Studio 17 2022' -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-msvc --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'build-msvc\Release\abi_probe_host.exe')) {
+            throw 'MSVC host was not produced'
+          }
+          if (-not (Test-Path 'build-msvc\Release\BonDriver_ABIProbe.dll')) {
+            throw 'MSVC DLL was not produced'
+          }
+
+      - name: Build llvm-mingw host and DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:LLVM_MINGW\bin;$env:PATH"
+          $clang = Join-Path $env:LLVM_MINGW 'bin\clang.exe'
+          $clangxx = Join-Path $env:LLVM_MINGW 'bin\clang++.exe'
+          cmake -S diagnostics/windows-abi -B build-mingw -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$clang" `
+            -DCMAKE_CXX_COMPILER="$clangxx" `
+            -DCMAKE_C_COMPILER_FRONTEND_VARIANT=GNU `
+            -DCMAKE_CXX_COMPILER_FRONTEND_VARIANT=GNU
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-mingw
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'build-mingw\abi_probe_host.exe')) {
+            throw 'llvm-mingw host was not produced'
+          }
+          if (-not (Test-Path 'build-mingw\BonDriver_ABIProbe.dll')) {
+            throw 'llvm-mingw DLL was not produced'
+          }
+          & $clangxx --version
+
+      - name: Run ABI probe cases
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python diagnostics/windows-abi/runner/run_cases.py `
+            --msvc-host build-msvc/Release/abi_probe_host.exe `
+            --msvc-dll build-msvc/Release/BonDriver_ABIProbe.dll `
+            --mingw-host build-mingw/abi_probe_host.exe `
+            --mingw-dll build-mingw/BonDriver_ABIProbe.dll `
+            --outdir artifacts/windows-abi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish summary
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path 'artifacts/windows-abi/summary.txt') {
+            Get-Content 'artifacts/windows-abi/summary.txt'
+          }
+          if (Test-Path 'artifacts/windows-abi/summary.md') {
+            Get-Content 'artifacts/windows-abi/summary.md' |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: windows-abi-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/windows-abi
+          if-no-files-found: warn
