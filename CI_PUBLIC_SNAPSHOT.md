@@ -20,6 +20,14 @@
   not call IFDH operations, start a daemon/pcscd, register a service, open USB,
   or run the six normal jobs. The wrong `CFBundleExecutable` copy is a negative
   control. macOS actual service discovery and registration remain unverified.
+- Before configure, the branch-only job also runs a diagnostic limited to
+  `xcrun --show-sdk-path`: it prints `xcodebuild -version`, candidate
+  `ifdhandler.h` paths/realpaths, and the count/first paths of a
+  `find "$sdk" -name ifdhandler.h` scan. The SDK root is normalized to its
+  real directory first; child symlinks are not followed. Missing/unresolved
+  SDK roots report `ifdhandler_count=unknown`, not a false zero. This step does not add a header,
+  include path, shim, fallback, or change the existing configure/build/load
+  conditions. It is diagnostic output only, not evidence that a header exists.
 - This branch contains only source, documentation, PC/SC packaging, and CI files from the
   allowlisted snapshot. No private git history, tokens, or device captures are
   copied.

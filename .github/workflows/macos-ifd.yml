@@ -27,6 +27,53 @@ jobs:
           cmake --version | head -n 1
           xcrun --show-sdk-path
 
+      - name: Diagnose SDK IFD header availability
+        shell: bash
+        run: |
+          set -u
+          echo "== xcodebuild"
+          xcodebuild -version 2>&1 || echo "xcodebuild unavailable"
+          sdk_input=$(xcrun --show-sdk-path 2>/dev/null || true)
+          echo "sdk_input=$sdk_input"
+          sdk=''
+          sdk_status=missing
+          if [ -n "$sdk_input" ] && [ -d "$sdk_input" ]; then
+            sdk=$(cd -P -- "$sdk_input" 2>/dev/null && pwd -P) || sdk=''
+            if [ -n "$sdk" ] && [ -d "$sdk" ]; then
+              sdk_status=normalized
+            else
+              sdk_status=unresolved
+              sdk=''
+            fi
+          fi
+          echo "sdk_root=$sdk"
+          echo "sdk_status=$sdk_status"
+          if [ "$sdk_status" != "normalized" ]; then
+            echo "ifdhandler_count=unknown"
+            exit 0
+          fi
+          for candidate in \
+            "$sdk/usr/include/PCSC/ifdhandler.h" \
+            "$sdk/System/Library/Frameworks/PCSC.framework/Headers/ifdhandler.h" \
+            "$sdk/System/Library/Frameworks/PCSC.framework/Versions/Current/Headers/ifdhandler.h" \
+            "$sdk/System/Library/Frameworks/PCSC.framework/Versions/A/Headers/ifdhandler.h"; do
+            if [ -e "$candidate" ]; then
+              if command -v realpath >/dev/null 2>&1; then
+                resolved=$(realpath "$candidate")
+              else
+                resolved=$candidate
+              fi
+              echo "candidate=$candidate exists realpath=$resolved"
+            else
+              echo "candidate=$candidate missing"
+            fi
+          done
+          find "$sdk" -name ifdhandler.h -print > "$RUNNER_TEMP/ifdhandler.paths" 2>/dev/null || true
+          count=$(wc -l < "$RUNNER_TEMP/ifdhandler.paths" | tr -d ' ')
+          echo "ifdhandler_count=$count"
+          sed -n '1,20p' "$RUNNER_TEMP/ifdhandler.paths"
+          exit 0
+
       - name: Configure PC/SC IFD/bundle
         run: |
           cmake -S . -B build-ifd \
