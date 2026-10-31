@@ -27,6 +27,23 @@ jobs:
           cmake --version | head -n 1
           xcrun --show-sdk-path
 
+      - name: Install build-only pcsc-lite IFD headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install pcsc-lite
+          prefix=$(brew --prefix pcsc-lite)
+          header="$prefix/include/PCSC/ifdhandler.h"
+          test -r "$header"
+          brew info pcsc-lite > "$RUNNER_TEMP/pcsc-lite-info.txt"
+          version=$(sed -n '1p' "$RUNNER_TEMP/pcsc-lite-info.txt")
+          checksum_line=$(shasum -a 256 "$header")
+          checksum=${checksum_line%% *}
+          echo "pcsc_lite_include_dir=$prefix/include/PCSC" >> "$GITHUB_ENV"
+          echo "pcsc_lite_header=$header"
+          echo "pcsc_lite_version=$version"
+          echo "pcsc_lite_header_sha256=$checksum"
+
       - name: Diagnose SDK IFD header availability
         shell: bash
         run: |
@@ -79,7 +96,8 @@ jobs:
           cmake -S . -B build-ifd \
             -DCMAKE_BUILD_TYPE=Release \
             -DTORNE_BUILD_TESTS=OFF \
-            -DTORNE_BUILD_PCSC_IFD=ON
+            -DTORNE_BUILD_PCSC_IFD=ON \
+            -DDTV_USERLAND_PCSC_IFD_INCLUDE_DIR:PATH="$pcsc_lite_include_dir"
 
       - name: Build PC/SC IFD and candidate bundle
         run: |

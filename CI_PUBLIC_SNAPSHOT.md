@@ -13,6 +13,12 @@
   `.github/workflows/fr30-generation.yml` is manual-only (`workflow_dispatch`)
   and adds one job. Neither uses secrets, write tokens, private checkouts,
   releases, packages, schedules, or external uploads.
+- The branch-only `.github/workflows/macos-ifd.yml` installs Homebrew
+  pcsc-lite only as a CI build-header input, records the version/header hash,
+  and passes `../include/PCSC` through the existing Core cache variable. The
+  generated IFD is not linked to libpcsclite/Homebrew, and users are not asked
+  to install Homebrew. This remains a packaging/build-input step, not runtime
+  support or OS registration.
 - The branch-only `.github/workflows/macos-ifd.yml` is triggered only by
   `ci/torne-macos-ifd`. It builds the optional macOS IFD/bundle, checks Mach-O,
   exports, plist, notices, and dependencies, then probes `CFBundle` loading and
