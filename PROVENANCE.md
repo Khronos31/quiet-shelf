@@ -7,13 +7,13 @@
 ## dtv-userland-core
 
 - repository: `https://github.com/Khronos31/dtv-userland-core.git`
-- commit: `1d5569ee303204cbb2d660517152d8a5b5878041`（Core141、Unix IFD torne profile採用中間pin）
+- commit: `548a04605d9e224be179547de30f590ff693a128`（Core main、Windows共通WinSCard fixtureとUnix IFD torne profileを含む採用pin）
 - 固定箇所: `cmake/TorneCoreDependency.cmake`
 - 用途: `host_ctl`、`host_ts`、`identity`、`json`、`host_runtime`、
   `host_facade`、`host_card_t1` の既存 API。製品側でATR/T=1/APDU契約を複製しない。
 - ライセンス: Core リポジトリの `LICENSE` / `PROVENANCE.json` に従う。
   portable 部分は MIT、GPL adapter は GPL-2.0-only。
-- この commit はCardService接続のための中間pinであり、最終5製品同pinではない。
+- この commit はCardService接続とWindows共通WinSCard fixtureを含む採用pinであり、最終5製品同pinではない。
 
 Core のソースは FetchContent で取得するか、`TORNE_CORE_SOURCE_DIR` で同じ
 commit を checkout 済みのツリーを指定する。生成物や取得物はこのリポジトリへ
@@ -76,7 +76,7 @@ vendor しない。
   `driver/torne_fw_gen.h:221-245` に基づく。製品コードはhash/entry/語だけを保持し、
   旧画像のbyte列を製品FWやロード対象へ埋め込まない。
 - SHA-256はCoreの `include/dtv/userland/detail/sha256.h`（Core入力
-  `1d5569ee...`、MIT範囲）を使用する。外部runtime依存は増やしていない。
+  `548a046...`、MIT範囲）を使用する。外部runtime依存は増やしていない。
 - `tests/widen_recognition_tests.cpp` に置く85語/340Bの旧画像は、登録tupleの
   受理・変異試験専用の固定参照データであり、製品FWではない。出典は同じ
   `torne_drv` commitの `torne_addressing0_code[85]`（GPL-2.0-only、coax/Linux由来）。
@@ -165,13 +165,13 @@ vendor しない。
   TRIGGERとして再送しない。不正・short・unknown後はセッションを無効化し、
   後続操作を止める。実カード、presence極性、FIFO上限、byte lane、ATR/T=1は
   未実測。fake EP0/clockのみで検証する。
-- `src/card/service.*` は製品UARTを共有Core **1d5569ee** の公開
+- `src/card/service.*` は製品UARTを共有Core **548a046** の公開
   `CardHardware`/`CardTime`/`CardSession`/`CardProtocolSessionAdapter`へ接続する
   自作host adapter。ATR構文・T=1・IFSD・EDC・R/S/WTX・APDUはCore既存APIに任せ、
   製品側で複製しない。`src/product/hardware_device.cpp`が同じ単一Transportから
   `CardPort`を公開し、`src/product/core_family.cpp`が`EnclosureFamily`の
   card backend/protocolとして`CardService`へ渡す。
-- Core 1d5569eeはMIT/GPL-2.0-onlyの既存Core sourceであり、製品は公開APIだけに依存
+- Core 548a046はMIT/GPL-2.0-onlyの既存Core sourceであり、製品は公開APIだけに依存
   する。Coreの生成物や他製品sourceをvendorしない。
 
 ## DiB8096 C11 frontend
@@ -202,7 +202,7 @@ vendor しない。
 
 ## PC/SC adapter packaging
 
-- Windows adapter: Core `1d5569ee303204cbb2d660517152d8a5b5878041` の
+- Windows adapter: Core `548a04605d9e224be179547de30f590ff693a128` の
   `adapters/windows_winscard/`（GPL-2.0-only、PX4由来）。製品はCore既存の
   `dtv_windows_winscard` / `WinSCard.dll` targetを選択し、同一DLL byteを
   `torne_pcsc_stage`でアプリローカルへstageする。OS全体のreader登録・
@@ -210,7 +210,7 @@ vendor しない。
 - Unix IFD: Core `adapters/unix_pcsc_ifd/`（GPL-2.0-only、
   `UNIX_PCSC_IFD_PROVENANCE.json`付き）。`TORNE_BUILD_PCSC_IFD=ON`では
   Core `DTV_USERLAND_BUILD_UNIX_PCSC_IFD=ON` と
-  `DTV_USERLAND_UNIX_PCSC_TORNE_PROFILE=ON` を固定Core141入力に対して設定する。
+  `DTV_USERLAND_UNIX_PCSC_TORNE_PROFILE=ON` を固定Core548入力に対して設定する。
   ASICEN/torne profileは排他で、PX4 profileへの暗黙fallbackはしない。
   `torne_pcsc_stage`はIFD共有ライブラリ、adapter `COPYING`/provenance、Linux
   reader設定ひな形をstageする。Linux pcscd/OS登録、macOS loader/登録は未実施。

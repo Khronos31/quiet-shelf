@@ -96,7 +96,7 @@ CIは実open/claim/tune/TSを行わない。
   presence、冷resetの10/2/1ms、電源断、FIFO count/RX/TX、SEND一度、
   9600/19200/38400のbaud、注入clockを実装し、short/timeout/USB喪失/unknownの
   非再送・セッション無効化をfakeで確認する。
-- `card/service` で製品UARTをCore 1d5569eeの`CardHardware`/`CardTime`/
+- `card/service` で製品UARTをCore 548a046の`CardHardware`/`CardTime`/
   `CardSession`/`CardProtocolSessionAdapter`へ接続した。`EnclosureFamily`の
   card backend/protocolを`CardService`へ渡し、通常daemonのCore listener経路に
   乗る。ATR構文/T=1/APDU/IFSD/WTXはCore既存APIに任せ、CONSUMING_READ/
@@ -133,10 +133,10 @@ CIは実open/claim/tune/TSを行わない。
 | 項目 | 値 |
 | --- | --- |
 | repository | `https://github.com/Khronos31/dtv-userland-core.git` |
-| commit | `1d5569ee303204cbb2d660517152d8a5b5878041`（Core141、Unix IFD torne profileを含む採用中間pin） |
+| commit | `548a04605d9e224be179547de30f590ff693a128`（Core main、Windows共通WinSCard fixtureとUnix IFD torne profileを含む採用pin） |
 | 定義場所 | `cmake/TorneCoreDependency.cmake` の1か所 |
 
-1d5569ee はUnix IFDのtorne profileを含む採用中間pinであり、最終5製品同pin・
+548a046 はWindows共通WinSCard fixtureとUnix IFDのtorne profileを含む採用pinであり、最終5製品同pin・
 tagではない。最終pin確定後に5製品と同じ新Coreへ揃える。更新するときは上記の
 ファイルだけを変える。
 

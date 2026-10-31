@@ -1,24 +1,39 @@
 # Public CI snapshot of torne-userland
 
 - **Source repository**: `Khronos31/torne-userland` (private at snapshot time).
-- **Source commit**: `ba35825e0a236c098ce5d614eef741618aa6feb2` (main; product tree identical to 9619; includes PR21 Core/family/CardService/optional PC/SC packaging and cold-start clock-gate fix).
+- **Source commit**: `2163dcbe32b07baa229612edd8536ec8602d5c52` (private `windows-pcsc-native` branch from main `ba35825`; Core pin update only, plus matching pin references).
 - **License**: GPL-2.0-only. The product `LICENSE`, `PROVENANCE.md`, and the upstream attribution `NOTICE` are preserved.
 - **Dependency pin**: `Khronos31/dtv-userland-core` at
-  `1d5569ee303204cbb2d660517152d8a5b5878041` (Core141 intermediate pin), fetched by CMake
-  FetchContent from the public repository. It is not the final five-product pin.
+  `548a04605d9e224be179547de30f590ff693a128` (Core main after PR144; shared Windows
+  WinSCard SDK import fixture), fetched by CMake FetchContent from the public
+  repository. It is not the final five-product pin.
 - **libusb**: 1.0.30, fetched by URL and SHA-256 from the libusb release page and
   built as a static library with udev disabled.
 - **CI workflows**: `.github/workflows/ci.yml` runs the six automatic
   cross-platform jobs on pushes to `ci/torne-userland`. The adapted
   `.github/workflows/fr30-generation.yml` is manual-only (`workflow_dispatch`)
-  and adds one job. Neither uses secrets, write tokens, private checkouts,
-  releases, packages, schedules, or external uploads.
+  and adds one job. The branch-only `.github/workflows/windows-winscard-native.yml`
+  runs one Windows native stage job on `ci/torne-winscard-native`. None uses
+  secrets, write tokens, private checkouts, releases, packages, schedules, or
+  external uploads.
 - The branch-only `.github/workflows/macos-ifd.yml` installs Homebrew
   pcsc-lite only as a CI build-header input, records the version/header hash,
   and passes `../include/PCSC` through the existing Core cache variable. The
   generated IFD is not linked to libpcsclite/Homebrew, and users are not asked
   to install Homebrew. This remains a packaging/build-input step, not runtime
   support or OS registration.
+- The branch-only `.github/workflows/windows-winscard-native.yml` is triggered only by
+  `ci/torne-winscard-native`. It configures the Torne source with Core
+  `DTV_USERLAND_BUILD_TESTING=ON` and `TORNE_BUILD_WINSCARD=ON`, builds
+  `torne_pcsc_stage` plus the shared Core `windows_winscard_native_fixture_tests`
+  and `windows_winscard_sdk_import_tests`, and runs both against the staged
+  `WinSCard.dll`. The native fixture uses its own private temporary runtime and
+  checks the Torne mock reader namespace/T=1/ATR/APDU; the SDK import fixture
+  checks app-local module identity, 12 function imports plus
+  `g_rgSCardT1Pci`, context creation, and the separate System32 provider.
+  It does not register readers, modify System32, start a daemon/pcscd, open USB,
+  or use a real card. The job is prepared but has not executed in this
+  preparation.
 - The branch-only `.github/workflows/macos-ifd.yml` is triggered only by
   `ci/torne-macos-ifd`. It builds the optional macOS IFD/bundle, checks Mach-O,
   exports, plist, notices, and dependencies, then probes `CFBundle` loading and
@@ -38,14 +53,17 @@
   allowlisted snapshot. No private git history, tokens, or device captures are
   copied.
 - The workflow builds and runs non-hardware tests only. It never opens, claims,
-  tunes, or streams from a tuner. Windows is cross-compiled and is not executed.
+  tunes, or streams from a tuner. The normal Windows jobs are cross-compiled and
+  are not executed; the branch-only Windows native stage job is prepared but not
+  executed in this preparation.
 - CTest has seventeen tests normally. The Linux job additionally configures an
   optional `TORNE_BUILD_PCSC_IFD=ON` build with tests OFF and checks the staged
   IFD `.so`, notices, reader template, and ten `IFDH*` ABI symbols. The Windows
   cross job stages `WinSCard.dll` and checks its exports, imports, and notices.
-  These are CI-only staging checks; no pcscd, OS reader registration, service,
-  or real device I/O is performed. macOS keeps its normal build/tests and does
-  not claim bundle loader/registration success.
+  The branch-only Windows native job applies the shared Core mock and SDK import
+  fixtures to the staged DLL. These are CI-only staging checks; no pcscd, OS
+  reader registration, service, or real device I/O is performed. macOS keeps
+  its normal build/tests and does not claim bundle loader/registration success.
 - The manual FR30 workflow adds four tests (twenty-one total when enabled),
   including `torne_fr30_generation`, `torne_widen_firmware`,
   `torne_core1_firmware`, and `torne_core0_firmware`.

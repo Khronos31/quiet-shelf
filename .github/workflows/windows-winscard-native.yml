@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Branch-only Windows native check for the staged Torne WinSCard DLL and the
+# shared Core fixtures adopted at Core 548a046. Not registered on the default
+# branch and does not run the six normal jobs or the macOS IFD job.
+name: Windows candidate WinSCard native stage check
+
+on:
+  push:
+    branches: [ci/torne-winscard-native]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-winscard-native:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out public CI snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain and fixed pins
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --version
+          Write-Host "GITHUB_SHA=$env:GITHUB_SHA"
+          Select-String -Path 'cmake/TorneCoreDependency.cmake' -Pattern 'TORNE_CORE_COMMIT'
+
+      - name: Configure Torne with Core Windows fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -A x64 `
+            -DTORNE_BUILD_TESTS=OFF `
+            -DDTV_USERLAND_BUILD_TESTING=ON `
+            -DTORNE_BUILD_WINSCARD=ON
+          if ($LASTEXITCODE -ne 0) { throw "configure exit=$LASTEXITCODE" }
+
+      - name: Build staged DLL and shared Core fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build --config Release --parallel 2 `
+            --target torne_pcsc_stage windows_winscard_native_fixture_tests windows_winscard_sdk_import_tests
+          if ($LASTEXITCODE -ne 0) { throw "build exit=$LASTEXITCODE" }
+
+      - name: Check staged DLL exports and dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Join-Path $PWD 'build\pcsc\windows\WinSCard.dll'
+          if (-not (Test-Path -LiteralPath $dll)) { throw "missing staged DLL: $dll" }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC x64 tools not found' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $exportCmd = "call `"$vcvars`" >nul && dumpbin /nologo /exports `"$dll`""
+          $exportsRaw = & $env:ComSpec /d /s /c $exportCmd
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports exit=$LASTEXITCODE" }
+          $exportsRaw | Write-Host
+          $exportCount = @($exportsRaw | Where-Object {
+              $_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+\S+'
+            }).Count
+          Write-Host "WinSCard_export_count=$exportCount"
+          if ($exportCount -ne 13) { throw "expected 13 WinSCard exports, got $exportCount" }
+          $dependencyCmd = "call `"$vcvars`" >nul && dumpbin /nologo /dependents `"$dll`""
+          $dependenciesRaw = & $env:ComSpec /d /s /c $dependencyCmd
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents exit=$LASTEXITCODE" }
+          $dependenciesRaw | Write-Host
+          if ($dependenciesRaw -match 'libpcsclite|libusb|libc\+\+|libstdc\+\+|libgcc|libwinpthread') {
+            throw 'unexpected non-system WinSCard dependency'
+          }
+
+      - name: Run Core native and SDK fixtures against the staged DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $PWD 'build\pcsc\windows'
+          $dll = Join-Path $stage 'WinSCard.dll'
+          $native = Get-ChildItem -Path 'build' -Recurse -Filter 'windows_winscard_native_fixture_tests.exe' |
+            Select-Object -First 1 -ExpandProperty FullName
+          $sdk = Get-ChildItem -Path 'build' -Recurse -Filter 'windows_winscard_sdk_import_tests.exe' |
+            Select-Object -First 1 -ExpandProperty FullName
+          foreach ($path in @($dll, $native, $sdk)) {
+            if (-not $path -or -not (Test-Path -LiteralPath $path)) { throw "missing fixture input: $path" }
+          }
+          Write-Host 'Expected Torne mock reader: DTV userland (torne:fixture-t/reader-0)'
+          Write-Host 'Expected mock protocol/ATR/APDU: T=1 / 3B00 / 90 00'
+          $runtime = Join-Path $env:RUNNER_TEMP ('tw-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))
+          New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          $acl = Get-Acl $runtime
+          $acl.SetOwner($identity.User)
+          $acl.SetAccessRuleProtection($true, $false)
+          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity.User,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+          $acl.SetAccessRule($rule)
+          Set-Acl -Path $runtime -AclObject $acl
+          $oldTemp = $env:TEMP
+          $oldTmp = $env:TMP
+          $env:TEMP = $runtime
+          $env:TMP = $runtime
+          try {
+            Write-Host "== Core native mock fixture: $dll =="
+            & $native $dll
+            if ($LASTEXITCODE -ne 0) { throw "native fixture exit=$LASTEXITCODE" }
+
+            $stageCopy = Join-Path $runtime 'stage'
+            Copy-Item -LiteralPath $stage -Destination $stageCopy -Recurse
+            Copy-Item -LiteralPath $sdk -Destination $stageCopy
+            $sdkDll = Join-Path $stageCopy 'WinSCard.dll'
+            Write-Host "== Core SDK import fixture: $sdkDll =="
+            & (Join-Path $stageCopy 'windows_winscard_sdk_import_tests.exe')
+            if ($LASTEXITCODE -ne 0) { throw "SDK import fixture exit=$LASTEXITCODE" }
+          } finally {
+            $env:TEMP = $oldTemp
+            $env:TMP = $oldTmp
+            Remove-Item -LiteralPath $runtime -Recurse -Force -ErrorAction SilentlyContinue
+          }
