@@ -83,8 +83,8 @@ jobs:
               data = json.load(archive.extractfile(member))
           expected_map = hashlib.sha256(Path("SOURCE-MAP.json").read_bytes()).hexdigest()
           assert data["product_source"]["repository"] == "Khronos31/torne-userland"
-          assert data["product_source"]["commit"] == "3fe17ea167fc1fff4586046d6b2a8edc02f52c4b"
-          assert data["product_source"]["tree"] == "6199984391eca496abc2a5a9d26d01f9efd03264"
+          assert data["product_source"]["commit"] == "ee3f94e44a751103dc863d10b6be59b7413482cd"
+          assert data["product_source"]["tree"] == "c3b868d30db42aee668fad0a419d5e75821af468"
           assert data["checkout"]["repository"].endswith("quiet-shelf")
           assert data["checkout"]["commit"] == os.environ["GITHUB_SHA"]
           assert data["checkout"]["commit"] != data["product_source"]["commit"]

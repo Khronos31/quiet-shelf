@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Build the REL-01 source and Linux x86_64 glibc release candidate."""
+"""Build the source and Linux release archives from fixed inputs."""
 
 from __future__ import annotations
 
@@ -20,7 +20,13 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCT = "torne-userland"
-PLATFORM = "linux-glibc-x86_64"
+DEFAULT_PLATFORM = "linux-glibc-x86_64"
+LINUX_PLATFORMS = (
+    "linux-glibc-x86_64",
+    "linux-glibc-aarch64",
+    "linux-musl-x86_64",
+    "linux-musl-aarch64",
+)
 BINARIES = ("torned", "tornectl", "torne-ts")
 IFD_SYMBOLS = (
     "IFDHCreateChannel",
@@ -34,7 +40,7 @@ IFD_SYMBOLS = (
     "IFDHControl",
     "IFDHICCPresence",
 )
-ALLOWED_NEEDED = {
+GLIBC_ALLOWED_NEEDED = {
     "libc.so.6",
     "libm.so.6",
     "libpthread.so.0",
@@ -42,6 +48,7 @@ ALLOWED_NEEDED = {
     "libdl.so.2",
     "ld-linux-x86-64.so.2",
 }
+MUSL_ALLOWED_NEEDED = {"libc.so"}
 FORBIDDEN_NEEDED = (
     "libusb",
     "libpcsclite",
@@ -50,16 +57,24 @@ FORBIDDEN_NEEDED = (
     "libgcc_s",
     "libc++",
 )
-# Standard glibc loaders for the only binary platform in this increment.
-# The same loader is commonly reachable through these distro-standard aliases.
-ALLOWED_INTERPRETERS = frozenset({
-    "/lib64/ld-linux-x86-64.so.2",
-    "/lib/ld-linux-x86-64.so.2",
-    "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-    "/usr/lib64/ld-linux-x86-64.so.2",
-    "/usr/lib/ld-linux-x86-64.so.2",
-    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-})
+# Distro-standard glibc loader aliases. musl CLI archives are fully static.
+ALLOWED_INTERPRETERS = {
+    "x86_64": frozenset({
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/ld-linux-x86-64.so.2",
+        "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        "/usr/lib64/ld-linux-x86-64.so.2",
+        "/usr/lib/ld-linux-x86-64.so.2",
+        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    }),
+    "aarch64": frozenset({
+        "/lib/ld-linux-aarch64.so.1",
+        "/lib64/ld-linux-aarch64.so.1",
+        "/usr/lib/ld-linux-aarch64.so.1",
+        "/usr/lib64/ld-linux-aarch64.so.1",
+    }),
+}
+ELF_MACHINE = {"x86_64": "Advanced Micro Devices X86-64", "aarch64": "AArch64"}
 
 
 def fail(message: str) -> None:
@@ -68,12 +83,15 @@ def fail(message: str) -> None:
 
 
 def run(args: list[str], *, cwd: Path | None = None,
-        capture: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, check=True, text=True, capture_output=capture)
+        capture: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    process_env = None if env is None else {**os.environ, **env}
+    return subprocess.run(args, cwd=cwd, check=True, text=True,
+                          capture_output=capture, env=process_env)
 
 
-def output(args: list[str], *, cwd: Path | None = None) -> str:
-    return run(args, cwd=cwd, capture=True).stdout.strip()
+def output(args: list[str], *, cwd: Path | None = None,
+           env: dict[str, str] | None = None) -> str:
+    return run(args, cwd=cwd, capture=True, env=env).stdout.strip()
 
 
 def sha256(path: Path) -> str:
@@ -82,6 +100,105 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def split_platform(platform: str) -> tuple[str, str]:
+    match = re.fullmatch(r"linux-(glibc|musl)-(x86_64|aarch64)", platform)
+    if match is None:
+        fail(f"unsupported Linux platform: {platform}")
+    return match.group(1), match.group(2)
+
+
+def executable_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        if not path.is_file():
+            fail(f"toolchain executable does not exist: {value}")
+        return path
+    found = shutil.which(value)
+    if found is None:
+        fail(f"toolchain executable not found: {value}")
+    return Path(found)
+
+
+def load_toolchains(path: str | None) -> dict[str, dict[str, object]]:
+    if path is None:
+        return {}
+    config_path = Path(path).expanduser().resolve()
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"invalid toolchain config: {error}")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        fail("toolchain config must contain schema 1")
+    platforms = data.get("platforms")
+    if not isinstance(platforms, dict):
+        fail("toolchain config must contain a platforms object")
+    result: dict[str, dict[str, object]] = {}
+    for platform, value in platforms.items():
+        if platform not in LINUX_PLATFORMS:
+            fail(f"unsupported platform in toolchain config: {platform}")
+        if not isinstance(value, dict):
+            fail(f"toolchain entry must be an object: {platform}")
+        for key in ("cc", "cxx"):
+            if not isinstance(value.get(key), str) or not value[key]:
+                fail(f"toolchain {platform}.{key} is missing")
+        for key in ("c_flags", "cxx_flags", "exe_linker_flags", "shared_linker_flags"):
+            if key in value and not isinstance(value[key], str):
+                fail(f"toolchain {platform}.{key} must be a string")
+        if "sysroot" in value and value["sysroot"] is not None and not isinstance(value["sysroot"], str):
+            fail(f"toolchain {platform}.sysroot must be a string or null")
+        if "runner" in value and not isinstance(value["runner"], list):
+            fail(f"toolchain {platform}.runner must be a list")
+        for key in ("c_compiler_target", "cxx_compiler_target"):
+            if key in value and value[key] is not None and not isinstance(value[key], str):
+                fail(f"toolchain {platform}.{key} must be a string or null")
+        if "env" in value:
+            if not isinstance(value["env"], dict) or not all(
+                    isinstance(key, str) and isinstance(item, str)
+                    for key, item in value["env"].items()):
+                fail(f"toolchain {platform}.env must be a string map")
+        result[platform] = dict(value)
+    return result
+
+
+def resolve_platform(platform: str, toolchains: dict[str, dict[str, object]]) -> dict[str, object]:
+    libc, cpu = split_platform(platform)
+    if platform in toolchains:
+        values = dict(toolchains[platform])
+    elif platform == DEFAULT_PLATFORM:
+        values = {"cc": os.environ.get("CC", "cc"), "cxx": os.environ.get("CXX", "c++")}
+    else:
+        fail(f"--toolchain-config is required for {platform}")
+    cc = executable_path(str(values["cc"]))
+    cxx = executable_path(str(values["cxx"]))
+    runner = values.get("runner", [])
+    if runner:
+        if not isinstance(runner, list) or not all(isinstance(item, str) for item in runner):
+            fail(f"toolchain {platform}.runner must be a string list")
+        runner = [str(executable_path(runner[0]))] + list(runner[1:])
+    values.update({
+        "platform": platform,
+        "libc": libc,
+        "cpu": cpu,
+        "cc": str(cc),
+        "cxx": str(cxx),
+        "c_flags": str(values.get("c_flags", "")),
+        "cxx_flags": str(values.get("cxx_flags", "")),
+        "exe_linker_flags": str(values.get("exe_linker_flags", "-static-libstdc++ -static-libgcc")),
+        "shared_linker_flags": str(values.get("shared_linker_flags", "-static-libstdc++ -static-libgcc")),
+        "sysroot": values.get("sysroot"),
+        "cmake_system_name": values.get("cmake_system_name"),
+        "system_processor": str(values.get("system_processor", cpu)),
+        "c_compiler_target": values.get("c_compiler_target"),
+        "cxx_compiler_target": values.get("cxx_compiler_target"),
+        "runner": runner,
+        "run_checks": bool(values.get("run_checks", cpu == "x86_64")),
+        "emulated": bool(values.get("emulated", False)),
+        "build_kind": str(values.get("build_kind", "native" if cpu == "x86_64" else "cross")),
+        "env": dict(values.get("env", {})),
+    })
+    return values
 
 
 def read_version() -> str:
@@ -307,14 +424,17 @@ def source_archive(version: str, product_source: dict[str, str],
     return archive_path, source_root
 
 
-def build_from_source(version: str, source_archive_path: Path, work: Path,
-                      jobs: int) -> Path:
+def extract_source(version: str, source_archive_path: Path, work: Path) -> Path:
     extract = work / "source-build"
     extract.mkdir()
     with tarfile.open(source_archive_path) as archive:
         safe_extract(archive, extract)
-    source = extract / f"{PRODUCT}-{version}-source"
-    build = work / "build"
+    return extract / f"{PRODUCT}-{version}-source"
+
+
+def build_platform(version: str, source: Path, spec: dict[str, object],
+                   work: Path, jobs: int) -> Path:
+    build = work / f"build-{spec['platform']}"
     configure = [
         "cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
@@ -322,13 +442,28 @@ def build_from_source(version: str, source_archive_path: Path, work: Path,
         "-DTORNE_BUILD_PCSC_IFD=ON",
         f"-DTORNE_CORE_SOURCE_DIR={source / 'third_party/dtv-userland-core'}",
         f"-DTORNE_LIBUSB_SOURCE_ARCHIVE={source / 'third_party/libusb/libusb-1.0.30.tar.bz2'}",
-        "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
-        "-DCMAKE_SHARED_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
+        f"-DCMAKE_C_COMPILER={spec['cc']}",
+        f"-DCMAKE_CXX_COMPILER={spec['cxx']}",
+        f"-DCMAKE_SYSTEM_PROCESSOR={spec['system_processor']}",
+        f"-DCMAKE_EXE_LINKER_FLAGS={spec['exe_linker_flags']}",
+        f"-DCMAKE_SHARED_LINKER_FLAGS={spec['shared_linker_flags']}",
     ]
-    run(configure, cwd=source)
+    if spec.get("cmake_system_name"):
+        configure.append(f"-DCMAKE_SYSTEM_NAME={spec['cmake_system_name']}")
+    if spec.get("sysroot"):
+        configure.append(f"-DCMAKE_SYSROOT={spec['sysroot']}")
+    if spec.get("c_compiler_target"):
+        configure.append(f"-DCMAKE_C_COMPILER_TARGET={spec['c_compiler_target']}")
+    if spec.get("cxx_compiler_target"):
+        configure.append(f"-DCMAKE_CXX_COMPILER_TARGET={spec['cxx_compiler_target']}")
+    if spec.get("c_flags"):
+        configure.append(f"-DCMAKE_C_FLAGS={spec['c_flags']}")
+    if spec.get("cxx_flags"):
+        configure.append(f"-DCMAKE_CXX_FLAGS={spec['cxx_flags']}")
+    run(configure, cwd=source, env=spec["env"])
     run(["cmake", "--build", str(build), "--parallel", str(jobs), "--target",
          "torne_torned", "torne_tornectl", "torne_torne_ts", "torne_pcsc_stage"],
-        cwd=source)
+        cwd=source, env=spec["env"])
     return build
 
 
@@ -337,60 +472,109 @@ def needed(path: Path) -> list[str]:
                       output(["readelf", "-d", str(path)]))
 
 
-def check_dependencies(path: Path) -> None:
-    deps = needed(path)
-    forbidden = [dep for dep in deps if any(token in dep for token in FORBIDDEN_NEEDED)]
-    unexpected = [dep for dep in deps if dep not in ALLOWED_NEEDED and dep not in forbidden]
-    if forbidden or unexpected:
-        fail(f"unexpected ELF dependency in {path.name}: {deps}")
-
-
 def interpreter(path: Path) -> str | None:
     match = re.search(r"Requesting program interpreter: ([^\]]+)",
                       output(["readelf", "-l", str(path)]))
     return match.group(1) if match else None
 
 
-def check_binary(path: Path) -> None:
-    check_dependencies(path)
+def elf_identity(path: Path) -> tuple[str, str, str]:
+    text = output(["readelf", "-h", str(path)])
+    elf_class = re.search(r"Class:\s+(\S+)", text)
+    elf_type = re.search(r"Type:\s+(\S+)", text)
+    machine = re.search(r"Machine:\s+(.+)", text)
+    if elf_class is None or elf_type is None or machine is None:
+        fail(f"cannot read ELF identity: {path.name}")
+    return elf_class.group(1), elf_type.group(1), machine.group(1).strip()
+
+
+def check_elf_identity(path: Path, spec: dict[str, object]) -> None:
+    elf_class, _elf_type, machine = elf_identity(path)
+    if elf_class != "ELF64":
+        fail(f"unexpected ELF class in {path.name}: {elf_class}")
+    expected = ELF_MACHINE[str(spec["cpu"])]
+    if machine != expected:
+        fail(f"unexpected ELF machine in {path.name}: {machine}")
+
+
+def check_dependencies(path: Path, spec: dict[str, object]) -> list[str]:
+    deps = needed(path)
+    libc = str(spec["libc"])
+    allowed = GLIBC_ALLOWED_NEEDED if libc == "glibc" else MUSL_ALLOWED_NEEDED
+    forbidden = [dep for dep in deps if any(token in dep for token in FORBIDDEN_NEEDED)]
+    unexpected = [dep for dep in deps if dep not in allowed and dep not in forbidden]
+    if forbidden or unexpected:
+        fail(f"unexpected ELF dependency in {path.name}: {deps}")
+    return deps
+
+
+def check_binary(path: Path, spec: dict[str, object]) -> None:
+    check_elf_identity(path, spec)
+    deps = check_dependencies(path, spec)
     loader = interpreter(path)
+    if str(spec["libc"]) == "musl":
+        if deps or loader is not None:
+            fail(f"musl CLI is not fully static: {path.name}")
+        return
     if loader is None:
         fail(f"missing ELF program interpreter in {path.name}")
-    if loader not in ALLOWED_INTERPRETERS:
+    if loader not in ALLOWED_INTERPRETERS[str(spec["cpu"])]:
         fail(f"non-standard ELF program interpreter in {path.name}: {loader}")
 
 
-def check_ifd(path: Path) -> None:
-    check_dependencies(path)
+def check_ifd(path: Path, spec: dict[str, object]) -> None:
+    _elf_class, elf_type, _machine = elf_identity(path)
+    check_elf_identity(path, spec)
+    if elf_type != "DYN":
+        fail(f"IFD is not a shared object: {path.name}")
+    check_dependencies(path, spec)
+    if interpreter(path) is not None:
+        fail(f"IFD unexpectedly has a program interpreter: {path.name}")
     symbols = output(["nm", "-D", "--defined-only", str(path)])
     for symbol in IFD_SYMBOLS:
         if re.search(rf"\s_?{re.escape(symbol)}$", symbols, re.MULTILINE) is None:
             fail(f"missing IFD symbol: {symbol}")
 
 
-def build_binary_archive(version: str, product_source: dict[str, str],
+def compiler_metadata(value: str, env: dict[str, str]) -> dict[str, str]:
+    path = executable_path(value)
+    return {
+        "path": str(path),
+        "sha256": sha256(path),
+        "version": output([str(path), "--version"], env=env).splitlines()[0],
+    }
+
+
+def build_binary_archive(version: str, spec: dict[str, object],
+                         product_source: dict[str, str],
                          checkout: dict[str, str], source_map_sha256: str | None,
                          core_commit: str, libusb_version: str, libusb_url: str,
-                         libusb_sha256: str, source_root: Path, source_archive_path: Path,
+                         libusb_sha256: str, source_root: Path,
+                         source_archive_path: Path, source_archive_sha256: str,
                          build: Path, work: Path, output_dir: Path) -> Path:
-    root_name = f"{PRODUCT}-{version}-{PLATFORM}"
+    platform = str(spec["platform"])
+    root_name = f"{PRODUCT}-{version}-{platform}"
     stage = work / root_name
     for sub in ("bin", "ifd", "licenses", "docs"):
         (stage / sub).mkdir(parents=True)
 
+    binary_needed: dict[str, list[str]] = {}
+    binary_interpreter: dict[str, str | None] = {}
     for name in BINARIES:
         source = build / name
         if not source.is_file():
             fail(f"missing built binary: {source}")
         shutil.copy2(source, stage / "bin" / name)
-        check_binary(stage / "bin" / name)
+        check_binary(stage / "bin" / name, spec)
+        binary_needed[name] = needed(stage / "bin" / name)
+        binary_interpreter[name] = interpreter(stage / "bin" / name)
 
     ifd_stage = build / "pcsc" / "unix"
     ifd = ifd_stage / "libdtv_userland_unix_pcsc_ifd.so"
     if not ifd.is_file():
         fail("missing staged Unix IFD")
     shutil.copy2(ifd, stage / "ifd" / "torne-userland-ifd.so")
-    check_ifd(stage / "ifd" / "torne-userland-ifd.so")
+    check_ifd(stage / "ifd" / "torne-userland-ifd.so", spec)
     for name in ("COPYING", "UNIX_PCSC_IFD_PROVENANCE.json", "torne.reader.conf.in"):
         source = ifd_stage / name
         if not source.is_file():
@@ -412,13 +596,17 @@ def build_binary_archive(version: str, product_source: dict[str, str],
             fail(f"missing release license/document input: {source}")
         shutil.copy2(source, destination)
 
-    cc = os.environ.get("CC", "cc")
-    cxx = os.environ.get("CXX", "c++")
+    verification = "native" if spec["run_checks"] and not spec["emulated"] else (
+        "emulated via QEMU" if spec["run_checks"] and spec["emulated"] else "not run")
     metadata = {
         "schema": 1,
         "product": PRODUCT,
         "version": version,
-        "platform": PLATFORM,
+        "platform": platform,
+        "libc": spec["libc"],
+        "cpu": spec["cpu"],
+        "build_kind": spec["build_kind"],
+        "emulated": bool(spec["emulated"]),
         "product_source": product_source,
         "checkout": checkout,
         "source_map": ({"path": "SOURCE-MAP.json", "sha256": source_map_sha256}
@@ -430,31 +618,53 @@ def build_binary_archive(version: str, product_source: dict[str, str],
         "libusb_url": libusb_url,
         "libusb_sha256": libusb_sha256,
         "source_archive": source_archive_path.name,
+        "source_archive_sha256": source_archive_sha256,
         "toolchain": {
-            "cc": output([cc, "--version"]).splitlines()[0],
-            "cxx": output([cxx, "--version"]).splitlines()[0],
+            "cc": compiler_metadata(str(spec["cc"]), spec["env"]),
+            "cxx": compiler_metadata(str(spec["cxx"]), spec["env"]),
+            "c_flags": spec["c_flags"],
+            "cxx_flags": spec["cxx_flags"],
+            "sysroot": spec["sysroot"],
+            "exe_linker_flags": spec["exe_linker_flags"],
+            "shared_linker_flags": spec["shared_linker_flags"],
+            "system_processor": spec["system_processor"],
+            "c_compiler_target": spec["c_compiler_target"],
+            "cxx_compiler_target": spec["cxx_compiler_target"],
+            "env": spec["env"],
             "cmake": output(["cmake", "--version"]).splitlines()[0],
-            "glibc": output(["getconf", "GNU_LIBC_VERSION"]),
+            "host_glibc": output(["getconf", "GNU_LIBC_VERSION"]),
         },
         "binary_sha256": {name: sha256(stage / "bin" / name) for name in BINARIES},
+        "binary_needed": binary_needed,
+        "binary_interpreter": binary_interpreter,
         "ifd_sha256": sha256(stage / "ifd" / "torne-userland-ifd.so"),
+        "ifd_needed": needed(stage / "ifd" / "torne-userland-ifd.so"),
         "ifd_symbols": list(IFD_SYMBOLS),
+        "verification": {
+            "elf_identity": "checked",
+            "elf_dependencies": "checked",
+            "ifd_symbols": "checked 10",
+            "ifd_libpcsclite_free": "checked",
+            "post_extract_help_version": verification,
+        },
         "note": "No bit-for-bit reproducibility claim; inputs, toolchain, hashes and rebuild inputs are recorded.",
     }
     write_json(stage / "BUILD-METADATA.json", metadata)
+    libc = str(spec["libc"])
+    cli_linkage = "fully static musl" if libc == "musl" else "glibc PIE"
     notice_lines = [
-        f"# {PRODUCT} {version} {PLATFORM}",
+        f"# {PRODUCT} {version} {platform}",
         "",
         f"Source: {source_archive_path.name}",
+        f"Source archive SHA-256: {source_archive_sha256}",
         f"Core: Khronos31/dtv-userland-core {core_commit}",
         f"libusb: {libusb_version}, static LGPL-2.1-or-later, {libusb_url}",
         f"libusb source SHA-256: {libusb_sha256}",
         "",
-        "The three CLI executables are built from the fixed source and statically link libusb.",
-        "The PC/SC IFD is a glibc shared object and does not link libpcsclite.",
+        f"The three CLI executables are {cli_linkage} and statically link libusb.",
+        f"The PC/SC IFD is a {libc} shared object and does not link libpcsclite.",
         "Product LICENSE/NOTICE/PROVENANCE, Core MIT/GPL notices, libusb COPYING,",
         "and source/rebuild inputs are included. FR30 source and generated images are in the source archive.",
-        "No Homebrew/libpcsclite runtime dependency is introduced.",
     ]
     (stage / "DEPENDENCY-NOTICE.txt").write_text("\n".join(notice_lines) + "\n", encoding="utf-8")
 
@@ -469,15 +679,53 @@ def build_binary_archive(version: str, product_source: dict[str, str],
     return archive_path
 
 
-def verify_extracted(archive_path: Path, version: str, work: Path) -> None:
-    extract = work / "verify"
+def verify_extracted(archive_path: Path, version: str, spec: dict[str, object],
+                     work: Path) -> None:
+    platform = str(spec["platform"])
+    extract = work / f"verify-{platform}"
     extract.mkdir()
     with tarfile.open(archive_path) as archive:
         safe_extract(archive, extract)
-    root = extract / f"{PRODUCT}-{version}-{PLATFORM}"
+    root = extract / f"{PRODUCT}-{version}-{platform}"
+    required = [
+        *[root / "bin" / name for name in BINARIES],
+        root / "ifd" / "torne-userland-ifd.so",
+        root / "ifd" / "COPYING",
+        root / "ifd" / "UNIX_PCSC_IFD_PROVENANCE.json",
+        root / "ifd" / "torne.reader.conf.in",
+        root / "licenses" / "LICENSE",
+        root / "licenses" / "NOTICE",
+        root / "licenses" / "PROVENANCE.md",
+        root / "licenses" / "LICENSE.dtv-userland-core",
+        root / "licenses" / "libusb-COPYING",
+        root / "docs" / "README.md",
+        root / "docs" / "cli-framework.md",
+        root / "BUILD-METADATA.json",
+        root / "DEPENDENCY-NOTICE.txt",
+        root / "SHA256SUMS",
+    ]
+    for path in required:
+        if not path.is_file():
+            fail(f"missing extracted release file: {path.relative_to(extract)}")
+    listed = set()
+    for line in (root / "SHA256SUMS").read_text(encoding="ascii").splitlines():
+        digest, separator, name = line.partition("  ")
+        if not separator or not name:
+            fail(f"invalid inner checksum line: {line}")
+        path = root / name
+        if not path.is_file() or sha256(path) != digest:
+            fail(f"inner checksum mismatch: {name}")
+        listed.add(name)
+    present = {path.relative_to(root).as_posix() for path in root.rglob("*")
+               if path.is_file() and path.name != "SHA256SUMS"}
+    if listed != present:
+        fail("inner SHA256SUMS does not cover the extracted archive exactly")
+    if not spec["run_checks"]:
+        return
+    runner = list(spec["runner"])
     for name in BINARIES:
         for argument in ("--version", "--help"):
-            run([str(root / "bin" / name), argument], cwd=root, capture=True)
+            run(runner + [str(root / "bin" / name), argument], cwd=root, capture=True)
 
 
 def write_outer_checksums(output_dir: Path, archives: list[Path]) -> Path:
@@ -492,10 +740,29 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--core-source", required=True)
     parser.add_argument("--libusb-source-archive")
+    parser.add_argument("--linux-platform", action="append", choices=LINUX_PLATFORMS,
+                        help="Linux archive platform; repeat to manufacture several")
+    parser.add_argument("--linux-matrix", action="store_true",
+                        help="manufacture all four Linux glibc/musl x86_64/aarch64 archives")
+    parser.add_argument("--toolchain-config",
+                        help="schema-1 JSON mapping each selected platform to its fixed toolchain")
     parser.add_argument("--source-only", action="store_true",
                         help="manufacture and verify the source archive without building binaries")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     args = parser.parse_args()
+
+    if args.linux_matrix and args.linux_platform:
+        fail("--linux-matrix and --linux-platform are mutually exclusive")
+    if args.linux_matrix:
+        platforms = list(LINUX_PLATFORMS)
+    elif args.linux_platform:
+        platforms = list(args.linux_platform)
+    else:
+        platforms = [DEFAULT_PLATFORM]
+    if len(set(platforms)) != len(platforms):
+        fail("duplicate --linux-platform value")
+    if not args.source_only and len(platforms) > 1 and not args.toolchain_config:
+        fail("--toolchain-config is required for a multi-platform build")
 
     os.umask(0o022)
     output_dir = Path(args.output).expanduser().resolve()
@@ -513,6 +780,9 @@ def main() -> int:
     core_source = Path(args.core_source).expanduser().resolve()
     if output(["git", "rev-parse", "HEAD"], cwd=core_source) != core_commit:
         fail("--core-source does not match the fixed Core commit")
+    toolchains = load_toolchains(args.toolchain_config)
+    specs = [] if args.source_only else [resolve_platform(platform, toolchains)
+                                         for platform in platforms]
 
     with tempfile.TemporaryDirectory(prefix="torne-release-") as temporary:
         work = Path(temporary)
@@ -528,6 +798,7 @@ def main() -> int:
             version, product_source, checkout, source_map_sha256,
             core_commit, core_source, libusb_archive, libusb_version,
             libusb_url, libusb_sha256, work, output_dir)
+        source_sha256 = sha256(source_path)
         if args.source_only:
             checksums = write_outer_checksums(output_dir, [source_path])
             for item in (source_path, checksums):
@@ -535,18 +806,24 @@ def main() -> int:
             print(f"source_archive={source_path}")
             print(f"checksums={checksums}")
             return 0
-        build = build_from_source(version, source_path, work, args.jobs)
-        binary_path = build_binary_archive(
-            version, product_source, checkout, source_map_sha256, core_commit,
-            libusb_version, libusb_url, libusb_sha256, source_root,
-            source_path, build, work, output_dir)
-        verify_extracted(binary_path, version, work)
-        checksums = write_outer_checksums(output_dir, [source_path, binary_path])
-        for item in (source_path, binary_path, checksums):
+
+        build_source = extract_source(version, source_path, work)
+        archives = [source_path]
+        for spec in specs:
+            build = build_platform(version, build_source, spec, work, args.jobs)
+            binary_path = build_binary_archive(
+                version, spec, product_source, checkout, source_map_sha256,
+                core_commit, libusb_version, libusb_url, libusb_sha256,
+                source_root, source_path, source_sha256, build, work, output_dir)
+            verify_extracted(binary_path, version, spec, work)
+            archives.append(binary_path)
+        checksums = write_outer_checksums(output_dir, archives)
+        for item in [*archives, checksums]:
             item.chmod(0o644)
 
     print(f"source_archive={output_dir / (PRODUCT + '-' + version + '-source.tar.gz')}")
-    print(f"binary_archive={output_dir / (PRODUCT + '-' + version + '-' + PLATFORM + '.tar.gz')}")
+    for platform in platforms:
+        print(f"binary_archive[{platform}]={output_dir / (PRODUCT + '-' + version + '-' + platform + '.tar.gz')}")
     print(f"checksums={output_dir / 'SHA256SUMS'}")
     return 0
 
