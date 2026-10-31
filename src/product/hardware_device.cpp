@@ -105,6 +105,18 @@ Result<void> fail(Error error) noexcept
     return Result<void>::failure(error);
 }
 
+Error open_error(usb::OpenState state) noexcept
+{
+    switch (state) {
+    case usb::OpenState::invalid: return Error::INVALID_ARGUMENT;
+    case usb::OpenState::unsupported: return Error::UNSUPPORTED;
+    case usb::OpenState::busy: return Error::BUSY;
+    case usb::OpenState::not_found:
+    case usb::OpenState::disconnected: return Error::DISCONNECTED;
+    default: return Error::USB_IO;
+    }
+}
+
 Error transfer_error(const widen::RecognitionResult& result) noexcept
 {
     if (result.failure.cause == usb::TransferCause::no_device)
@@ -668,6 +680,26 @@ Result<std::unique_ptr<Device>> open_hardware(
     auto opened = usb::Transport::open(usb::create_libusb_io(), location);
     if (opened.outcome.state != usb::OpenState::ok || !opened.transport)
         return Result<std::unique_ptr<Device>>::failure(Error::USB_IO);
+
+    std::unique_ptr<Clock> clock(new SystemClock());
+    std::unique_ptr<HardwareDevice> device(
+        new HardwareDevice(std::move(opened.transport), std::move(clock)));
+    const Result<void> started = device->startup();
+    if (!started) {
+        device->close();
+        return Result<std::unique_ptr<Device>>::failure(started.error());
+    }
+    return Result<std::unique_ptr<Device>>::success(std::move(device));
+}
+
+Result<std::unique_ptr<Device>> open_hardware_fd(int fd) noexcept
+{
+    if (fd < 0)
+        return Result<std::unique_ptr<Device>>::failure(Error::INVALID_ARGUMENT);
+    auto opened = usb::Transport::open_fd(usb::create_libusb_io_fd(), fd);
+    if (opened.outcome.state != usb::OpenState::ok || !opened.transport)
+        return Result<std::unique_ptr<Device>>::failure(
+            open_error(opened.outcome.state));
 
     std::unique_ptr<Clock> clock(new SystemClock());
     std::unique_ptr<HardwareDevice> device(

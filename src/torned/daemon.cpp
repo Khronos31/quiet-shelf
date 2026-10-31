@@ -244,6 +244,8 @@ Result<dtv::userland::identity::Selector> selected_selector(
     const DaemonConfig& config, const wire::DiscoveryScan* scan) noexcept
 {
     namespace identity = dtv::userland::identity;
+    if (config.has_fd)
+        return Result<identity::Selector>::failure(Error::NOT_FOUND);
     if (config.has_device) {
         if (config.device.kind != identity::SelectorKind::usb_topology)
             return Result<identity::Selector>::failure(Error::INVALID_ARGUMENT);
@@ -279,9 +281,15 @@ int run_daemon(const DaemonConfig& config, Backend* backend,
     wire::Producer producer;
     producer.product = text<32>("torne-userland");
     producer.version = text<64>(TORNE_USERLAND_PRODUCT_VERSION);
-    const auto discovered = backend->discover(config);
-    const wire::DiscoveryScan* scan =
-        discovered ? &discovered.value() : nullptr;
+    // A borrowed descriptor is opened directly. Do not make a general USB
+    // scan (and its authority) a prerequisite for FD startup.
+    Result<wire::DiscoveryScan> discovered =
+        Result<wire::DiscoveryScan>::failure(Error::UNSUPPORTED);
+    const wire::DiscoveryScan* scan = nullptr;
+    if (!config.has_fd) {
+        discovered = backend->discover(config);
+        if (discovered) scan = &discovered.value();
+    }
     const auto selector = selected_selector(config, scan);
     std::string selected_path;
     if (selector && selector.value().topology.count == 1U) {

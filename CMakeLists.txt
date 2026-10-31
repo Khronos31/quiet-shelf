@@ -413,6 +413,12 @@ if(TORNE_BUILD_TESTS)
             -DTORNE_TS=$<TARGET_FILE:torne_torne_ts>
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_smoke.cmake")
 
+    # The Termux launcher test uses /proc, setsid and the Linux signal matrix.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME torne_termux_launcher
+            COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/test-torne-termux.sh")
+    endif()
+
     if(TORNE_FR30_BINUTILS_DIR)
         add_test(NAME torne_fr30_generation
             COMMAND ${CMAKE_COMMAND}
@@ -460,6 +466,8 @@ endif()
 
 install(TARGETS torne_torned torne_tornectl torne_torne_ts
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS packaging/termux/torne-termux
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES
     LICENSE README.md PROVENANCE.md docs/cli-framework.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR})

@@ -35,6 +35,18 @@ Result<dtv::userland::wire::DiscoveryScan> DaemonBackend::discover(
 Result<DaemonBackend::FamilyPtr> DaemonBackend::open_family(
     const torne::daemon::DaemonConfig& config) noexcept
 {
+    if (config.has_fd) {
+        auto device = open_hardware_fd(config.fd);
+        if (!device) {
+            card_service_available_ = false;
+            return Result<FamilyPtr>::failure(device.error());
+        }
+        card_service_available_ =
+            device.value()->card_port().line != nullptr;
+        auto family = make_family(std::move(device.value()));
+        if (!family) return Result<FamilyPtr>::failure(Error::INTERNAL);
+        return Result<FamilyPtr>::success(std::move(family));
+    }
     if (!config.has_device) {
         if (!has_scan_) {
             const auto discovered = discover(config);

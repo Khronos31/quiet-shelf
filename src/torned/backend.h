@@ -12,10 +12,10 @@
 
 namespace torne::daemon {
 
-// Product-owned hardware seam. The USB transport, MB86H47A bridge, DiB8096
-// frontend and card UART are not part of this CLI framework; they are supplied
-// by a later backend implementation. A null Backend means "no hardware
-// backend", which torned reports as an error instead of inventing a state.
+// Product-owned hardware seam. The production DaemonBackend supplies the USB
+// transport, MB86H47A bridge, DiB8096 frontend, card UART/CardService and the
+// Core enclosure family. A null Backend means "no hardware backend", which
+// torned reports as an error instead of inventing a state.
 class Backend {
 public:
     using FamilyPtr = std::unique_ptr<dtv::userland::host_runtime::EnclosureFamily>;

@@ -1,7 +1,7 @@
 # Public CI snapshot of torne-userland
 
 - **Source repository**: `Khronos31/torne-userland` (private at snapshot time).
-- **Source commit**: `2163dcbe32b07baa229612edd8536ec8602d5c52` (private `windows-pcsc-native` branch from main `ba35825`; Core pin update only, plus matching pin references).
+- **Source commit**: `1d21690cac116faec62cbfa73eacd2c2245c3f37` (PR25 `android-fd-entry` with reviewed DOC26 `d48f2d6a` normally merged; product tree `f321da9e`; PR25 not merged to main).
 - **License**: GPL-2.0-only. The product `LICENSE`, `PROVENANCE.md`, and the upstream attribution `NOTICE` are preserved.
 - **Dependency pin**: `Khronos31/dtv-userland-core` at
   `548a04605d9e224be179547de30f590ff693a128` (Core main after PR144; shared Windows
@@ -15,7 +15,26 @@
   and adds one job. The branch-only `.github/workflows/windows-winscard-native.yml`
   runs one Windows native stage job on `ci/torne-winscard-native`. None uses
   secrets, write tokens, private checkouts, releases, packages, schedules, or
-  external uploads.
+  external uploads. The four workflow files are byte-identical to the parent
+  3003 candidate; the planned public sequence is six normal + Mac IFD one +
+  Windows native one, eight jobs total.
+- The source includes PR25's Android/Termux borrowed-FD entry
+  (`torned --fd FD --instance TOKEN`) and `packaging/termux/torne-termux`.
+  The FD path duplicates the caller descriptor, uses a dedicated libusb context
+  without a prior discovery scan, and leaves the original FD to its owner.
+  This is a one-USB-function Torne entry; two-FD/multi-function machines are
+  outside that entry. No Android APK, 2-FD model, or real Termux execution is
+  claimed by this snapshot.
+- PR25 A1 (FD-only context without prior scan) is included at the fixed head.
+  A2/P2 (launcher process-group creation race before `setsid` readiness) is
+  deferred by user decision to product Issue #27 and is not fixed in this
+  candidate. The author's 18-test/3-ABI and A1-limited validation are reused;
+  public CI has not run this candidate yet.
+- DOC26 `d48f2d6adefbe3b094d97e9eab7a55f1d006c632` (base `5ffb91e4`,
+  independent review `33ca1ddd` PROCEED, no findings) was normally merged into
+  PR25; `ad0419c` to `1d21690c` changes only `README.md`,
+  `docs/cli-framework.md`, and the `src/torned/backend.h` comment. No PR25
+  Android FD source was changed in the merge. PR25 remains Draft.
 - The branch-only `.github/workflows/macos-ifd.yml` installs Homebrew
   pcsc-lite only as a CI build-header input, records the version/header hash,
   and passes `../include/PCSC` through the existing Core cache variable. The
@@ -56,7 +75,8 @@
   tunes, or streams from a tuner. The normal Windows jobs are cross-compiled and
   are not executed; the branch-only Windows native stage job is prepared but not
   executed in this preparation.
-- CTest has seventeen tests normally. The Linux job additionally configures an
+- CTest has eighteen tests on Linux (the new Termux launcher test) and seventeen
+  on macOS. The Linux job additionally configures an
   optional `TORNE_BUILD_PCSC_IFD=ON` build with tests OFF and checks the staged
   IFD `.so`, notices, reader template, and ten `IFDH*` ABI symbols. The Windows
   cross job stages `WinSCard.dll` and checks its exports, imports, and notices.
@@ -69,8 +89,10 @@
   `torne_core1_firmware`, and `torne_core0_firmware`.
 - This is a disposable CI copy, not the authoritative development branch.
   Fixes belong in the source repository first and are synchronized here after
-  review.
+  review. The source delta is the reviewed PR25 Android FD change plus the
+  reviewed DOC26 README/cli-framework/backend.h documentation merge. PR24
+  release-foundation changes are not included.
 
 PR22 adds the cold-start Widen clock-gate initialization (`src/product/clock_gate.*`, fake/CTest only). This is not evidence of real cold boot or F3 success; real hardware validation is a separate scout task.
 
-The source snapshot includes the upstream `torne_drv` attribution notice for the DiB8096-derived files (coax and Linux DiBcom notices, with the px4_drv section scoped to upstream files not included here). It contains the CLI framework, USB transport/discovery, Widen, Core 1 and Core 0 host runtimes, DiB8096 C11 frontend, card UART/CardService adapters, the product daemon/family path, FR30 candidate images/fixtures, and optional PC/SC packaging. The normal build does not generate FR30 images; it uses the tracked Widen/Core 0/Core 1 images. CI does not open, claim, tune, or stream from a tuner; the CLI smoke may perform read-only USB enumeration. The direct `torne-ts --device usb:BUS-PORT` path is the product startup path that performs Widen/FR30/Core startup, tune, and TS on hardware; it is outside CI. The daemon listener/family connection and CardService adapter are included, but real device I/O remains outside CI. The card path is tested with fake UART/Core only. Optional PC/SC packaging is a CI-staged candidate; Linux pcscd/OS registration, macOS loader/registration, and real IFD/card operation remain unverified. OS PC/SC system registration is not included.
+The source snapshot includes the upstream `torne_drv` attribution notice for the DiB8096-derived files (coax and Linux DiBcom notices, with the px4_drv section scoped to upstream files not included here). It contains the CLI framework, USB transport/discovery, Android/Termux borrowed-FD launcher, Widen, Core 1 and Core 0 host runtimes, DiB8096 C11 frontend, card UART/CardService adapters, the product daemon/family path, FR30 candidate images/fixtures, and optional PC/SC packaging. The normal build does not generate FR30 images; it uses the tracked Widen/Core 0/Core 1 images. CI does not open, claim, tune, or stream from a tuner; the CLI smoke may perform read-only USB enumeration. The direct `torne-ts --device usb:BUS-PORT` path is the product startup path that performs Widen/FR30/Core startup, tune, and TS on hardware; it is outside CI. The daemon listener/family connection and CardService adapter are included, but real device I/O remains outside CI. The card path is tested with fake UART/Core in CI; a separate same-UID isolated Linux PC/SC record exists, but OS registration/other UID, macOS service registration, and real IFD/card operation remain unverified. Optional PC/SC packaging is a CI-staged candidate. OS PC/SC system registration is not included.

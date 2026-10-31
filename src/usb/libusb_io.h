@@ -18,6 +18,12 @@ TransferOutcome bulk_transfer_outcome(int status, int transferred,
 // failure into the OS-independent contract.
 std::unique_ptr<UsbIo> create_libusb_io() noexcept;
 
+// FD-only context: on Linux/Android it initializes libusb with
+// LIBUSB_OPTION_NO_DEVICE_DISCOVERY so a borrowed descriptor does not require
+// general USB enumeration or hotplug authority. Other platforms fall back to
+// the normal context; their open_fd remains unsupported.
+std::unique_ptr<UsbIo> create_libusb_io_fd() noexcept;
+
 }  // namespace torne::usb
 
 #endif  // TORNE_USB_LIBUSB_IO_H

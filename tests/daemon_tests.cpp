@@ -116,6 +116,48 @@ void test_parse()
         CHECK(!parsed.valid);
     }
     {
+        const char* argv[] = {"torned", "--fd", "7", "--instance", "torne"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(5, argv);
+        CHECK(parsed.valid);
+        CHECK(parsed.config.has_fd);
+        CHECK(!parsed.config.has_device);
+        CHECK(parsed.config.fd == 7);
+        CHECK(parsed.config.instance == "torne");
+    }
+    {
+        const char* argv[] = {"torned", "--fd", "7"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(3, argv);
+        CHECK(!parsed.valid);
+    }
+    {
+        const char* argv[] = {"torned", "--fd", "7", "--device", "usb:1-2",
+                              "--instance", "torne"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(7, argv);
+        CHECK(!parsed.valid);
+    }
+    {
+        const char* argv[] = {"torned", "--fd", "7", "--fd", "8",
+                              "--instance", "torne"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(7, argv);
+        CHECK(!parsed.valid);
+    }
+    {
+        const char* argv[] = {"torned", "--fd", "-1", "--instance", "torne"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(5, argv);
+        CHECK(!parsed.valid);
+    }
+    {
+        const char* argv[] = {"torned", "--fd", "x", "--instance", "torne"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(5, argv);
+        CHECK(!parsed.valid);
+    }
+    {
+        const char* argv[] = {"torned", "--list-json", "--fd", "7",
+                              "--instance", "torne"};
+        const auto parsed = torne::daemon::parse_daemon_arguments(7, argv);
+        CHECK(!parsed.valid);
+    }
+    {
         const char* argv[] = {"torned", "--list-json", "--instance", "torne"};
         const auto parsed = torne::daemon::parse_daemon_arguments(4, argv);
         CHECK(!parsed.valid);
@@ -181,6 +223,21 @@ void test_fake_backend()
     CHECK(output != nullptr && error != nullptr);
     CHECK(torne::daemon::run_daemon(start, &backend, output, error) == 3);
     CHECK(backend.open_calls == 1);
+    CHECK(read_file(error).find("hardware backend open failed") != std::string::npos);
+    std::fclose(output);
+    std::fclose(error);
+
+    DaemonConfig borrowed;
+    borrowed.has_fd = true;
+    borrowed.fd = 7;
+    borrowed.instance = "torne";
+    const int discoveries_before_fd = backend.discover_calls;
+    output = std::tmpfile();
+    error = std::tmpfile();
+    CHECK(output != nullptr && error != nullptr);
+    CHECK(torne::daemon::run_daemon(borrowed, &backend, output, error) == 3);
+    CHECK(backend.open_calls == 2);
+    CHECK(backend.discover_calls == discoveries_before_fd);
     CHECK(read_file(error).find("hardware backend open failed") != std::string::npos);
     std::fclose(output);
     std::fclose(error);

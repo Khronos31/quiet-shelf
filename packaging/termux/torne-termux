@@ -1,0 +1,209 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Open the single CECH-ZD1 USB function with termux-usb and pass its borrowed
+# descriptor to torned.  The daemon duplicates the descriptor and closes only
+# that duplicate; termux-usb keeps ownership of the original.
+set -eu
+
+usage()
+{
+    printf '%s\n' \
+        'usage: torne-termux --usb-device PATH --instance TOKEN [--runtime-dir PATH]' \
+        '       torne-termux --version' \
+        '       torne-termux --help' \
+        '' \
+        'CECH-ZD1 exposes one USB function, so exactly one --usb-device is accepted.' \
+        'The FD is passed to torned as --fd; torned duplicates it and leaves the' \
+        'original descriptor to its termux-usb owner.'
+}
+
+fail()
+{
+    printf 'torne-termux: %s\n' "$1" >&2
+    exit 2
+}
+
+script_path=$0
+case "$script_path" in
+    /*) ;;
+    *)
+        script_path=$(CDPATH='' cd -- "$(dirname -- "$script_path")" && pwd -P)/$(basename -- "$script_path") ||
+            fail 'cannot resolve launcher path'
+        ;;
+esac
+case "$script_path" in
+    /*) ;;
+    *) fail 'launcher callback path is not an absolute path' ;;
+esac
+case "$script_path" in
+    *[!A-Za-z0-9_./-]*) fail 'launcher callback path contains unsafe shell characters' ;;
+esac
+
+# Prefer the torned installed beside this launcher, then PATH.
+find_torned()
+{
+    launcher_directory=$(CDPATH='' cd -- "$(dirname -- "$script_path")" && pwd -P) ||
+        fail 'cannot resolve torned directory'
+    torned=$launcher_directory/torned
+    if [ ! -x "$torned" ]; then
+        torned=$(command -v torned 2>/dev/null) || fail 'torned was not found beside the launcher or in PATH'
+    fi
+    printf '%s\n' "$torned"
+}
+
+valid_fd()
+{
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -e "/proc/self/fd/$1" ]
+}
+
+stage=${TORNE_TERMUX_STAGE-0}
+case "$stage" in
+0)
+    usb_device_count=0
+    usb_device=
+    instance=
+    runtime_dir=
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --help)
+                [ "$#" -eq 1 ] || fail '--help cannot be combined with other arguments'
+                usage
+                exit 0
+                ;;
+            --version)
+                [ "$#" -eq 1 ] || fail '--version cannot be combined with other arguments'
+                torned=$(find_torned)
+                version_output=$("$torned" --version) || fail 'torned --version failed'
+                case "$version_output" in
+                    'torned '*) ;;
+                    *) fail 'torned --version returned an unexpected string' ;;
+                esac
+                printf 'torne-termux %s\n' "${version_output#torned }"
+                exit 0
+                ;;
+            --usb-device)
+                [ "$#" -ge 2 ] || fail '--usb-device requires a path'
+                [ "$usb_device_count" -eq 0 ] || fail '--usb-device must be specified once'
+                [ -n "$2" ] || fail '--usb-device path must not be empty'
+                usb_device_count=1
+                usb_device=$2
+                shift 2
+                ;;
+            --instance)
+                [ "$#" -ge 2 ] || fail '--instance requires a token'
+                [ -z "$instance" ] || fail '--instance must be specified once'
+                [ -n "$2" ] || fail '--instance must not be empty'
+                instance=$2
+                shift 2
+                ;;
+            --runtime-dir)
+                [ "$#" -ge 2 ] || fail '--runtime-dir requires a path'
+                [ -z "$runtime_dir" ] || fail '--runtime-dir must be specified once'
+                [ -n "$2" ] || fail '--runtime-dir must not be empty'
+                runtime_dir=$2
+                shift 2
+                ;;
+            --fd|--fd=*)
+                fail '--fd is internal; use --usb-device'
+                ;;
+            --usb-device=*|--instance=*|--runtime-dir=*)
+                fail 'options require separate arguments'
+                ;;
+            *)
+                fail "unknown argument: $1"
+                ;;
+        esac
+    done
+    [ "$usb_device_count" -eq 1 ] || fail '--usb-device must be specified once'
+    [ -n "$instance" ] || fail '--instance is required; a borrowed descriptor has no USB path'
+    command -v termux-usb >/dev/null 2>&1 || fail 'termux-usb was not found in PATH'
+    command -v setsid >/dev/null 2>&1 || fail 'setsid was not found in PATH'
+    export TORNE_TERMUX_STAGE=1
+    export TORNE_TERMUX_USB_DEVICE="$usb_device"
+    export TORNE_TERMUX_INSTANCE="$instance"
+    export TORNE_TERMUX_RUNTIME_DIR="$runtime_dir"
+    unset TERMUX_EXPORT_FD TERMUX_USB_FD
+
+    child_pid=
+    pending_signal=
+    forwarded_signal=
+    # shellcheck disable=SC2329 # invoked indirectly by the signal traps below
+    forward_signal()
+    {
+        signal=$1
+        if [ -n "${child_pid-}" ]; then
+            [ -n "$forwarded_signal" ] || forwarded_signal=$signal
+            kill "-$signal" "-$child_pid" 2>/dev/null || :
+        else
+            [ -n "$pending_signal" ] || pending_signal=$signal
+        fi
+    }
+    group_is_alive()
+    {
+        kill -0 "-$child_pid" 2>/dev/null
+    }
+    group_grace_seconds=40
+    wait_for_group_exit()
+    {
+        elapsed=0
+        while group_is_alive; do
+            [ "$elapsed" -lt "$group_grace_seconds" ] || return 1
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        return 0
+    }
+    drain_child_group()
+    {
+        signal=$1
+        # Give torned time to close USB and remove its runtime endpoint.
+        kill "-$signal" "-$child_pid" 2>/dev/null || :
+        if ! wait_for_group_exit; then
+            # A broken callback must not keep the launcher or a later open
+            # blocked indefinitely.  The direct child status is preserved.
+            printf 'torne-termux: child process group did not exit within %s seconds; using SIGKILL. Graceful cleanup and runtime endpoint removal are not guaranteed.\n' \
+                "$group_grace_seconds" >&2
+            kill -KILL "-$child_pid" 2>/dev/null || :
+            wait_for_group_exit || :
+        fi
+    }
+    trap 'forward_signal INT' INT
+    trap 'forward_signal TERM' TERM
+    trap 'forward_signal HUP' HUP
+    setsid termux-usb -e "$script_path" "$usb_device" &
+    child_pid=$!
+    if [ -n "$pending_signal" ]; then
+        signal=$pending_signal
+        pending_signal=
+        forward_signal "$signal"
+    fi
+    child_status=0
+    wait "$child_pid" || child_status=$?
+    # A callback implementation may outlive the termux-usb shell that started
+    # it.  Drain that process group before returning, while the group id is
+    # still known, so a failed open cannot leave the nested chain behind.
+    cleanup_signal=${forwarded_signal:-TERM}
+    drain_child_group "$cleanup_signal"
+    trap - INT TERM HUP
+    exit "$child_status"
+    ;;
+1)
+    [ "$#" -eq 1 ] || fail 'termux-usb callback did not provide exactly one FD'
+    valid_fd "$1" || fail 'termux-usb callback provided a missing or invalid FD'
+    [ -n "${TORNE_TERMUX_INSTANCE-}" ] || fail 'termux-usb callback has no --instance'
+    torned=$(find_torned)
+    if [ -n "${TORNE_TERMUX_RUNTIME_DIR-}" ]; then
+        set -- "$torned" --fd "$1" --instance "$TORNE_TERMUX_INSTANCE" \
+            --runtime-dir "$TORNE_TERMUX_RUNTIME_DIR"
+    else
+        set -- "$torned" --fd "$1" --instance "$TORNE_TERMUX_INSTANCE"
+    fi
+    unset TORNE_TERMUX_STAGE TORNE_TERMUX_USB_DEVICE TORNE_TERMUX_INSTANCE \
+        TORNE_TERMUX_RUNTIME_DIR
+    exec "$@"
+    ;;
+*) fail 'invalid internal launcher stage' ;;
+esac

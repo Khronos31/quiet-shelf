@@ -110,6 +110,15 @@ public:
 
     virtual OpenOutcome open(const DeviceLocation& location,
                              DeviceSummary& summary) noexcept = 0;
+    // Wrap a caller-owned native device descriptor. Implementations duplicate
+    // it and close only that duplicate; the caller keeps ownership of fd.
+    // Platforms without borrowed-descriptor support leave this unsupported.
+    virtual OpenOutcome open_fd(int fd, DeviceSummary& summary) noexcept
+    {
+        (void)fd;
+        (void)summary;
+        return OpenOutcome{OpenState::unsupported, TransferCause::unsupported};
+    }
     virtual OpenOutcome claim_interface(std::uint8_t number) noexcept = 0;
     virtual TransferOutcome control_in(std::uint8_t request_type,
                                        std::uint8_t request,

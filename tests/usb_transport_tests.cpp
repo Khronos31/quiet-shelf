@@ -55,6 +55,8 @@ usb::DeviceLocation location_1_2()
 
 struct Stats final {
     int open_calls = 0;
+    int open_fd_calls = 0;
+    int last_fd = -1;
     int claim_calls = 0;
     int release_calls = 0;
     int close_calls = 0;
@@ -78,6 +80,7 @@ public:
 
     usb::DeviceSummary summary = valid_summary();
     usb::OpenOutcome open_result{usb::OpenState::ok, usb::TransferCause::none};
+    usb::OpenOutcome open_fd_result{usb::OpenState::ok, usb::TransferCause::none};
     usb::OpenOutcome claim_result{usb::OpenState::ok, usb::TransferCause::none};
     std::vector<usb::TransferOutcome> control_in_results;
     std::vector<usb::TransferOutcome> control_out_results;
@@ -91,6 +94,14 @@ public:
         stats_.opened_at = location;
         output = summary;
         return open_result;
+    }
+
+    usb::OpenOutcome open_fd(int fd, usb::DeviceSummary& output) noexcept override
+    {
+        ++stats_.open_fd_calls;
+        stats_.last_fd = fd;
+        output = summary;
+        return open_fd_result;
     }
 
     usb::OpenOutcome claim_interface(std::uint8_t) noexcept override
@@ -195,6 +206,57 @@ void test_open_and_close()
     opened.transport.reset();
     CHECK(stats.release_calls == 1);
     CHECK(stats.close_calls == 1);
+}
+
+void test_open_fd_and_close()
+{
+    Stats stats;
+    auto opened = usb::Transport::open_fd(make_io(stats), 7);
+    CHECK(opened.outcome.state == usb::OpenState::ok);
+    CHECK(opened.transport != nullptr);
+    CHECK(opened.transport->claimed());
+    CHECK(stats.open_fd_calls == 1);
+    CHECK(stats.last_fd == 7);
+    CHECK(stats.claim_calls == 1);
+    opened.transport.reset();
+    CHECK(stats.release_calls == 1);
+    CHECK(stats.close_calls == 1);
+}
+
+void test_open_fd_failure_closes_io()
+{
+    Stats stats;
+    auto io = std::unique_ptr<FakeIo>(new FakeIo(stats));
+    io->open_fd_result = usb::OpenOutcome{usb::OpenState::busy,
+                                          usb::TransferCause::busy};
+    auto opened = usb::Transport::open_fd(std::move(io), 9);
+    CHECK(opened.outcome.state == usb::OpenState::busy);
+    CHECK(opened.transport == nullptr);
+    CHECK(stats.open_fd_calls == 1);
+    CHECK(stats.last_fd == 9);
+    CHECK(stats.claim_calls == 0);
+    CHECK(stats.close_calls == 1);
+}
+
+void test_open_fd_descriptor_mismatch_does_not_claim()
+{
+    Stats stats;
+    auto io = std::unique_ptr<FakeIo>(new FakeIo(stats));
+    io->summary.interface_zero.endpoints[0].max_packet = 64U;
+    auto opened = usb::Transport::open_fd(std::move(io), 9);
+    CHECK(opened.outcome.state == usb::OpenState::unsupported);
+    CHECK(opened.transport == nullptr);
+    CHECK(stats.claim_calls == 0);
+    CHECK(stats.close_calls == 1);
+}
+
+void test_open_fd_invalid_argument_does_not_open()
+{
+    Stats stats;
+    auto opened = usb::Transport::open_fd(make_io(stats), -1);
+    CHECK(opened.outcome.state == usb::OpenState::invalid);
+    CHECK(opened.transport == nullptr);
+    CHECK(stats.open_fd_calls == 0);
 }
 
 void test_close_is_idempotent()
@@ -475,11 +537,24 @@ void test_location_parser()
     CHECK(!usb::location_from_selector(serial.value(), location));
 }
 
+void test_fd_context_skips_discovery()
+{
+#if defined(__linux__)
+    auto io = usb::create_libusb_io_fd();
+    CHECK(io != nullptr);
+    if (io) io->close();
+#endif
+}
+
 }  // namespace
 
 int main()
 {
     test_open_and_close();
+    test_open_fd_and_close();
+    test_open_fd_failure_closes_io();
+    test_open_fd_descriptor_mismatch_does_not_claim();
+    test_open_fd_invalid_argument_does_not_open();
     test_close_is_idempotent();
     test_open_failures_are_not_replaced();
     test_descriptor_mismatch_does_not_claim();
@@ -496,6 +571,7 @@ int main()
     test_bulk_outcome_conversion();
     test_bulk_short_and_timeout();
     test_location_parser();
+    test_fd_context_skips_discovery();
     if (failures != 0) {
         std::fprintf(stderr, "%d checks failed\n", failures);
         return 1;

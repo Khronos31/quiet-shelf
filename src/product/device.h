@@ -110,6 +110,10 @@ dtv::userland::Result<std::unique_ptr<Device>> open_hardware(
 // Device owns its monotonic clock; use this for a returned long-lived family.
 dtv::userland::Result<std::unique_ptr<Device>> open_hardware(
     const dtv::userland::identity::Selector& selector) noexcept;
+// Opens the selected enclosure from a caller-owned native descriptor. The
+// transport duplicates the descriptor and closes only its duplicate; the
+// caller (for example termux-usb) keeps ownership of the original.
+dtv::userland::Result<std::unique_ptr<Device>> open_hardware_fd(int fd) noexcept;
 
 }  // namespace torne::product
 

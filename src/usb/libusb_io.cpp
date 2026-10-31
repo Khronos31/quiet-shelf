@@ -10,6 +10,11 @@
 #include <map>
 #include <memory>
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace torne::usb {
 namespace {
 
@@ -68,6 +73,23 @@ OpenOutcome open_outcome_for_error(int error) noexcept
         return OpenOutcome{OpenState::io, TransferCause::io};
     }
 }
+
+#if defined(__linux__) || defined(__ANDROID__)
+int duplicate_fd(int fd) noexcept
+{
+#if defined(F_DUPFD_CLOEXEC)
+    const int cloexec_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (cloexec_fd >= 0) return cloexec_fd;
+#endif
+    const int duplicated = ::dup(fd);
+    if (duplicated < 0) return -1;
+#if defined(FD_CLOEXEC)
+    const int flags = fcntl(duplicated, F_GETFD);
+    if (flags >= 0) (void)fcntl(duplicated, F_SETFD, flags | FD_CLOEXEC);
+#endif
+    return duplicated;
+}
+#endif
 
 bool same_location(libusb_device* device,
                    const DeviceLocation& location) noexcept
@@ -182,6 +204,114 @@ public:
         libusb_free_device_list(devices, 1);
         return OpenOutcome{OpenState::ok, TransferCause::none};
     }
+
+#if defined(__linux__) || defined(__ANDROID__)
+    OpenOutcome open_fd(int fd, DeviceSummary& summary) noexcept override
+    {
+        if (context_ == nullptr || handle_ != nullptr || fd < 0)
+            return OpenOutcome{OpenState::invalid, TransferCause::invalid};
+        const int retained_fd = duplicate_fd(fd);
+        if (retained_fd < 0)
+            return OpenOutcome{OpenState::io, TransferCause::io};
+
+        libusb_device_handle* wrapped = nullptr;
+        const int wrap_status = libusb_wrap_sys_device(
+            context_, static_cast<std::intptr_t>(retained_fd), &wrapped);
+        if (wrap_status != LIBUSB_SUCCESS || wrapped == nullptr) {
+            ::close(retained_fd);
+            return open_outcome_for_error(wrap_status);
+        }
+
+        libusb_device* device = libusb_get_device(wrapped);
+        if (device == nullptr) {
+            libusb_close(wrapped);
+            ::close(retained_fd);
+            return OpenOutcome{OpenState::io, TransferCause::io};
+        }
+        libusb_device_descriptor descriptor{};
+        const int descriptor_status =
+            libusb_get_device_descriptor(device, &descriptor);
+        if (descriptor_status != LIBUSB_SUCCESS) {
+            libusb_close(wrapped);
+            ::close(retained_fd);
+            return open_outcome_for_error(descriptor_status);
+        }
+        if (descriptor.idVendor != 0x054cU || descriptor.idProduct != 0x04b2U) {
+            libusb_close(wrapped);
+            ::close(retained_fd);
+            return OpenOutcome{OpenState::unsupported, TransferCause::unsupported};
+        }
+
+        int configuration = 0;
+        const int configuration_status =
+            libusb_get_configuration(wrapped, &configuration);
+        if (configuration_status != LIBUSB_SUCCESS) {
+            libusb_close(wrapped);
+            ::close(retained_fd);
+            return open_outcome_for_error(configuration_status);
+        }
+        if (configuration != 1) {
+            libusb_close(wrapped);
+            ::close(retained_fd);
+            return OpenOutcome{OpenState::unsupported, TransferCause::unsupported};
+        }
+        libusb_config_descriptor* active = nullptr;
+        const int active_status =
+            libusb_get_active_config_descriptor(device, &active);
+        if (active_status != LIBUSB_SUCCESS) {
+            libusb_close(wrapped);
+            ::close(retained_fd);
+            return open_outcome_for_error(active_status);
+        }
+        summary.vid = descriptor.idVendor;
+        summary.pid = descriptor.idProduct;
+        summary.num_configurations = descriptor.bNumConfigurations;
+        summary.configuration_value = active->bConfigurationValue;
+        summary.num_interfaces = active->bNumInterfaces;
+        if (active->bNumInterfaces != 0U) {
+            const libusb_interface& interface = active->interface[0];
+            for (int alternate = 0; alternate < interface.num_altsetting; ++alternate) {
+                const libusb_interface_descriptor& setting = interface.altsetting[alternate];
+                if (setting.bAlternateSetting != 0U) continue;
+                summary.interface_zero.number = setting.bInterfaceNumber;
+                summary.interface_zero.alternate = setting.bAlternateSetting;
+                summary.interface_zero.interface_class = setting.bInterfaceClass;
+                summary.interface_zero.interface_subclass = setting.bInterfaceSubClass;
+                summary.interface_zero.interface_protocol = setting.bInterfaceProtocol;
+                const std::size_t endpoint_count =
+                    setting.bNumEndpoints < summary.interface_zero.endpoints.size()
+                        ? setting.bNumEndpoints
+                        : summary.interface_zero.endpoints.size();
+                summary.interface_zero.endpoint_count =
+                    static_cast<std::uint8_t>(endpoint_count);
+                for (std::size_t index = 0U; index < endpoint_count; ++index) {
+                    const libusb_endpoint_descriptor& endpoint =
+                        setting.endpoint[index];
+                    summary.interface_zero.endpoints[index].address =
+                        endpoint.bEndpointAddress;
+                    summary.interface_zero.endpoints[index].attributes =
+                        endpoint.bmAttributes;
+                    summary.interface_zero.endpoints[index].max_packet =
+                        endpoint.wMaxPacketSize;
+                    summary.interface_zero.endpoints[index].interval =
+                        endpoint.bInterval;
+                }
+                break;
+            }
+        }
+        libusb_free_config_descriptor(active);
+        handle_ = wrapped;
+        retained_fd_ = retained_fd;
+        return OpenOutcome{OpenState::ok, TransferCause::none};
+    }
+#else
+    OpenOutcome open_fd(int fd, DeviceSummary& summary) noexcept override
+    {
+        (void)fd;
+        (void)summary;
+        return OpenOutcome{OpenState::unsupported, TransferCause::unsupported};
+    }
+#endif
 
     OpenOutcome claim_interface(std::uint8_t number) noexcept override
     {
@@ -339,6 +469,12 @@ public:
             libusb_close(handle_);
             handle_ = nullptr;
         }
+#if defined(__linux__) || defined(__ANDROID__)
+        if (retained_fd_ >= 0) {
+            ::close(retained_fd_);
+            retained_fd_ = -1;
+        }
+#endif
         if (context_ != nullptr) {
             libusb_exit(context_);
             context_ = nullptr;
@@ -412,6 +548,9 @@ private:
 
     libusb_context* context_ = nullptr;
     libusb_device_handle* handle_ = nullptr;
+#if defined(__linux__) || defined(__ANDROID__)
+    int retained_fd_ = -1;
+#endif
     std::map<std::uint64_t, std::unique_ptr<AsyncTransfer>> async_;
     std::uint64_t next_async_id_ = 1U;
     bool unrecovered_ = false;
@@ -439,6 +578,22 @@ std::unique_ptr<UsbIo> create_libusb_io() noexcept
     if (libusb_init(&context) != LIBUSB_SUCCESS || context == nullptr)
         return nullptr;
     return std::unique_ptr<UsbIo>(new LibusbIo(context));
+}
+
+std::unique_ptr<UsbIo> create_libusb_io_fd() noexcept
+{
+#if defined(__linux__) || defined(__ANDROID__)
+    libusb_init_option option{};
+    option.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY;
+    option.value.ival = 1;
+    libusb_context* context = nullptr;
+    if (libusb_init_context(&context, &option, 1) != LIBUSB_SUCCESS ||
+        context == nullptr)
+        return nullptr;
+    return std::unique_ptr<UsbIo>(new LibusbIo(context));
+#else
+    return create_libusb_io();
+#endif
 }
 
 }  // namespace torne::usb

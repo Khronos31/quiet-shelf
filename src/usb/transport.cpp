@@ -136,6 +136,34 @@ OpenResult Transport::open(std::unique_ptr<UsbIo> io,
                       std::move(transport)};
 }
 
+OpenResult Transport::open_fd(std::unique_ptr<UsbIo> io, int fd) noexcept
+{
+    if (!io || fd < 0)
+        return OpenResult{OpenOutcome{OpenState::invalid, TransferCause::invalid},
+                          nullptr};
+    DeviceSummary summary;
+    const OpenOutcome opened = io->open_fd(fd, summary);
+    if (opened.state != OpenState::ok) {
+        io->close();
+        return OpenResult{opened, nullptr};
+    }
+    if (!expected_summary(summary)) {
+        io->close();
+        return OpenResult{OpenOutcome{OpenState::unsupported,
+                                      TransferCause::unsupported}, nullptr};
+    }
+    const OpenOutcome claimed = io->claim_interface(0U);
+    if (claimed.state != OpenState::ok) {
+        io->close();
+        return OpenResult{claimed, nullptr};
+    }
+    std::unique_ptr<Transport> transport(
+        new Transport(std::move(io), summary));
+    transport->claimed_ = true;
+    return OpenResult{OpenOutcome{OpenState::ok, TransferCause::none},
+                      std::move(transport)};
+}
+
 Transport::Transport(std::unique_ptr<UsbIo> io, DeviceSummary summary) noexcept
     : io_(std::move(io)), summary_(summary)
 {

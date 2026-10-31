@@ -13,6 +13,8 @@ struct DaemonConfig final {
     bool version = false;
     bool list_json = false;
     bool has_device = false;
+    bool has_fd = false;
+    int fd = -1;
     dtv::userland::identity::Selector device{};
     std::string instance;
     std::string runtime_directory;

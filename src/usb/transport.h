@@ -28,6 +28,9 @@ class Transport final {
 public:
     static OpenResult open(std::unique_ptr<UsbIo> io,
                            const DeviceLocation& location) noexcept;
+    // Same descriptor/claim validation as open(), but from a caller-owned
+    // native descriptor. UsbIo duplicates fd; this Transport never closes it.
+    static OpenResult open_fd(std::unique_ptr<UsbIo> io, int fd) noexcept;
 
     ~Transport() noexcept;
     Transport(const Transport&) = delete;
