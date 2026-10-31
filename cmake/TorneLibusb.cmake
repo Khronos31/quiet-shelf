@@ -7,6 +7,8 @@ set(TORNE_LIBUSB_VERSION "1.0.30")
 set(TORNE_LIBUSB_URL
     "https://github.com/libusb/libusb/releases/download/v${TORNE_LIBUSB_VERSION}/libusb-${TORNE_LIBUSB_VERSION}.tar.bz2")
 set(TORNE_LIBUSB_SHA256 "fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf")
+set(TORNE_LIBUSB_SOURCE_ARCHIVE "" CACHE FILEPATH
+    "Optional verified libusb source archive for offline/release rebuilds")
 
 set(TORNE_LIBUSB_SOURCE_DIR "${CMAKE_BINARY_DIR}/libusb-src")
 set(TORNE_LIBUSB_BINARY_DIR "${CMAKE_BINARY_DIR}/libusb-build")
@@ -84,8 +86,15 @@ function(torne_add_libusb)
         list(APPEND configure_env "RANLIB=${CMAKE_RANLIB}")
     endif()
 
+    set(libusb_url "${TORNE_LIBUSB_URL}")
+    if(TORNE_LIBUSB_SOURCE_ARCHIVE)
+        get_filename_component(libusb_source_archive
+            "${TORNE_LIBUSB_SOURCE_ARCHIVE}" ABSOLUTE)
+        set(libusb_url "file://${libusb_source_archive}")
+    endif()
+
     ExternalProject_Add(torne_libusb_external
-        URL "${TORNE_LIBUSB_URL}"
+        URL "${libusb_url}"
         URL_HASH "SHA256=${TORNE_LIBUSB_SHA256}"
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         SOURCE_DIR "${TORNE_LIBUSB_SOURCE_DIR}"

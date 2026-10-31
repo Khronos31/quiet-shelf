@@ -264,6 +264,24 @@ bool read_frame(dtv::userland::wire::TimedClientTransport& transport,
     return true;
 }
 
+void test_auto_instance_identity()
+{
+    const auto selector = dtv::userland::identity::parse_device_selector("usb:1-2");
+    CHECK(selector);
+    if (!selector) return;
+    const auto resolved = dtv::userland::identity::resolve_selector(
+        dtv::userland::identity::Product::torne, selector.value());
+    CHECK(resolved);
+    if (!resolved) return;
+    const auto automatic = dtv::userland::identity::auto_instance(resolved.value());
+    CHECK(automatic);
+    if (!automatic) return;
+    const std::string instance(automatic.value().bytes.data(),
+                               automatic.value().length);
+    CHECK(instance.rfind("auto-", 0U) == 0U);
+    CHECK(instance.size() == 37U);
+}
+
 void test_daemon_publishes_and_closes()
 {
 #if defined(_WIN32)
@@ -280,8 +298,17 @@ void test_daemon_publishes_and_closes()
     const auto automatic = dtv::userland::identity::auto_instance(resolved.value());
     CHECK(automatic);
     if (!automatic) return;
-    const std::string instance(automatic.value().bytes.data(),
-                               automatic.value().length);
+    const std::string automatic_instance(automatic.value().bytes.data(),
+                                         automatic.value().length);
+    // Keep the daemon's auto-instance wiring in this combined test wherever
+    // this fixture can build a root that fits sun_path. The fixture adds a
+    // tda-<clock> directory under an explicit runtime root; on the measured
+    // Android/Termux private temp root the 37-character auto token does not
+    // fit, so fall back to a short explicit instance and retain every
+    // lifecycle/IPC/CardService assertion. This is not a statement about all
+    // Termux roots, default root selection, or the FD entry.
+    std::string instance = automatic_instance;
+    bool automatic_instance_mode = true;
 
     // AF_UNIX path limits are smaller than some CI TMPDIR trees. Prefer a
     // short, writable temporary directory; fall back to a short /tmp only
@@ -315,6 +342,22 @@ void test_daemon_publishes_and_closes()
             break;
         }
     }
+    if (root.empty()) {
+        std::fprintf(stderr,
+                     "product daemon test: auto-instance fixture root does not "
+                     "fit; using explicit daemon lifecycle\n");
+        instance = "daemon";
+        automatic_instance_mode = false;
+        for (const fs::path& base : bases) {
+            if (!fits(base)) continue;
+            const fs::path candidate = base / leaf;
+            error.clear();
+            if (fs::create_directories(candidate, error) && !error) {
+                root = candidate;
+                break;
+            }
+        }
+    }
     CHECK(!root.empty());
     if (root.empty()) return;
     fs::permissions(root, fs::perms::owner_all,
@@ -325,6 +368,7 @@ void test_daemon_publishes_and_closes()
     config.runtime_directory = root.string();
     config.has_device = true;
     config.device = selector.value();
+    if (!automatic_instance_mode) config.instance = instance;
     FakeDevice::close_calls.store(0);
     FakeBackend backend;
     std::atomic<bool> finished{false};
@@ -577,6 +621,7 @@ void test_daemon_publishes_and_closes()
 
 int main()
 {
+    test_auto_instance_identity();
     test_daemon_publishes_and_closes();
     if (failures != 0) {
         std::fprintf(stderr, "%d checks failed\n", failures);

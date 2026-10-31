@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Install build tools
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential make libpcsclite-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential make libpcsclite-dev curl
 
       - name: Configure
         env:
@@ -52,6 +52,45 @@ jobs:
           for exe in torned tornectl torne-ts; do
             "./build/$exe" --version
           done
+
+      - name: Smoke release helper from public checkout
+        if: matrix.config == 'Release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          core="$RUNNER_TEMP/torne-core-548"
+          git init -q "$core"
+          git -C "$core" fetch --depth 1 https://github.com/Khronos31/dtv-userland-core.git 548a04605d9e224be179547de30f590ff693a128
+          git -C "$core" checkout --detach FETCH_HEAD
+          test "$(git -C "$core" rev-parse HEAD)" = "548a04605d9e224be179547de30f590ff693a128"
+          libusb="$RUNNER_TEMP/libusb-1.0.30.tar.bz2"
+          curl -fsSL --retry 3 https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2 -o "$libusb"
+          echo "fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf  $libusb" | sha256sum -c -
+          output="$RUNNER_TEMP/torne-release-smoke"
+          scripts/release/build-candidate.sh --output "$output" --core-source "$core" --libusb-source-archive "$libusb"
+          python3 - "$output" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import tarfile
+          import sys
+          output = Path(sys.argv[1])
+          source_archive = next(output.glob("torne-userland-*-source.tar.gz"))
+          with tarfile.open(source_archive) as archive:
+              member = next(m for m in archive.getmembers()
+                            if m.name.endswith("/SOURCE-METADATA.json"))
+              data = json.load(archive.extractfile(member))
+          expected_map = hashlib.sha256(Path("SOURCE-MAP.json").read_bytes()).hexdigest()
+          assert data["product_source"]["repository"] == "Khronos31/torne-userland"
+          assert data["product_source"]["commit"] == "3fe17ea167fc1fff4586046d6b2a8edc02f52c4b"
+          assert data["product_source"]["tree"] == "6199984391eca496abc2a5a9d26d01f9efd03264"
+          assert data["checkout"]["repository"].endswith("quiet-shelf")
+          assert data["checkout"]["commit"] == os.environ["GITHUB_SHA"]
+          assert data["checkout"]["commit"] != data["product_source"]["commit"]
+          assert data["source_map"]["sha256"] == expected_map
+          print("release smoke provenance OK")
+          PY
 
       - name: Configure PC/SC IFD stage
         env:
