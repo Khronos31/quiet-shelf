@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform as hostinfo
 import re
 import shutil
 import subprocess
@@ -31,8 +32,20 @@ LINUX_PLATFORMS = (
 )
 DARWIN_PLATFORM = "darwin-arm64"
 WINDOWS_PLATFORM = "windows-x86_64"
+ANDROID_PLATFORMS = ("android-armv7a", "android-aarch64", "android-x86_64")
 DESKTOP_PLATFORMS = (DARWIN_PLATFORM, WINDOWS_PLATFORM)
-PLATFORMS = LINUX_PLATFORMS + DESKTOP_PLATFORMS
+PLATFORMS = LINUX_PLATFORMS + ANDROID_PLATFORMS + DESKTOP_PLATFORMS
+ANDROID_ABI = {
+    "android-armv7a": ("armeabi-v7a", "armv7a", "/system/bin/linker", "ELF32", "ARM"),
+    "android-aarch64": ("arm64-v8a", "aarch64", "/system/bin/linker64", "ELF64", "AArch64"),
+    "android-x86_64": (
+        "x86_64", "x86_64", "/system/bin/linker64", "ELF64",
+        "Advanced Micro Devices X86-64"),
+}
+ANDROID_API = "android-26"
+ANDROID_STL = "c++_static"
+ANDROID_LINKER_FLAGS = "-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+ANDROID_ALLOWED_NEEDED = {"libc.so", "libm.so", "libdl.so", "liblog.so"}
 WINDOWS_EXPORT_NAMES = (
     "SCardConnectA",
     "SCardConnectW",
@@ -136,6 +149,8 @@ def split_platform(platform: str) -> tuple[str, str]:
         return "darwin", "arm64"
     if platform == WINDOWS_PLATFORM:
         return "windows", "x86_64"
+    if platform in ANDROID_PLATFORMS:
+        return "android", ANDROID_ABI[platform][1]
     match = re.fullmatch(r"linux-(glibc|musl)-(x86_64|aarch64)", platform)
     if match is None:
         fail(f"unsupported platform: {platform}")
@@ -173,9 +188,16 @@ def load_toolchains(path: str | None) -> dict[str, dict[str, object]]:
             fail(f"unsupported platform in toolchain config: {platform}")
         if not isinstance(value, dict):
             fail(f"toolchain entry must be an object: {platform}")
-        for key in ("cc", "cxx"):
-            if not isinstance(value.get(key), str) or not value[key]:
-                fail(f"toolchain {platform}.{key} is missing")
+        if platform in ANDROID_PLATFORMS:
+            if not isinstance(value.get("ndk"), str) or not value["ndk"]:
+                fail(f"toolchain {platform}.ndk is missing")
+            for key in ("android_platform", "android_stl", "android_ndk_revision"):
+                if key in value and not isinstance(value[key], str):
+                    fail(f"toolchain {platform}.{key} must be a string")
+        else:
+            for key in ("cc", "cxx"):
+                if not isinstance(value.get(key), str) or not value[key]:
+                    fail(f"toolchain {platform}.{key} is missing")
         for key in ("c_flags", "cxx_flags", "exe_linker_flags", "shared_linker_flags"):
             if key in value and not isinstance(value[key], str):
                 fail(f"toolchain {platform}.{key} must be a string")
@@ -215,6 +237,86 @@ def resolve_platform(platform: str, toolchains: dict[str, dict[str, object]]) ->
         values = {"cc": os.environ.get("CC", "cc"), "cxx": os.environ.get("CXX", "c++")}
     else:
         fail(f"--toolchain-config is required for {platform}")
+    if libc == "android":
+        ndk_value = values.get("ndk") or os.environ.get("ANDROID_NDK_HOME") or os.environ.get("ANDROID_NDK_ROOT")
+        if not isinstance(ndk_value, str) or not ndk_value:
+            fail(f"toolchain {platform}.ndk or ANDROID_NDK_HOME is required")
+        ndk = Path(ndk_value).expanduser().resolve()
+        properties = ndk / "source.properties"
+        if not properties.is_file():
+            fail(f"Android NDK source.properties is missing: {properties}")
+        revision_match = re.search(r"^Pkg.Revision = (\S+)$",
+                                   properties.read_text(encoding="utf-8"), re.MULTILINE)
+        if revision_match is None:
+            fail(f"cannot read Android NDK revision: {properties}")
+        revision = revision_match.group(1)
+        if revision.split(".", 1)[0] != "27":
+            fail(f"Android NDK r27 is required for release archives, got {revision}")
+        expected_revision = values.get("android_ndk_revision")
+        if expected_revision and revision != expected_revision:
+            fail(f"Android NDK revision mismatch: expected {expected_revision}, got {revision}")
+        host_machine = hostinfo.machine().lower()
+        if hostinfo.system() == "Linux" and host_machine in ("x86_64", "amd64"):
+            prebuilt = "linux-x86_64"
+        elif hostinfo.system() == "Linux" and host_machine in ("aarch64", "arm64"):
+            prebuilt = "linux-aarch64"
+        elif hostinfo.system() == "Darwin" and host_machine in ("arm64", "aarch64"):
+            prebuilt = "darwin-x86_64"
+        elif hostinfo.system() == "Darwin" and host_machine in ("x86_64", "amd64"):
+            prebuilt = "darwin-x86_64"
+        else:
+            fail(f"unsupported Android build host: {hostinfo.system()} {hostinfo.machine()}")
+        toolchain = ndk / "toolchains" / "llvm" / "prebuilt" / prebuilt
+        cc = executable_path(str(toolchain / "bin" / "clang"))
+        cxx = executable_path(str(toolchain / "bin" / "clang++"))
+        strip = executable_path(str(toolchain / "bin" / "llvm-strip"))
+        nm = executable_path(str(toolchain / "bin" / "llvm-nm"))
+        toolchain_file = ndk / "build" / "cmake" / "android.toolchain.cmake"
+        if not toolchain_file.is_file():
+            fail(f"Android CMake toolchain is missing: {toolchain_file}")
+        for material in ("NOTICE", "NOTICE.toolchain"):
+            if not (ndk / material).is_file():
+                fail(f"Android NDK notice is missing: {ndk / material}")
+        abi, android_cpu, interpreter, elf_class, machine = ANDROID_ABI[platform]
+        android_platform = str(values.get("android_platform", ANDROID_API))
+        android_stl = str(values.get("android_stl", ANDROID_STL))
+        if android_stl != "c++_static":
+            fail(f"Android STL must be {ANDROID_STL}, got {android_stl}")
+        values.update({
+            "platform": platform,
+            "libc": "android",
+            "cpu": android_cpu,
+            "cc": str(cc),
+            "cxx": str(cxx),
+            "c_flags": str(values.get("c_flags", "")),
+            "cxx_flags": str(values.get("cxx_flags", "")),
+            "exe_linker_flags": str(values.get("exe_linker_flags", ANDROID_LINKER_FLAGS)),
+            "shared_linker_flags": str(values.get("shared_linker_flags", ANDROID_LINKER_FLAGS)),
+            "sysroot": None,
+            "cmake_system_name": None,
+            "system_processor": android_cpu,
+            "c_compiler_target": None,
+            "cxx_compiler_target": None,
+            "readobj": None,
+            "cmake_args": list(values.get("cmake_args", [])),
+            "runner": [],
+            "run_checks": bool(values.get("run_checks", False)),
+            "emulated": False,
+            "build_kind": str(values.get("build_kind", "cross")),
+            "env": {**dict(values.get("env", {})), "ANDROID_NDK_HOME": str(ndk)},
+            "android_ndk": str(ndk),
+            "android_ndk_revision": revision,
+            "android_platform": android_platform,
+            "android_stl": android_stl,
+            "android_abi": abi,
+            "android_interpreter": interpreter,
+            "android_elf_class": elf_class,
+            "android_machine": machine,
+            "android_toolchain_file": str(toolchain_file),
+            "android_strip": str(strip),
+            "android_nm": str(nm),
+        })
+        return values
     cc = executable_path(str(values["cc"]))
     cxx = executable_path(str(values["cxx"]))
     runner = values.get("runner", [])
@@ -512,6 +614,32 @@ def build_platform(version: str, source: Path, spec: dict[str, object],
                    work: Path, jobs: int) -> Path:
     platform = str(spec["platform"])
     build = work / f"build-{platform}"
+    if str(spec["libc"]) == "android":
+        configure = [
+            "cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DTORNE_BUILD_TESTS=OFF",
+            "-DTORNE_BUILD_PCSC_IFD=OFF",
+            "-DTORNE_BUILD_WINSCARD=OFF",
+            f"-DTORNE_CORE_SOURCE_DIR={source / 'third_party/dtv-userland-core'}",
+            f"-DTORNE_LIBUSB_SOURCE_ARCHIVE={source / 'third_party/libusb/libusb-1.0.30.tar.bz2'}",
+            f"-DCMAKE_TOOLCHAIN_FILE={spec['android_toolchain_file']}",
+            f"-DANDROID_ABI={spec['android_abi']}",
+            f"-DANDROID_PLATFORM={spec['android_platform']}",
+            f"-DCMAKE_ANDROID_STL_TYPE={spec['android_stl']}",
+            f"-DCMAKE_EXE_LINKER_FLAGS={spec['exe_linker_flags']}",
+            f"-DCMAKE_SHARED_LINKER_FLAGS={spec['shared_linker_flags']}",
+        ]
+        if spec.get("c_flags"):
+            configure.append(f"-DCMAKE_C_FLAGS={spec['c_flags']}")
+        if spec.get("cxx_flags"):
+            configure.append(f"-DCMAKE_CXX_FLAGS={spec['cxx_flags']}")
+        configure.extend(str(item) for item in spec.get("cmake_args", []))
+        run(configure, cwd=source, env=spec["env"])
+        run(["cmake", "--build", str(build), "--parallel", str(jobs), "--target",
+             "torne_torned", "torne_tornectl", "torne_torne_ts"],
+            cwd=source, env=spec["env"])
+        return build
     configure = [
         "cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
@@ -632,6 +760,72 @@ def check_ifd(path: Path, spec: dict[str, object]) -> None:
     for symbol in IFD_SYMBOLS:
         if re.search(rf"\s_?{re.escape(symbol)}$", symbols, re.MULTILINE) is None:
             fail(f"missing IFD symbol: {symbol}")
+
+
+def check_android_static_libusb(path: Path, spec: dict[str, object]) -> None:
+    symbols = output([str(spec["android_nm"]), str(path)])
+    for symbol in ("libusb_init", "libusb_close"):
+        if re.search(rf"\s{symbol}$", symbols, re.MULTILINE) is None:
+            fail(f"missing static libusb symbol in {path.name}: {symbol}")
+
+
+def check_android_binary(path: Path, spec: dict[str, object]) -> None:
+    header = output(["readelf", "-h", str(path)])
+    elf_class = re.search(r"Class:\s+(\S+)", header)
+    elf_type = re.search(r"Type:\s+(\S+)", header)
+    machine = re.search(r"Machine:\s+(.+)", header)
+    if elf_class is None or elf_type is None or machine is None:
+        fail(f"cannot read Android ELF identity: {path.name}")
+    if elf_class.group(1) != str(spec["android_elf_class"]):
+        fail(f"unexpected Android ELF class in {path.name}: {elf_class.group(1)}")
+    if machine.group(1).strip() != str(spec["android_machine"]):
+        fail(f"unexpected Android ELF machine in {path.name}: {machine.group(1).strip()}")
+    if not elf_type.group(1).startswith("DYN"):
+        fail(f"Android CLI is not PIE/DYN: {path.name}: {elf_type.group(1)}")
+    program = output(["readelf", "-lW", str(path)])
+    interpreter_match = re.search(r"Requesting program interpreter: ([^\]]+)", program)
+    if interpreter_match is None or interpreter_match.group(1) != str(spec["android_interpreter"]):
+        fail(f"unexpected Android program interpreter in {path.name}: "
+             f"{interpreter_match.group(1) if interpreter_match else 'missing'}")
+    alignments = []
+    for line in program.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "LOAD":
+            alignments.append(fields[-1])
+    if not alignments:
+        fail(f"no PT_LOAD segments in {path.name}")
+    for alignment in alignments:
+        try:
+            value = int(alignment, 16)
+        except ValueError:
+            fail(f"invalid PT_LOAD alignment in {path.name}: {alignment}")
+        if value < 0x4000 or value & (value - 1):
+            fail(f"PT_LOAD alignment below 16 KiB or not a power of two in {path.name}: {alignment}")
+    if "GNU_RELRO" not in program:
+        fail(f"missing GNU_RELRO in {path.name}")
+    dynamic = output(["readelf", "-d", str(path)])
+    if re.search(r"\(FLAGS\).*BIND_NOW|\(FLAGS_1\).*NOW", dynamic) is None:
+        fail(f"missing BIND_NOW in {path.name}")
+    if re.search(r"\(RPATH\)|\(RUNPATH\)", dynamic) is not None:
+        fail(f"RPATH/RUNPATH is forbidden in {path.name}")
+    deps = re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", dynamic)
+    for dependency in deps:
+        if dependency not in ANDROID_ALLOWED_NEEDED:
+            fail(f"unexpected Android DT_NEEDED in {path.name}: {dependency}")
+    if "libc.so" not in deps:
+        fail(f"missing Android libc.so dependency in {path.name}")
+    if any(token in dependency for dependency in deps for token in
+           ("libusb", "libudev", "libstdc++", "libc++", "libgcc", "libunwind")):
+        fail(f"non-Android runtime dependency in {path.name}: {deps}")
+    sections = output(["readelf", "-SW", str(path)])
+    section_names = re.findall(r"^\s*\[\s*\d+\]\s+(\S+)", sections, re.MULTILINE)
+    if any(name.startswith(".debug_") or name in (".symtab", ".strtab")
+           for name in section_names):
+        fail(f"unstripped debug/symbol section in {path.name}")
+    leaked = re.search(r"/usr/|/opt/|/lib64/ld-linux|/lib/ld-musl|/lib/ld-linux|"
+                       r"data/data/com\.termux", program + dynamic)
+    if leaked is not None:
+        fail(f"host/prefix path leaked into Android ELF {path.name}: {leaked.group(0)}")
 
 
 def compiler_metadata(value: str, env: dict[str, str]) -> dict[str, str]:
@@ -1021,6 +1215,138 @@ def build_darwin_archive(version: str, spec: dict[str, object],
     return archive_path
 
 
+def copy_fr30_materials(source_root: Path, stage: Path) -> None:
+    for relative in ("fr30/README.md", "fr30/src", "fr30/ld", "fr30/generated"):
+        source = source_root / relative
+        destination = stage / relative
+        if not source.exists():
+            fail(f"missing FR30 material: {source}")
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
+def build_android_archive(version: str, spec: dict[str, object],
+                          product_source: dict[str, str],
+                          checkout: dict[str, str], source_map_sha256: str | None,
+                          core_commit: str, libusb_version: str, libusb_url: str,
+                          libusb_sha256: str, source_root: Path,
+                          source_archive_path: Path, source_archive_sha256: str,
+                          build: Path, work: Path, output_dir: Path) -> Path:
+    platform = str(spec["platform"])
+    root_name = f"{PRODUCT}-{version}-{platform}"
+    stage = work / root_name
+    for sub in ("bin", "licenses", "ndk", "docs"):
+        (stage / sub).mkdir(parents=True)
+    binary_hashes = {}
+    binary_needed = {}
+    binary_interpreter = {}
+    for name in BINARIES:
+        source = build / name
+        if not source.is_file():
+            fail(f"missing built binary: {source}")
+        destination = stage / "bin" / name
+        shutil.copy2(source, destination)
+        if name in ("torned", "torne-ts"):
+            check_android_static_libusb(destination, spec)
+        run([str(spec["android_strip"]), "--strip-all", str(destination)])
+        check_android_binary(destination, spec)
+        binary_hashes[name] = sha256(destination)
+        binary_needed[name] = needed(destination)
+        binary_interpreter[name] = interpreter(destination)
+    launcher = source_root / "packaging" / "termux" / "torne-termux"
+    if not launcher.is_file():
+        fail("missing Termux launcher")
+    launcher_destination = stage / "bin" / "torne-termux"
+    shutil.copy2(launcher, launcher_destination)
+    launcher_destination.chmod(0o755)
+    copy_release_docs(source_root, stage)
+    core_provenance = source_root / "third_party" / "dtv-userland-core" / "PROVENANCE.json"
+    if not core_provenance.is_file():
+        fail("missing Core PROVENANCE.json")
+    shutil.copy2(core_provenance, stage / "licenses" / "PROVENANCE.dtv-userland-core.json")
+    ndk = Path(str(spec["android_ndk"]))
+    for name in ("source.properties", "NOTICE", "NOTICE.toolchain"):
+        source = ndk / name
+        if not source.is_file():
+            fail(f"missing Android NDK material: {source}")
+        shutil.copy2(source, stage / "ndk" / name)
+    copy_fr30_materials(source_root, stage)
+    fr30_hashes = {
+        path.relative_to(stage).as_posix(): sha256(path)
+        for path in sorted((stage / "fr30").rglob("*")) if path.is_file()
+    }
+    metadata = {
+        "schema": 1,
+        "product": PRODUCT,
+        "version": version,
+        "platform": platform,
+        "libc": "android",
+        "cpu": str(spec["cpu"]),
+        "android": {
+            "abi": str(spec["android_abi"]),
+            "api": str(spec["android_platform"]),
+            "stl": str(spec["android_stl"]),
+            "ndk_revision": str(spec["android_ndk_revision"]),
+        },
+        "build_kind": str(spec["build_kind"]),
+        "emulated": False,
+        "product_source": product_source,
+        "checkout": checkout,
+        "source_map": ({"path": "SOURCE-MAP.json", "sha256": source_map_sha256}
+                       if source_map_sha256 is not None else None),
+        "source_commit": product_source["commit"],
+        "source_tree": product_source["tree"],
+        "core_commit": core_commit,
+        "libusb_version": libusb_version,
+        "libusb_url": libusb_url,
+        "libusb_sha256": libusb_sha256,
+        "source_archive": source_archive_path.name,
+        "source_archive_sha256": source_archive_sha256,
+        "toolchain": toolchain_metadata(spec),
+        "binary_sha256": binary_hashes,
+        "binary_needed": binary_needed,
+        "binary_interpreter": binary_interpreter,
+        "launcher_sha256": sha256(launcher_destination),
+        "fr30_sha256": fr30_hashes,
+        "verification": {
+            "android_elf": "checked PIE/machine/interpreter/PT_LOAD/RELRO/BIND_NOW/NEEDED",
+            "stripped": "llvm-strip --strip-all",
+            "static_libusb_symbols": "torned/torne-ts checked before strip",
+            "pcsc_or_winscard": "not included",
+            "help_version": "not run (Android binaries are not executed on the build host)",
+        },
+        "note": "No bit-for-bit reproducibility claim; inputs, toolchain, hashes and rebuild inputs are recorded.",
+    }
+    write_json(stage / "BUILD-METADATA.json", metadata)
+    (stage / "DEPENDENCY-NOTICE.txt").write_text(
+        "\n".join([
+            f"# {PRODUCT} {version} {platform}",
+            "",
+            f"Source: {source_archive_path.name}",
+            f"Source archive SHA-256: {source_archive_sha256}",
+            f"Core: Khronos31/dtv-userland-core {core_commit}",
+            f"libusb: {libusb_version}, static LGPL-2.1-or-later, {libusb_url}",
+            f"libusb source SHA-256: {libusb_sha256}",
+            f"Android NDK: {spec['android_ndk_revision']}, {spec['android_platform']}, "
+            f"{spec['android_stl']}",
+            "",
+            "The three CLI executables are Android PIE binaries with static libusb and "
+            "static C++ runtime.",
+            "The Termux launcher is included at bin/torne-termux.",
+            "Android PC/SC IFD and WinSCard DLL are not included.",
+            "Product LICENSE/NOTICE/PROVENANCE, Core MIT/GPL notices, libusb COPYING,",
+            "NDK NOTICE/NOTICE.toolchain, FR30 source/generated materials, and source/rebuild",
+            "inputs are included.",
+        ]) + "\n", encoding="utf-8")
+    write_inner_checksums(stage)
+    archive_path = output_dir / f"{root_name}.tar.gz"
+    deterministic_tar(stage, archive_path)
+    return archive_path
+
+
 def build_windows_archive(version: str, spec: dict[str, object],
                           product_source: dict[str, str],
                           checkout: dict[str, str], source_map_sha256: str | None,
@@ -1151,6 +1477,39 @@ def verify_extracted(archive_path: Path, version: str, spec: dict[str, object],
     platform = str(spec["platform"])
     extract = work / f"verify-{platform}"
     extract.mkdir()
+    if str(spec["libc"]) == "android":
+        with tarfile.open(archive_path) as archive:
+            safe_extract(archive, extract)
+        root = extract / f"{PRODUCT}-{version}-{platform}"
+        required = [
+            *[root / "bin" / name for name in BINARIES],
+            root / "bin" / "torne-termux",
+            root / "licenses" / "LICENSE",
+            root / "licenses" / "NOTICE",
+            root / "licenses" / "PROVENANCE.md",
+            root / "licenses" / "LICENSE.dtv-userland-core",
+            root / "licenses" / "PROVENANCE.dtv-userland-core.json",
+            root / "licenses" / "libusb-COPYING",
+            root / "ndk" / "source.properties",
+            root / "ndk" / "NOTICE",
+            root / "ndk" / "NOTICE.toolchain",
+            root / "fr30" / "README.md",
+            root / "docs" / "README.md",
+            root / "docs" / "cli-framework.md",
+            root / "BUILD-METADATA.json",
+            root / "DEPENDENCY-NOTICE.txt",
+            root / "SHA256SUMS",
+        ]
+        for path in required:
+            if not path.is_file():
+                fail(f"missing extracted release file: {path.relative_to(extract)}")
+        verify_inner_checksums(root)
+        for name in BINARIES:
+            check_android_binary(root / "bin" / name, spec)
+        launcher = root / "bin" / "torne-termux"
+        if not os.access(launcher, os.X_OK):
+            fail("extracted Termux launcher is not executable")
+        return
     if platform == WINDOWS_PLATFORM:
         safe_extract_zip(archive_path, extract)
         root = extract / f"{PRODUCT}-{version}-{WINDOWS_PLATFORM}"
@@ -1248,6 +1607,10 @@ def main() -> int:
                         help="Linux archive platform; repeat to manufacture several")
     parser.add_argument("--linux-matrix", action="store_true",
                         help="manufacture all four Linux glibc/musl x86_64/aarch64 archives")
+    parser.add_argument("--android-platform", action="append", choices=ANDROID_PLATFORMS,
+                        help="Android archive platform; repeat to manufacture several")
+    parser.add_argument("--android-matrix", action="store_true",
+                        help="manufacture all three Android armv7a/aarch64/x86_64 archives")
     parser.add_argument("--darwin-arm64", action="store_true",
                         help="manufacture the macOS arm64 archive (must run on macOS)")
     parser.add_argument("--windows-x86_64", action="store_true",
@@ -1266,6 +1629,10 @@ def main() -> int:
         platforms.extend(LINUX_PLATFORMS)
     elif args.linux_platform:
         platforms.extend(args.linux_platform)
+    if args.android_matrix:
+        platforms.extend(ANDROID_PLATFORMS)
+    elif args.android_platform:
+        platforms.extend(args.android_platform)
     if args.darwin_arm64:
         platforms.append(DARWIN_PLATFORM)
     if args.windows_x86_64:
@@ -1350,6 +1717,11 @@ def main() -> int:
             platform = str(spec["platform"])
             if platform == DARWIN_PLATFORM:
                 binary_path = build_darwin_archive(
+                    version, spec, product_source, checkout, source_map_sha256,
+                    core_commit, libusb_version, libusb_url, libusb_sha256,
+                    source_root, source_path, source_sha256, build, work, output_dir)
+            elif platform in ANDROID_PLATFORMS:
+                binary_path = build_android_archive(
                     version, spec, product_source, checkout, source_map_sha256,
                     core_commit, libusb_version, libusb_url, libusb_sha256,
                     source_root, source_path, source_sha256, build, work, output_dir)

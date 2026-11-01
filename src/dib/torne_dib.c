@@ -3417,7 +3417,8 @@ static int dib_set_frontend(struct torne_dib *d)
 
 	d->tune_state = DEMOD_START;
 
-	give_up = now_ms(d) + DEFAULT_TUNE_TIMEOUT_MS;
+	give_up = d->br->deadline_ms ? d->br->deadline_ms :
+		now_ms(d) + DEFAULT_TUNE_TIMEOUT_MS;
 	while (active) {
 		u64 callback_ms = 0;
 		bool have_callback = false;
@@ -3457,7 +3458,7 @@ static int dib_set_frontend(struct torne_dib *d)
 			return d->err;
 		/* Linux has no bound here; a chip that never raises its search interrupt would hold it forever */
 		if (active && now_ms(d) > give_up) {
-			LOG(d, TORNE_LOG_ERR, "DiB8000: tune did not finish within %d ms (state %d)", DEFAULT_TUNE_TIMEOUT_MS,
+			LOG(d, TORNE_LOG_ERR, "DiB8000: tune deadline expired (state %d)",
 			    d->tune_state);
 			return -ETIMEDOUT;
 		}

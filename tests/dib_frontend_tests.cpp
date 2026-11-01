@@ -31,6 +31,7 @@ struct Fake final {
     int flush_calls = 0;
     std::uint64_t now = 1000;
     std::uint32_t wait_cost_ms = 0;
+    bool advance_sleep = false;
 };
 
 std::uint16_t be16(const std::uint8_t* p)
@@ -140,9 +141,11 @@ int resume_cb(void*, int)
     return 0;
 }
 
-void sleep_cb(void* ctx, unsigned int)
+void sleep_cb(void* ctx, unsigned int ms)
 {
-    static_cast<Fake*>(ctx)->sleep_calls++;
+    Fake* fake = static_cast<Fake*>(ctx);
+    fake->sleep_calls++;
+    if (fake->advance_sleep) fake->now += ms;
 }
 
 std::uint64_t now_cb(void* ctx)
@@ -289,6 +292,20 @@ void test_tune_timeout_bounds_i2c_wait()
     CHECK(fake.now >= 1100U);
 }
 
+void test_tune_timeout_bounds_state_machine()
+{
+    Fake fake = make_fake();
+    fake.advance_sleep = true;
+    torne_i2c_backend backend = make_backend(fake);
+    torne_dib_frontend_config config = make_config(fake, backend);
+    torne_dib_frontend frontend{};
+    CHECK(torne_dib_frontend_init(&frontend, &config) == 0);
+    fake.now = 1000U;
+    const int rc = torne_dib_frontend_tune_timeout(&frontend, 473142857U, 15000U);
+    CHECK(rc == -ETIMEDOUT);
+    CHECK(fake.now >= 16000U);
+}
+
 void test_preconditions_and_tune_range()
 {
     Fake fake = make_fake();
@@ -339,6 +356,7 @@ int main()
     test_set_gpio_uses_register_read_modify_write();
     test_failure_propagates_and_stops();
     test_tune_timeout_bounds_i2c_wait();
+    test_tune_timeout_bounds_state_machine();
     test_preconditions_and_tune_range();
     test_status_exposes_only_measured_fields();
     if (failures != 0) {

@@ -83,8 +83,8 @@ jobs:
               data = json.load(archive.extractfile(member))
           expected_map = hashlib.sha256(Path("SOURCE-MAP.json").read_bytes()).hexdigest()
           assert data["product_source"]["repository"] == "Khronos31/torne-userland"
-          assert data["product_source"]["commit"] == "3c3140857537a35da8d89577d562768572b7875d"
-          assert data["product_source"]["tree"] == "007f37b689f8d3cb14b86c55d6fe43e55c413bfa"
+          assert data["product_source"]["commit"] == "af7525a8f8d14a18d2a5ee960f5c39ff86701e49"
+          assert data["product_source"]["tree"] == "4ecdcd2932149c5e23f262de3c9e9e9035298b57"
           assert data["core_commit"] == "cf2aedfaba588827c3dcf024be12b400aa881874"
           assert data["checkout"]["repository"].endswith("quiet-shelf")
           assert data["checkout"]["commit"] == os.environ["GITHUB_SHA"]
@@ -295,8 +295,8 @@ jobs:
           import re
           from pathlib import Path
           product = json.loads(Path("SOURCE-MAP.json").read_text())["product"]
-          assert product["commit"] == "3c3140857537a35da8d89577d562768572b7875d"
-          assert product["tree"] == "007f37b689f8d3cb14b86c55d6fe43e55c413bfa"
+          assert product["commit"] == "af7525a8f8d14a18d2a5ee960f5c39ff86701e49"
+          assert product["tree"] == "4ecdcd2932149c5e23f262de3c9e9e9035298b57"
           core = re.search(r'set\(TORNE_CORE_COMMIT "([0-9a-f]{40})"\)',
                            Path("cmake/TorneCoreDependency.cmake").read_text())
           assert core is not None and core.group(1) == "cf2aedfaba588827c3dcf024be12b400aa881874"

@@ -85,6 +85,65 @@ scripts/release/build-candidate.sh \
   --toolchain-config /path/to/linux-matrix-toolchains.json
 ```
 
+## Android / Termux 3 ABI
+
+`--android-matrix` manufactures the three product-spec Android archives from
+the same source archive:
+
+- `torne-userland-<version>-android-armv7a.tar.gz`
+- `torne-userland-<version>-android-aarch64.tar.gz`
+- `torne-userland-<version>-android-x86_64.tar.gz`
+
+Each archive contains the three CLIs, `bin/torne-termux`, product/Core/libusb
+notices, the NDK `NOTICE`, `NOTICE.toolchain`, and `source.properties`, the
+FR30 source/generated materials, `BUILD-METADATA.json`, and `SHA256SUMS`. An
+Android archive does not contain the PC/SC IFD or WinSCard DLL.
+
+The Android toolchain entry supplies the fixed NDK root. `cc`/`cxx` are then
+taken from the NDK’s LLVM prebuilt tree, and the helper passes the NDK CMake
+toolchain, ABI, `android-26`, `c++_static`, and the Android release linker
+defaults `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384`. Explicit
+`exe_linker_flags`/`shared_linker_flags` override those defaults. Explicit
+`c_flags`/`cxx_flags` are passed to CMake and recorded in build metadata. NDK
+r27 uses its `darwin-x86_64` prebuilt on both Intel and Apple Silicon Macs. For
+example:
+
+```json
+{
+  "schema": 1,
+  "platforms": {
+    "android-aarch64": {
+      "ndk": "/path/to/android-ndk-r27b",
+      "android_platform": "android-26",
+      "android_stl": "c++_static"
+    }
+  }
+}
+```
+
+Repeat the platform entry for `android-armv7a` and `android-x86_64`, or use
+`--android-platform` for a subset. NDK r27 is required; the private manufacture
+uses `27.1.12297006` and records the exact revision.
+
+```sh
+scripts/release/build-candidate.sh \
+  --output /tmp/torne-release-android \
+  --core-source /path/to/dtv-userland-core \
+  --libusb-source-archive /path/to/libusb-1.0.30.tar.bz2 \
+  --android-matrix \
+  --toolchain-config /path/to/android-toolchains.json
+```
+
+The helper builds the source archive once and then all selected ABIs from that
+same archive. It strips the Android CLIs with the NDK `llvm-strip`, checks
+PIE/machine/interpreter, the `libc.so`/`libm.so`/`libdl.so`/`liblog.so`
+allowlist, 16 KiB PT_LOAD alignment, RELRO/BIND_NOW, no RPATH/RUNPATH, no debug
+or symbol sections, no dynamic libusb/libc++/host loader, and static libusb
+symbols in `torned`/`torne-ts`. It verifies inner/outer SHA-256 after extraction.
+Android binaries are not executed on the build host; device help/version is a
+separate check. The helper does not run `termux-usb`, open USB, or register a
+reader.
+
 ## macOS darwin-arm64
 
 `--darwin-arm64` builds the native arm64 3 CLIs and the candidate IFD bundle on

@@ -1,7 +1,7 @@
 # Public CI snapshot of torne-userland
 
 - **Source repository**: `Khronos31/torne-userland` (private at snapshot time).
-- **Source commit**: `3c3140857537a35da8d89577d562768572b7875d` (PR30 integrated macOS/Windows packaging and Core v1.0.2 pin; product tree `007f37b689f8d3cb14b86c55d6fe43e55c413bfa`; direct parents `f1512bec` + `ddf4cd91`; Torne version `0.1.0`; PR29 merged as main `9115feb7d289a2103ee2f6abe263c2458fd322bc`; PR30 open, PR31 Core pin commit included via merge).
+- **Source commit**: `af7525a8f8d14a18d2a5ee960f5c39ff86701e49` (main; product tree `4ecdcd2932149c5e23f262de3c9e9e9035298b57`; merge parents `4096082326d5931351da5074c17264b1794b9f57` + `6c37d108f4c66a681e1cfba9ad4ff02db2e9dfad`; Core v1.0.2; Torne version `0.1.0`; Android release helper PR32 is included).
 - **License**: GPL-2.0-only. The product `LICENSE`, `PROVENANCE.md`, and the upstream attribution `NOTICE` are preserved.
 - **Dependency pin**: `Khronos31/dtv-userland-core` at
   `cf2aedfaba588827c3dcf024be12b400aa881874` (v1.0.2 tag object `2fb38e74`;
@@ -21,9 +21,9 @@
   `scripts/release/ci-macos-release.sh`, plus the integrated product/Core
   assertion. The Linux Release full helper and the other existing checks are
   retained. No new job is added: the planned public sequence remains six normal
-  + Mac IFD one + Windows native one, eight jobs total. The Linux four-target
-  matrix and the Windows archive are not run by CI; no upload or success claim
-  is added.
+  + Mac IFD one + Windows native one, eight jobs total. The Linux four-target,
+  Android three-ABI, and Windows archive builds are not run by CI; CI does not
+  upload release artifacts or claim the final nine-binary set.
 - The source includes PR25's Android/Termux borrowed-FD entry
   (`torned --fd FD --instance TOKEN`) and `packaging/termux/torne-termux`.
   The FD path duplicates the caller descriptor, uses a dedicated libusb context
