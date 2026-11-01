@@ -60,9 +60,9 @@ jobs:
           set -euo pipefail
           core="$RUNNER_TEMP/torne-core-548"
           git init -q "$core"
-          git -C "$core" fetch --depth 1 https://github.com/Khronos31/dtv-userland-core.git 548a04605d9e224be179547de30f590ff693a128
+          git -C "$core" fetch --depth 1 https://github.com/Khronos31/dtv-userland-core.git cf2aedfaba588827c3dcf024be12b400aa881874
           git -C "$core" checkout --detach FETCH_HEAD
-          test "$(git -C "$core" rev-parse HEAD)" = "548a04605d9e224be179547de30f590ff693a128"
+          test "$(git -C "$core" rev-parse HEAD)" = "cf2aedfaba588827c3dcf024be12b400aa881874"
           libusb="$RUNNER_TEMP/libusb-1.0.30.tar.bz2"
           curl -fsSL --retry 3 https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2 -o "$libusb"
           echo "fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf  $libusb" | sha256sum -c -
@@ -83,8 +83,9 @@ jobs:
               data = json.load(archive.extractfile(member))
           expected_map = hashlib.sha256(Path("SOURCE-MAP.json").read_bytes()).hexdigest()
           assert data["product_source"]["repository"] == "Khronos31/torne-userland"
-          assert data["product_source"]["commit"] == "ee3f94e44a751103dc863d10b6be59b7413482cd"
-          assert data["product_source"]["tree"] == "c3b868d30db42aee668fad0a419d5e75821af468"
+          assert data["product_source"]["commit"] == "3c3140857537a35da8d89577d562768572b7875d"
+          assert data["product_source"]["tree"] == "007f37b689f8d3cb14b86c55d6fe43e55c413bfa"
+          assert data["core_commit"] == "cf2aedfaba588827c3dcf024be12b400aa881874"
           assert data["checkout"]["repository"].endswith("quiet-shelf")
           assert data["checkout"]["commit"] == os.environ["GITHUB_SHA"]
           assert data["checkout"]["commit"] != data["product_source"]["commit"]
@@ -281,3 +282,27 @@ jobs:
               exit 1
             fi
           done
+      - name: Install build-only PC/SC headers
+        if: matrix.config == 'Release'
+        run: brew install pcsc-lite
+
+      - name: Assert Core/source-map binding
+        if: matrix.config == 'Release'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          product = json.loads(Path("SOURCE-MAP.json").read_text())["product"]
+          assert product["commit"] == "3c3140857537a35da8d89577d562768572b7875d"
+          assert product["tree"] == "007f37b689f8d3cb14b86c55d6fe43e55c413bfa"
+          core = re.search(r'set\(TORNE_CORE_COMMIT "([0-9a-f]{40})"\)',
+                           Path("cmake/TorneCoreDependency.cmake").read_text())
+          assert core is not None and core.group(1) == "cf2aedfaba588827c3dcf024be12b400aa881874"
+          print("macOS source-map/Core binding OK")
+          PY
+
+      - name: Manufacture and verify macOS release archive
+        if: matrix.config == 'Release'
+        run: scripts/release/ci-macos-release.sh

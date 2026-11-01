@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "platforms": {
+    "darwin-arm64": {
+      "cc": "/usr/bin/cc",
+      "cxx": "/usr/bin/c++",
+      "cmake_args": [
+        "-DDTV_USERLAND_PCSC_IFD_INCLUDE_DIR=/opt/homebrew/opt/pcsc-lite/include/PCSC"
+      ],
+      "system_processor": "arm64",
+      "run_checks": true,
+      "build_kind": "native"
+    }
+  }
+}

@@ -1,12 +1,13 @@
 # Public CI snapshot of torne-userland
 
 - **Source repository**: `Khronos31/torne-userland` (private at snapshot time).
-- **Source commit**: `ee3f94e44a751103dc863d10b6be59b7413482cd` (PR29 Linux 4-archive manufacturing path on PR24/main history; product tree `c3b868d30db42aee668fad0a419d5e75821af468`; PR29 open, PR24 merged as main `ec81c8d3dc8921d45f3e7292fcfc98d96653faf6`).
+- **Source commit**: `3c3140857537a35da8d89577d562768572b7875d` (PR30 integrated macOS/Windows packaging and Core v1.0.2 pin; product tree `007f37b689f8d3cb14b86c55d6fe43e55c413bfa`; direct parents `f1512bec` + `ddf4cd91`; Torne version `0.1.0`; PR29 merged as main `9115feb7d289a2103ee2f6abe263c2458fd322bc`; PR30 open, PR31 Core pin commit included via merge).
 - **License**: GPL-2.0-only. The product `LICENSE`, `PROVENANCE.md`, and the upstream attribution `NOTICE` are preserved.
 - **Dependency pin**: `Khronos31/dtv-userland-core` at
-  `548a04605d9e224be179547de30f590ff693a128` (Core main after PR144; shared Windows
-  WinSCard SDK import fixture), fetched by CMake FetchContent from the public
-  repository. It is not the final five-product pin.
+  `cf2aedfaba588827c3dcf024be12b400aa881874` (v1.0.2 tag object `2fb38e74`;
+  548a046 plus the version-only CMake change; shared Windows WinSCard SDK import
+  fixture and torne Unix IFD profile), fetched by CMake FetchContent from the
+  public repository. It is not the final five-product pin.
 - **libusb**: 1.0.30, fetched by URL and SHA-256 from the libusb release page and
   built as a static library with udev disabled.
 - **CI workflows**: `.github/workflows/ci.yml` runs the six automatic
@@ -15,13 +16,14 @@
   and adds one job. The branch-only `.github/workflows/windows-winscard-native.yml`
   runs one Windows native stage job on `ci/torne-winscard-native`. None uses
   secrets, write tokens, private checkouts, releases, packages, schedules, or
-  external uploads. The approved `ci.yml` delta is the Linux common `curl`
-  install plus a Linux Release-only full helper smoke, with its fixed product
-  assertion updated to source `ee3f94e`/tree `c3b868d3`; the other three
-  workflow files are byte-identical to parent `cebf2f3a`. The planned public
-  sequence is six normal + Mac IFD one + Windows native one, eight jobs total.
-  The Linux four-target matrix is not run by CI; this snapshot does not claim a
-  successful matrix CI run.
+  external uploads. The approved `ci.yml` delta adds, inside the existing
+  macOS Release matrix job, Release-only `brew install pcsc-lite` and
+  `scripts/release/ci-macos-release.sh`, plus the integrated product/Core
+  assertion. The Linux Release full helper and the other existing checks are
+  retained. No new job is added: the planned public sequence remains six normal
+  + Mac IFD one + Windows native one, eight jobs total. The Linux four-target
+  matrix and the Windows archive are not run by CI; no upload or success claim
+  is added.
 - The source includes PR25's Android/Termux borrowed-FD entry
   (`torned --fd FD --instance TOKEN`) and `packaging/termux/torne-termux`.
   The FD path duplicates the caller descriptor, uses a dedicated libusb context
@@ -97,15 +99,17 @@
   Fixes belong in the source repository first and are synchronized here after
   review. The source delta is the reviewed PR25 Android FD change, the
   reviewed DOC26 documentation merge, PR28's approved test-only Termux path
-  change, the approved PR24 release helper/provenance guard, and PR29's Linux
-  4-archive manufacturing path. The Linux Release smoke runs the default
-  x64 glibc helper without source-only, upload, or release workflow. The
-  four-target matrix is not a CI job. PR24 is merged as main `ec81c8d3`;
-  PR29 remains open at this snapshot.
+  change, the approved PR24 release helper/provenance guard, PR29's Linux
+  4-archive manufacturing path, PR30's macOS/Windows packaging path, and the
+  Core v1.0.2 `cf2aedfa` pin commit. The existing macOS Release matrix job runs
+  the product-owned macOS release helper/config; the Linux Release smoke runs
+  the default x64 glibc helper without source-only, upload, or release
+  workflow. No new job is added. PR29 is merged as main `9115feb7`; PR30
+  remains open, and the PR31 Core pin commit is included through PR30.
 
 PR22 adds the cold-start Widen clock-gate initialization (`src/product/clock_gate.*`, fake/CTest only). This is not evidence of real cold boot or F3 success; real hardware validation is a separate scout task.
 
 The source snapshot includes the upstream `torne_drv` attribution notice for the DiB8096-derived files (coax and Linux DiBcom notices, with the px4_drv section scoped to upstream files not included here). It contains the CLI framework, USB transport/discovery, Android/Termux borrowed-FD launcher, Widen, Core 1 and Core 0 host runtimes, DiB8096 C11 frontend, card UART/CardService adapters, the product daemon/family path, FR30 candidate images/fixtures, and optional PC/SC packaging. The normal build does not generate FR30 images; it uses the tracked Widen/Core 0/Core 1 images. CI does not open, claim, tune, or stream from a tuner; the CLI smoke may perform read-only USB enumeration. The direct `torne-ts --device usb:BUS-PORT` path is the product startup path that performs Widen/FR30/Core startup, tune, and TS on hardware; it is outside CI. The daemon listener/family connection and CardService adapter are included, but real device I/O remains outside CI. The card path is tested with fake UART/Core in CI; a separate same-UID isolated Linux PC/SC record exists, but OS registration/other UID, macOS service registration, and real IFD/card operation remain unverified. Optional PC/SC packaging is a CI-staged candidate. OS PC/SC system registration is not included.
 
 - `SOURCE-MAP.json` is a tracked product-source mapping for the public synthetic checkout; the actual checkout identity is recorded separately by the helper.
-  Source map SHA-256: `7fd856c731f0cec417b050ca6f39da2987f867b1b75d8cbb2bccdd434a5136de`.
+  Source map SHA-256: `d85a497545d7d3b07a2ac662380e06ef4f8402ce052c88b5f1aa0b72a7e8ed34`.

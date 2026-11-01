@@ -4,7 +4,7 @@ Sony CECH-ZD1 J（USB 054c:04b2）用の、カーネルドライバに依存し�
 
 開発中です。ハードウェア対応・OS対応・受信品質の保証はまだありません。ライセンスは GPL-2.0-only です。
 
-共通基盤には [dtv-userland-core](https://github.com/Khronos31/dtv-userland-core) の採用pin `548a04605d9e224be179547de30f590ff693a128`（Core main、PR144採用）を使用する。これはWindows共通WinSCard SDK import fixtureとUnix IFDのtorne profileを含む採用pinで、最終5製品同pin・tagではない。固定箇所は `cmake/TorneCoreDependency.cmake`、出典は `PROVENANCE.md` に記録する。開発者向けの `TORNE_CORE_SOURCE_DIR` は未検証入力で、正式配布の入力監査とは別である。
+共通基盤には [dtv-userland-core](https://github.com/Khronos31/dtv-userland-core) の採用pin `cf2aedfaba588827c3dcf024be12b400aa881874`（Core v1.0.2 tag、tag object `2fb38e74`。548a046からCMake版1行のみ）を使用する。これはWindows共通WinSCard SDK import fixtureとUnix IFDのtorne profileを含む採用pinで、最終5製品同pinではない。固定箇所は `cmake/TorneCoreDependency.cmake`、出典は `PROVENANCE.md` に記録する。開発者向けの `TORNE_CORE_SOURCE_DIR` は未検証入力で、正式配布の入力監査とは別である。
 
 正式コマンドは `torned`（ハードウェア所有デーモン）、`torne-ts`（TS出力）、`tornectl`（制御・診断）の3つです。静的 libusb の非侵襲列挙、USB transport（open/claim/control/bulk/close）、Widen識別と導入policy、Core 1 host/I²C、DiB8096 C11 frontend、Core 0 host/非同期Bulk/TS framer、カードUART/CardService、Core listener/daemon、`torne-ts --device usb:`の直接入口を製品buildへ接続済みです。`torned` は同じDeviceを`EnclosureFamily`/`EnclosureContext`へ渡し、`tornectl`と`torne-ts --instance`はCore IPCを使います。Linuxの既存実測では通常daemonのT27→T25が同一daemonでexit0、自作Core0 fenceは120/120、隔離した同一UID pcscdの標準APIでreader/ATR/T=1/APDU、Mac IFDのbundle load、Windows stage DLLのnative mock/SDK importまで確認しています。初期daemon T27のpoll/close失敗は修正後の後続T27/T25成功と区別して記録し、初期失敗だけを現在の未実装扱いしません。
 

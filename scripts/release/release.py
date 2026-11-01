@@ -17,6 +17,8 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import plistlib
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCT = "torne-userland"
@@ -27,6 +29,33 @@ LINUX_PLATFORMS = (
     "linux-musl-x86_64",
     "linux-musl-aarch64",
 )
+DARWIN_PLATFORM = "darwin-arm64"
+WINDOWS_PLATFORM = "windows-x86_64"
+DESKTOP_PLATFORMS = (DARWIN_PLATFORM, WINDOWS_PLATFORM)
+PLATFORMS = LINUX_PLATFORMS + DESKTOP_PLATFORMS
+WINDOWS_EXPORT_NAMES = (
+    "SCardConnectA",
+    "SCardConnectW",
+    "SCardDisconnect",
+    "SCardEstablishContext",
+    "SCardFreeMemory",
+    "SCardGetStatusChangeW",
+    "SCardIsValidContext",
+    "SCardListReadersA",
+    "SCardListReadersW",
+    "SCardReleaseContext",
+    "SCardStatusW",
+    "SCardTransmit",
+    "g_rgSCardT1Pci",
+)
+WINDOWS_ALLOWED_IMPORTS = {
+    "advapi32.dll",
+    "kernel32.dll",
+    "shell32.dll",
+    "ws2_32.dll",
+    "bcrypt.dll",
+    "ucrtbase.dll",
+}
 BINARIES = ("torned", "tornectl", "torne-ts")
 IFD_SYMBOLS = (
     "IFDHCreateChannel",
@@ -103,9 +132,13 @@ def sha256(path: Path) -> str:
 
 
 def split_platform(platform: str) -> tuple[str, str]:
+    if platform == DARWIN_PLATFORM:
+        return "darwin", "arm64"
+    if platform == WINDOWS_PLATFORM:
+        return "windows", "x86_64"
     match = re.fullmatch(r"linux-(glibc|musl)-(x86_64|aarch64)", platform)
     if match is None:
-        fail(f"unsupported Linux platform: {platform}")
+        fail(f"unsupported platform: {platform}")
     return match.group(1), match.group(2)
 
 
@@ -136,7 +169,7 @@ def load_toolchains(path: str | None) -> dict[str, dict[str, object]]:
         fail("toolchain config must contain a platforms object")
     result: dict[str, dict[str, object]] = {}
     for platform, value in platforms.items():
-        if platform not in LINUX_PLATFORMS:
+        if platform not in PLATFORMS:
             fail(f"unsupported platform in toolchain config: {platform}")
         if not isinstance(value, dict):
             fail(f"toolchain entry must be an object: {platform}")
@@ -150,6 +183,10 @@ def load_toolchains(path: str | None) -> dict[str, dict[str, object]]:
             fail(f"toolchain {platform}.sysroot must be a string or null")
         if "runner" in value and not isinstance(value["runner"], list):
             fail(f"toolchain {platform}.runner must be a list")
+        if "cmake_args" in value and not isinstance(value["cmake_args"], list):
+            fail(f"toolchain {platform}.cmake_args must be a list")
+        if "cmake_args" in value and not all(isinstance(item, str) for item in value["cmake_args"]):
+            fail(f"toolchain {platform}.cmake_args must be a string list")
         for key in ("c_compiler_target", "cxx_compiler_target"):
             if key in value and value[key] is not None and not isinstance(value[key], str):
                 fail(f"toolchain {platform}.{key} must be a string or null")
@@ -160,6 +197,14 @@ def load_toolchains(path: str | None) -> dict[str, dict[str, object]]:
                 fail(f"toolchain {platform}.env must be a string map")
         result[platform] = dict(value)
     return result
+
+
+def default_linker_flags(platform: str) -> str:
+    # Darwin uses its system C++ runtime. Linux and Windows keep the product's
+    # existing static runtime defaults.
+    if platform == DARWIN_PLATFORM:
+        return ""
+    return "-static-libstdc++ -static-libgcc"
 
 
 def resolve_platform(platform: str, toolchains: dict[str, dict[str, object]]) -> dict[str, object]:
@@ -185,13 +230,15 @@ def resolve_platform(platform: str, toolchains: dict[str, dict[str, object]]) ->
         "cxx": str(cxx),
         "c_flags": str(values.get("c_flags", "")),
         "cxx_flags": str(values.get("cxx_flags", "")),
-        "exe_linker_flags": str(values.get("exe_linker_flags", "-static-libstdc++ -static-libgcc")),
-        "shared_linker_flags": str(values.get("shared_linker_flags", "-static-libstdc++ -static-libgcc")),
+        "exe_linker_flags": str(values.get("exe_linker_flags", default_linker_flags(platform))),
+        "shared_linker_flags": str(values.get("shared_linker_flags", default_linker_flags(platform))),
         "sysroot": values.get("sysroot"),
         "cmake_system_name": values.get("cmake_system_name"),
         "system_processor": str(values.get("system_processor", cpu)),
         "c_compiler_target": values.get("c_compiler_target"),
         "cxx_compiler_target": values.get("cxx_compiler_target"),
+        "readobj": values.get("readobj"),
+        "cmake_args": list(values.get("cmake_args", [])),
         "runner": runner,
         "run_checks": bool(values.get("run_checks", cpu == "x86_64")),
         "emulated": bool(values.get("emulated", False)),
@@ -424,6 +471,35 @@ def source_archive(version: str, product_source: dict[str, str],
     return archive_path, source_root
 
 
+def read_source_archive_metadata(source_archive_path: Path, version: str) -> dict[str, object]:
+    with tarfile.open(source_archive_path) as archive:
+        members = [m for m in archive.getmembers()
+                   if m.name.endswith("/SOURCE-METADATA.json")]
+        if len(members) != 1:
+            fail("source archive must contain exactly one SOURCE-METADATA.json")
+        stream = archive.extractfile(members[0])
+        if stream is None:
+            fail("cannot read SOURCE-METADATA.json")
+        try:
+            data = json.loads(stream.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            fail(f"invalid source archive metadata: {error}")
+    if not isinstance(data, dict) or data.get("schema") != 1 or data.get("product") != PRODUCT:
+        fail("source archive metadata is not a torne-userland schema 1 record")
+    if data.get("version") != version:
+        fail("source archive version does not match this helper")
+    for key in ("product_source", "checkout"):
+        value = data.get(key)
+        if not isinstance(value, dict) or not all(
+                isinstance(value.get(field), str) and value[field]
+                for field in ("repository", "commit", "tree")):
+            fail(f"source archive metadata {key} is invalid")
+    for key in ("core_commit", "libusb_version", "libusb_url", "libusb_sha256"):
+        if not isinstance(data.get(key), str) or not data[key]:
+            fail(f"source archive metadata {key} is missing")
+    return data
+
+
 def extract_source(version: str, source_archive_path: Path, work: Path) -> Path:
     extract = work / "source-build"
     extract.mkdir()
@@ -434,12 +510,12 @@ def extract_source(version: str, source_archive_path: Path, work: Path) -> Path:
 
 def build_platform(version: str, source: Path, spec: dict[str, object],
                    work: Path, jobs: int) -> Path:
-    build = work / f"build-{spec['platform']}"
+    platform = str(spec["platform"])
+    build = work / f"build-{platform}"
     configure = [
         "cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DTORNE_BUILD_TESTS=OFF",
-        "-DTORNE_BUILD_PCSC_IFD=ON",
         f"-DTORNE_CORE_SOURCE_DIR={source / 'third_party/dtv-userland-core'}",
         f"-DTORNE_LIBUSB_SOURCE_ARCHIVE={source / 'third_party/libusb/libusb-1.0.30.tar.bz2'}",
         f"-DCMAKE_C_COMPILER={spec['cc']}",
@@ -448,6 +524,28 @@ def build_platform(version: str, source: Path, spec: dict[str, object],
         f"-DCMAKE_EXE_LINKER_FLAGS={spec['exe_linker_flags']}",
         f"-DCMAKE_SHARED_LINKER_FLAGS={spec['shared_linker_flags']}",
     ]
+    if platform == DARWIN_PLATFORM:
+        configure += [
+            "-DCMAKE_OSX_ARCHITECTURES=arm64",
+            "-DTORNE_BUILD_PCSC_IFD=ON",
+            "-DTORNE_BUILD_WINSCARD=OFF",
+        ]
+        targets = ["torne_torned", "torne_tornectl", "torne_torne_ts",
+                   "torne_pcsc_bundle"]
+    elif platform == WINDOWS_PLATFORM:
+        configure += [
+            "-DTORNE_BUILD_PCSC_IFD=OFF",
+            "-DTORNE_BUILD_WINSCARD=ON",
+        ]
+        targets = ["torne_torned", "torne_tornectl", "torne_torne_ts",
+                   "torne_pcsc_stage"]
+    else:
+        configure += [
+            "-DTORNE_BUILD_PCSC_IFD=ON",
+            "-DTORNE_BUILD_WINSCARD=OFF",
+        ]
+        targets = ["torne_torned", "torne_tornectl", "torne_torne_ts",
+                   "torne_pcsc_stage"]
     if spec.get("cmake_system_name"):
         configure.append(f"-DCMAKE_SYSTEM_NAME={spec['cmake_system_name']}")
     if spec.get("sysroot"):
@@ -460,9 +558,9 @@ def build_platform(version: str, source: Path, spec: dict[str, object],
         configure.append(f"-DCMAKE_C_FLAGS={spec['c_flags']}")
     if spec.get("cxx_flags"):
         configure.append(f"-DCMAKE_CXX_FLAGS={spec['cxx_flags']}")
+    configure.extend(str(item) for item in spec.get("cmake_args", []))
     run(configure, cwd=source, env=spec["env"])
-    run(["cmake", "--build", str(build), "--parallel", str(jobs), "--target",
-         "torne_torned", "torne_tornectl", "torne_torne_ts", "torne_pcsc_stage"],
+    run(["cmake", "--build", str(build), "--parallel", str(jobs), "--target", *targets],
         cwd=source, env=spec["env"])
     return build
 
@@ -543,6 +641,121 @@ def compiler_metadata(value: str, env: dict[str, str]) -> dict[str, str]:
         "sha256": sha256(path),
         "version": output([str(path), "--version"], env=env).splitlines()[0],
     }
+
+
+MAC_ALLOWED_DEPENDENCIES = (
+    "/System/Library/Frameworks/",
+    "/usr/lib/libc++.1.dylib",
+    "/usr/lib/libc++abi.dylib",
+    "/usr/lib/libSystem.B.dylib",
+    "/usr/lib/libobjc.A.dylib",
+)
+
+
+def macos_dependencies(path: Path) -> list[str]:
+    text = output(["otool", "-L", str(path)])
+    deps = []
+    for line in text.splitlines()[1:]:
+        match = re.match(r"\s+([^ ]+) \(compatibility", line)
+        if match:
+            deps.append(match.group(1))
+    return deps
+
+
+def check_macos_macho(path: Path, spec: dict[str, object]) -> list[str]:
+    description = output(["file", str(path)])
+    if "Mach-O 64-bit" not in description or "arm64" not in description:
+        fail(f"not an arm64 Mach-O file: {path.name}: {description}")
+    deps = macos_dependencies(path)
+    for dep in deps:
+        if not dep.startswith(MAC_ALLOWED_DEPENDENCIES):
+            fail(f"non-system macOS dependency in {path.name}: {dep}")
+    return deps
+
+
+def check_macos_ifd_bundle(bundle: Path) -> dict[str, object]:
+    executable_name = "torne-userland-ifd"
+    info_path = bundle / "Contents" / "Info.plist"
+    executable = bundle / "Contents" / "MacOS" / executable_name
+    resources = bundle / "Contents" / "Resources"
+    for path in (info_path, executable, resources / "COPYING",
+                 resources / "UNIX_PCSC_IFD_PROVENANCE.json",
+                 resources / "LICENSE", resources / "LICENSE.dtv-userland-core"):
+        if not path.is_file():
+            fail(f"missing macOS IFD bundle file: {path}")
+    info = plistlib.loads(info_path.read_bytes())
+    if info.get("CFBundleExecutable") != executable_name:
+        fail("macOS IFD CFBundleExecutable does not match bundle executable")
+    description = output(["file", str(executable)])
+    if "Mach-O 64-bit" not in description or "arm64" not in description:
+        fail(f"IFD bundle executable is not arm64 Mach-O: {description}")
+    deps = macos_dependencies(executable)
+    for dep in deps:
+        if dep == "@rpath/libdtv_userland_unix_pcsc_ifd.dylib":
+            continue
+        if not dep.startswith(MAC_ALLOWED_DEPENDENCIES):
+            fail(f"non-system macOS IFD dependency: {dep}")
+    symbols = output(["nm", "-gU", str(executable)])
+    for symbol in IFD_SYMBOLS:
+        if re.search(rf"\s_?{re.escape(symbol)}$", symbols, re.MULTILINE) is None:
+            fail(f"missing macOS IFD symbol: {symbol}")
+    return {
+        "CFBundleExecutable": executable_name,
+        "executable_sha256": sha256(executable),
+        "Info.plist_sha256": sha256(info_path),
+        "dependencies": deps,
+        "symbols": list(IFD_SYMBOLS),
+    }
+
+
+def windows_info(path: Path, spec: dict[str, object]) -> tuple[list[str], list[str]]:
+    readobj = spec.get("readobj")
+    if not readobj:
+        fail("--toolchain-config readobj is required for Windows PE checks")
+    readobj_path = executable_path(str(readobj))
+    headers = output([str(readobj_path), "--file-headers", str(path)])
+    if "Format: COFF-x86-64" not in headers or "Arch: x86_64" not in headers:
+        fail(f"not an x86_64 COFF file: {path.name}")
+    imports_text = output([str(readobj_path), "--coff-imports", str(path)])
+    imports = re.findall(r"^  Name: ([^ ]+)$", imports_text, re.MULTILINE)
+    exports_text = output([str(readobj_path), "--coff-exports", str(path)])
+    exports = re.findall(r"^  Name: ([^ ]+)$", exports_text, re.MULTILINE)
+    return imports, exports
+
+
+def check_windows_pe(path: Path, spec: dict[str, object]) -> list[str]:
+    imports, _exports = windows_info(path, spec)
+    for name in imports:
+        lowered = name.lower()
+        if lowered in WINDOWS_ALLOWED_IMPORTS or lowered.startswith("api-ms-win-crt-"):
+            continue
+        fail(f"unexpected Windows import in {path.name}: {name}")
+    if any(token in name.lower() for name in imports for token in
+           ("libusb", "libstdc++", "libgcc", "libwinpthread", "libc++")):
+        fail(f"non-OS runtime import in {path.name}")
+    return imports
+
+
+def check_windows_dll(path: Path, spec: dict[str, object]) -> list[str]:
+    imports, exports = windows_info(path, spec)
+    check_windows_pe(path, spec)
+    if set(exports) != set(WINDOWS_EXPORT_NAMES) or len(exports) != 13:
+        fail(f"unexpected WinSCard exports: {exports}")
+    return imports
+
+
+def deterministic_zip(source: Path, destination: Path, root_name: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED,
+                         allowZip64=False) as archive:
+        for path in sorted(p for p in source.rglob("*") if p.is_file()):
+            if path.is_symlink():
+                fail(f"symlink in zip source: {path}")
+            relative = path.relative_to(source).as_posix()
+            info = zipfile.ZipInfo(f"{root_name}/{relative}", (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o100644 & 0xFFFF) << 16
+            archive.writestr(info, path.read_bytes())
 
 
 def build_binary_archive(version: str, spec: dict[str, object],
@@ -679,36 +892,247 @@ def build_binary_archive(version: str, spec: dict[str, object],
     return archive_path
 
 
-def verify_extracted(archive_path: Path, version: str, spec: dict[str, object],
-                     work: Path) -> None:
-    platform = str(spec["platform"])
-    extract = work / f"verify-{platform}"
-    extract.mkdir()
-    with tarfile.open(archive_path) as archive:
-        safe_extract(archive, extract)
-    root = extract / f"{PRODUCT}-{version}-{platform}"
-    required = [
-        *[root / "bin" / name for name in BINARIES],
-        root / "ifd" / "torne-userland-ifd.so",
-        root / "ifd" / "COPYING",
-        root / "ifd" / "UNIX_PCSC_IFD_PROVENANCE.json",
-        root / "ifd" / "torne.reader.conf.in",
-        root / "licenses" / "LICENSE",
-        root / "licenses" / "NOTICE",
-        root / "licenses" / "PROVENANCE.md",
-        root / "licenses" / "LICENSE.dtv-userland-core",
-        root / "licenses" / "libusb-COPYING",
-        root / "docs" / "README.md",
-        root / "docs" / "cli-framework.md",
-        root / "BUILD-METADATA.json",
-        root / "DEPENDENCY-NOTICE.txt",
-        root / "SHA256SUMS",
-    ]
-    for path in required:
-        if not path.is_file():
-            fail(f"missing extracted release file: {path.relative_to(extract)}")
+def toolchain_metadata(spec: dict[str, object]) -> dict[str, object]:
+    return {
+        "cc": compiler_metadata(str(spec["cc"]), spec["env"]),
+        "cxx": compiler_metadata(str(spec["cxx"]), spec["env"]),
+        "c_flags": spec["c_flags"],
+        "cxx_flags": spec["cxx_flags"],
+        "sysroot": spec["sysroot"],
+        "exe_linker_flags": spec["exe_linker_flags"],
+        "shared_linker_flags": spec["shared_linker_flags"],
+        "system_processor": spec["system_processor"],
+        "c_compiler_target": spec["c_compiler_target"],
+        "cxx_compiler_target": spec["cxx_compiler_target"],
+        "env": spec["env"],
+        "cmake": output(["cmake", "--version"]).splitlines()[0],
+    }
+
+
+def copy_release_docs(source_root: Path, stage: Path) -> None:
+    for source, destination in (
+        (source_root / "LICENSE", stage / "licenses" / "LICENSE"),
+        (source_root / "NOTICE", stage / "licenses" / "NOTICE"),
+        (source_root / "PROVENANCE.md", stage / "licenses" / "PROVENANCE.md"),
+        (source_root / "third_party" / "dtv-userland-core" / "LICENSE",
+         stage / "licenses" / "LICENSE.dtv-userland-core"),
+        (source_root / "third_party" / "libusb" / "COPYING",
+         stage / "licenses" / "libusb-COPYING"),
+        (source_root / "README.md", stage / "docs" / "README.md"),
+        (source_root / "docs" / "cli-framework.md", stage / "docs" / "cli-framework.md"),
+    ):
+        if not source.is_file():
+            fail(f"missing release license/document input: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def write_inner_checksums(stage: Path) -> None:
+    rows = []
+    for path in sorted(stage.rglob("*")):
+        if path.is_file() and path.name != "SHA256SUMS":
+            rows.append(f"{sha256(path)}  {path.relative_to(stage).as_posix()}")
+    (stage / "SHA256SUMS").write_text("\n".join(rows) + "\n", encoding="ascii")
+
+
+def build_darwin_archive(version: str, spec: dict[str, object],
+                         product_source: dict[str, str],
+                         checkout: dict[str, str], source_map_sha256: str | None,
+                         core_commit: str, libusb_version: str, libusb_url: str,
+                         libusb_sha256: str, source_root: Path,
+                         source_archive_path: Path, source_archive_sha256: str,
+                         build: Path, work: Path, output_dir: Path) -> Path:
+    root_name = f"{PRODUCT}-{version}-{DARWIN_PLATFORM}"
+    stage = work / root_name
+    for sub in ("bin", "ifd", "licenses", "docs"):
+        (stage / sub).mkdir(parents=True)
+    binary_hashes = {}
+    binary_dependencies = {}
+    for name in BINARIES:
+        source = build / name
+        if not source.is_file():
+            fail(f"missing built binary: {source}")
+        shutil.copy2(source, stage / "bin" / name)
+        binary_hashes[name] = sha256(stage / "bin" / name)
+        binary_dependencies[name] = check_macos_macho(stage / "bin" / name, spec)
+    bundle_source = build / "pcsc" / "torne-userland-ifd.bundle"
+    if not bundle_source.is_dir():
+        fail("missing macOS IFD bundle")
+    bundle = stage / "ifd" / "torne-userland-ifd.bundle"
+    shutil.copytree(bundle_source, bundle)
+    bundle_info = check_macos_ifd_bundle(bundle)
+    shutil.copy2(source_root / "packaging" / "pcsc" / "torne.reader.conf.in",
+                 stage / "ifd" / "torne.reader.conf.in")
+    copy_release_docs(source_root, stage)
+    metadata = {
+        "schema": 1,
+        "product": PRODUCT,
+        "version": version,
+        "platform": DARWIN_PLATFORM,
+        "libc": "darwin",
+        "cpu": "arm64",
+        "build_kind": spec["build_kind"],
+        "emulated": False,
+        "product_source": product_source,
+        "checkout": checkout,
+        "source_map": ({"path": "SOURCE-MAP.json", "sha256": source_map_sha256}
+                       if source_map_sha256 is not None else None),
+        "source_commit": product_source["commit"],
+        "source_tree": product_source["tree"],
+        "core_commit": core_commit,
+        "libusb_version": libusb_version,
+        "libusb_url": libusb_url,
+        "libusb_sha256": libusb_sha256,
+        "source_archive": source_archive_path.name,
+        "source_archive_sha256": source_archive_sha256,
+        "toolchain": toolchain_metadata(spec),
+        "binary_sha256": binary_hashes,
+        "binary_dependencies": binary_dependencies,
+        "ifd_bundle": bundle_info,
+        "verification": {
+            "macho_identity": "checked arm64",
+            "system_dependencies": "checked",
+            "ifd_bundle": "CFBundleExecutable/10 symbols/dependencies checked",
+            "os_registration": "not performed",
+            "post_extract_help_version": "native" if spec["run_checks"] else "not run",
+        },
+        "note": "No bit-for-bit reproducibility claim; inputs, toolchain, hashes and rebuild inputs are recorded.",
+    }
+    write_json(stage / "BUILD-METADATA.json", metadata)
+    (stage / "DEPENDENCY-NOTICE.txt").write_text(
+        "\n".join([
+            f"# {PRODUCT} {version} {DARWIN_PLATFORM}",
+            "",
+            f"Source: {source_archive_path.name}",
+            f"Source archive SHA-256: {source_archive_sha256}",
+            f"Core: Khronos31/dtv-userland-core {core_commit}",
+            f"libusb: {libusb_version}, static LGPL-2.1-or-later, {libusb_url}",
+            f"libusb source SHA-256: {libusb_sha256}",
+            "",
+            "The three CLI executables are native arm64 Mach-O programs.",
+            "The PC/SC IFD is a candidate bundle and is not registered with the OS.",
+            "Dependencies are Apple system frameworks/runtime only; no Homebrew or libpcsclite dependency is introduced.",
+            "Product LICENSE/NOTICE/PROVENANCE, Core MIT/GPL notices, libusb COPYING,",
+            "and source/rebuild inputs are included.",
+        ]) + "\n", encoding="utf-8")
+    write_inner_checksums(stage)
+    archive_path = output_dir / f"{root_name}.tar.gz"
+    deterministic_tar(stage, archive_path)
+    return archive_path
+
+
+def build_windows_archive(version: str, spec: dict[str, object],
+                          product_source: dict[str, str],
+                          checkout: dict[str, str], source_map_sha256: str | None,
+                          core_commit: str, libusb_version: str, libusb_url: str,
+                          libusb_sha256: str, source_root: Path,
+                          source_archive_path: Path, source_archive_sha256: str,
+                          build: Path, work: Path, output_dir: Path) -> Path:
+    root_name = f"{PRODUCT}-{version}-{WINDOWS_PLATFORM}"
+    stage = work / root_name
+    for sub in ("bin", "winscard", "licenses", "docs"):
+        (stage / sub).mkdir(parents=True)
+    binary_hashes = {}
+    binary_imports = {}
+    for name in ("torned", "tornectl", "torne-ts"):
+        source = build / f"{name}.exe"
+        if not source.is_file():
+            fail(f"missing built binary: {source}")
+        destination = stage / "bin" / f"{name}.exe"
+        shutil.copy2(source, destination)
+        binary_hashes[name] = sha256(destination)
+        binary_imports[name] = check_windows_pe(destination, spec)
+    stage_source = build / "pcsc" / "windows"
+    dll_source = stage_source / "WinSCard.dll"
+    if not dll_source.is_file():
+        fail("missing staged WinSCard.dll")
+    dll = stage / "winscard" / "WinSCard.dll"
+    shutil.copy2(dll_source, dll)
+    dll_imports = check_windows_dll(dll, spec)
+    for name in ("COPYING", "README.md", "LICENSE.dtv-userland-core",
+                 "COPYING.MinGW-w64-runtime.txt"):
+        source = stage_source / name
+        if not source.is_file():
+            fail(f"missing Windows stage file: {name}")
+        shutil.copy2(source, stage / "winscard" / name)
+    copy_release_docs(source_root, stage)
+    shutil.copy2(stage / "winscard" / "COPYING.MinGW-w64-runtime.txt",
+                 stage / "licenses" / "COPYING.MinGW-w64-runtime.txt")
+    metadata = {
+        "schema": 1,
+        "product": PRODUCT,
+        "version": version,
+        "platform": WINDOWS_PLATFORM,
+        "libc": "windows-ucrt",
+        "cpu": "x86_64",
+        "build_kind": spec["build_kind"],
+        "emulated": False,
+        "product_source": product_source,
+        "checkout": checkout,
+        "source_map": ({"path": "SOURCE-MAP.json", "sha256": source_map_sha256}
+                       if source_map_sha256 is not None else None),
+        "source_commit": product_source["commit"],
+        "source_tree": product_source["tree"],
+        "core_commit": core_commit,
+        "libusb_version": libusb_version,
+        "libusb_url": libusb_url,
+        "libusb_sha256": libusb_sha256,
+        "source_archive": source_archive_path.name,
+        "source_archive_sha256": source_archive_sha256,
+        "toolchain": toolchain_metadata(spec),
+        "binary_sha256": binary_hashes,
+        "binary_imports": binary_imports,
+        "winscard_sha256": sha256(dll),
+        "winscard_imports": dll_imports,
+        "winscard_exports": list(WINDOWS_EXPORT_NAMES),
+        "verification": {
+            "pe_identity": "checked x86-64",
+            "system_ucrt_imports": "checked",
+            "winscard_exports": "checked 13",
+            "native_run": "not performed on this host",
+        },
+        "note": "No bit-for-bit reproducibility claim; inputs, toolchain, hashes and rebuild inputs are recorded.",
+    }
+    write_json(stage / "BUILD-METADATA.json", metadata)
+    (stage / "DEPENDENCY-NOTICE.txt").write_text(
+        "\n".join([
+            f"# {PRODUCT} {version} {WINDOWS_PLATFORM}",
+            "",
+            f"Source: {source_archive_path.name}",
+            f"Source archive SHA-256: {source_archive_sha256}",
+            f"Core: Khronos31/dtv-userland-core {core_commit}",
+            f"libusb: {libusb_version}, static LGPL-2.1-or-later, {libusb_url}",
+            f"libusb source SHA-256: {libusb_sha256}",
+            "",
+            "The three CLI executables and WinSCard.dll use the official llvm-mingw UCRT build.",
+            "They import only Windows system/UCRT libraries and do not require libusb/libstdc++/libgcc runtime DLLs.",
+            "WinSCard.dll is app-local; System32 and OS reader registration are not modified.",
+            "Product LICENSE/NOTICE/PROVENANCE, Core MIT/GPL notices, libusb COPYING,",
+            "llvm-mingw runtime notice, and source/rebuild inputs are included.",
+        ]) + "\n", encoding="utf-8")
+    write_inner_checksums(stage)
+    archive_path = output_dir / f"{root_name}.zip"
+    deterministic_zip(stage, archive_path, root_name)
+    return archive_path
+
+
+def safe_extract_zip(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            name = info.filename
+            if name.startswith("/") or "\\" in name:
+                fail(f"unsafe zip path: {name}")
+            parts = Path(name).parts
+            if ".." in parts:
+                fail(f"unsupported zip member: {name}")
+            archive.extract(info, destination)
+
+
+def verify_inner_checksums(root: Path) -> None:
     listed = set()
-    for line in (root / "SHA256SUMS").read_text(encoding="ascii").splitlines():
+    sums = root / "SHA256SUMS"
+    for line in sums.read_text(encoding="ascii").splitlines():
         digest, separator, name = line.partition("  ")
         if not separator or not name:
             fail(f"invalid inner checksum line: {line}")
@@ -720,6 +1144,84 @@ def verify_extracted(archive_path: Path, version: str, spec: dict[str, object],
                if path.is_file() and path.name != "SHA256SUMS"}
     if listed != present:
         fail("inner SHA256SUMS does not cover the extracted archive exactly")
+
+
+def verify_extracted(archive_path: Path, version: str, spec: dict[str, object],
+                     work: Path) -> None:
+    platform = str(spec["platform"])
+    extract = work / f"verify-{platform}"
+    extract.mkdir()
+    if platform == WINDOWS_PLATFORM:
+        safe_extract_zip(archive_path, extract)
+        root = extract / f"{PRODUCT}-{version}-{WINDOWS_PLATFORM}"
+        required = [
+            *[root / "bin" / f"{name}.exe" for name in BINARIES],
+            root / "winscard" / "WinSCard.dll",
+            root / "winscard" / "COPYING",
+            root / "winscard" / "README.md",
+            root / "winscard" / "LICENSE.dtv-userland-core",
+            root / "winscard" / "COPYING.MinGW-w64-runtime.txt",
+            root / "licenses" / "LICENSE",
+            root / "licenses" / "NOTICE",
+            root / "licenses" / "PROVENANCE.md",
+            root / "licenses" / "LICENSE.dtv-userland-core",
+            root / "licenses" / "libusb-COPYING",
+            root / "docs" / "README.md",
+            root / "docs" / "cli-framework.md",
+            root / "BUILD-METADATA.json",
+            root / "DEPENDENCY-NOTICE.txt",
+            root / "SHA256SUMS",
+        ]
+        for path in required:
+            if not path.is_file():
+                fail(f"missing extracted release file: {path.relative_to(extract)}")
+        verify_inner_checksums(root)
+        return
+    with tarfile.open(archive_path) as archive:
+        safe_extract(archive, extract)
+    root = extract / f"{PRODUCT}-{version}-{platform}"
+    if platform == DARWIN_PLATFORM:
+        required = [
+            *[root / "bin" / name for name in BINARIES],
+            root / "ifd" / "torne-userland-ifd.bundle" / "Contents" / "Info.plist",
+            root / "ifd" / "torne-userland-ifd.bundle" / "Contents" / "MacOS" /
+            "torne-userland-ifd",
+            root / "ifd" / "torne.reader.conf.in",
+            root / "licenses" / "LICENSE",
+            root / "licenses" / "NOTICE",
+            root / "licenses" / "PROVENANCE.md",
+            root / "licenses" / "LICENSE.dtv-userland-core",
+            root / "licenses" / "libusb-COPYING",
+            root / "docs" / "README.md",
+            root / "docs" / "cli-framework.md",
+            root / "BUILD-METADATA.json",
+            root / "DEPENDENCY-NOTICE.txt",
+            root / "SHA256SUMS",
+        ]
+    else:
+        required = [
+            *[root / "bin" / name for name in BINARIES],
+            root / "ifd" / "torne-userland-ifd.so",
+            root / "ifd" / "COPYING",
+            root / "ifd" / "UNIX_PCSC_IFD_PROVENANCE.json",
+            root / "ifd" / "torne.reader.conf.in",
+            root / "licenses" / "LICENSE",
+            root / "licenses" / "NOTICE",
+            root / "licenses" / "PROVENANCE.md",
+            root / "licenses" / "LICENSE.dtv-userland-core",
+            root / "licenses" / "libusb-COPYING",
+            root / "docs" / "README.md",
+            root / "docs" / "cli-framework.md",
+            root / "BUILD-METADATA.json",
+            root / "DEPENDENCY-NOTICE.txt",
+            root / "SHA256SUMS",
+        ]
+    for path in required:
+        if not path.is_file():
+            fail(f"missing extracted release file: {path.relative_to(extract)}")
+    verify_inner_checksums(root)
+    if platform == DARWIN_PLATFORM:
+        check_macos_ifd_bundle(root / "ifd" / "torne-userland-ifd.bundle")
     if not spec["run_checks"]:
         return
     runner = list(spec["runner"])
@@ -738,12 +1240,18 @@ def write_outer_checksums(output_dir: Path, archives: list[Path]) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
-    parser.add_argument("--core-source", required=True)
+    parser.add_argument("--core-source")
+    parser.add_argument("--source-archive",
+                        help="fixed source archive to build from instead of creating a new one")
     parser.add_argument("--libusb-source-archive")
     parser.add_argument("--linux-platform", action="append", choices=LINUX_PLATFORMS,
                         help="Linux archive platform; repeat to manufacture several")
     parser.add_argument("--linux-matrix", action="store_true",
                         help="manufacture all four Linux glibc/musl x86_64/aarch64 archives")
+    parser.add_argument("--darwin-arm64", action="store_true",
+                        help="manufacture the macOS arm64 archive (must run on macOS)")
+    parser.add_argument("--windows-x86_64", action="store_true",
+                        help="manufacture the Windows x86_64 archive with llvm-mingw/UCRT")
     parser.add_argument("--toolchain-config",
                         help="schema-1 JSON mapping each selected platform to its fixed toolchain")
     parser.add_argument("--source-only", action="store_true",
@@ -753,52 +1261,81 @@ def main() -> int:
 
     if args.linux_matrix and args.linux_platform:
         fail("--linux-matrix and --linux-platform are mutually exclusive")
+    platforms = []
     if args.linux_matrix:
-        platforms = list(LINUX_PLATFORMS)
+        platforms.extend(LINUX_PLATFORMS)
     elif args.linux_platform:
-        platforms = list(args.linux_platform)
-    else:
+        platforms.extend(args.linux_platform)
+    if args.darwin_arm64:
+        platforms.append(DARWIN_PLATFORM)
+    if args.windows_x86_64:
+        platforms.append(WINDOWS_PLATFORM)
+    if not platforms:
         platforms = [DEFAULT_PLATFORM]
     if len(set(platforms)) != len(platforms):
-        fail("duplicate --linux-platform value")
-    if not args.source_only and len(platforms) > 1 and not args.toolchain_config:
-        fail("--toolchain-config is required for a multi-platform build")
+        fail("duplicate platform selection")
+    if DARWIN_PLATFORM in platforms and sys.platform != "darwin":
+        fail("--darwin-arm64 must be built on macOS")
+    if not args.source_only and platforms != [DEFAULT_PLATFORM] and not args.toolchain_config:
+        fail("--toolchain-config is required for non-default platforms")
 
     os.umask(0o022)
     output_dir = Path(args.output).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         fail("--output must be empty or absent")
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    require_clean_source()
-    checkout = checkout_identity()
-    product_from_map, source_map_sha256 = read_source_map()
-    product_source = product_from_map if product_from_map is not None else checkout
     version = read_version()
-    core_commit = read_core_commit()
-    libusb_version, libusb_url, libusb_sha256 = read_libusb()
-    core_source = Path(args.core_source).expanduser().resolve()
-    if output(["git", "rev-parse", "HEAD"], cwd=core_source) != core_commit:
-        fail("--core-source does not match the fixed Core commit")
     toolchains = load_toolchains(args.toolchain_config)
     specs = [] if args.source_only else [resolve_platform(platform, toolchains)
                                          for platform in platforms]
 
     with tempfile.TemporaryDirectory(prefix="torne-release-") as temporary:
         work = Path(temporary)
-        if args.libusb_source_archive:
-            libusb_archive = Path(args.libusb_source_archive).expanduser().resolve()
-            if sha256(libusb_archive) != libusb_sha256:
-                fail("libusb source archive checksum mismatch")
+        if args.source_archive:
+            input_source = Path(args.source_archive).expanduser().resolve()
+            if not input_source.is_file():
+                fail("--source-archive does not exist")
+            source_metadata = read_source_archive_metadata(input_source, version)
+            product_source = source_metadata["product_source"]
+            checkout = source_metadata["checkout"]
+            source_map = source_metadata.get("source_map")
+            source_map_sha256 = source_map.get("sha256") if isinstance(source_map, dict) else None
+            core_commit = source_metadata["core_commit"]
+            libusb_version = source_metadata["libusb_version"]
+            libusb_url = source_metadata["libusb_url"]
+            libusb_sha256 = source_metadata["libusb_sha256"]
+            source_path = output_dir / input_source.name
+            if input_source.resolve() != source_path.resolve():
+                shutil.copy2(input_source, source_path)
+            source_sha256 = sha256(source_path)
+            build_source = extract_source(version, source_path, work)
+            source_root = build_source
         else:
-            libusb_archive = work / f"libusb-{libusb_version}.tar.bz2"
-            download_libusb(libusb_url, libusb_sha256, libusb_archive)
+            if not args.core_source:
+                fail("--core-source is required unless --source-archive is supplied")
+            require_clean_source()
+            checkout = checkout_identity()
+            product_from_map, source_map_sha256 = read_source_map()
+            product_source = product_from_map if product_from_map is not None else checkout
+            core_commit = read_core_commit()
+            libusb_version, libusb_url, libusb_sha256 = read_libusb()
+            core_source = Path(args.core_source).expanduser().resolve()
+            if output(["git", "rev-parse", "HEAD"], cwd=core_source) != core_commit:
+                fail("--core-source does not match the fixed Core commit")
+            if args.libusb_source_archive:
+                libusb_archive = Path(args.libusb_source_archive).expanduser().resolve()
+                if sha256(libusb_archive) != libusb_sha256:
+                    fail("libusb source archive checksum mismatch")
+            else:
+                libusb_archive = work / f"libusb-{libusb_version}.tar.bz2"
+                download_libusb(libusb_url, libusb_sha256, libusb_archive)
+            source_path, source_root = source_archive(
+                version, product_source, checkout, source_map_sha256,
+                core_commit, core_source, libusb_archive, libusb_version,
+                libusb_url, libusb_sha256, work, output_dir)
+            source_sha256 = sha256(source_path)
+            build_source = extract_source(version, source_path, work)
 
-        source_path, source_root = source_archive(
-            version, product_source, checkout, source_map_sha256,
-            core_commit, core_source, libusb_archive, libusb_version,
-            libusb_url, libusb_sha256, work, output_dir)
-        source_sha256 = sha256(source_path)
         if args.source_only:
             checksums = write_outer_checksums(output_dir, [source_path])
             for item in (source_path, checksums):
@@ -807,14 +1344,25 @@ def main() -> int:
             print(f"checksums={checksums}")
             return 0
 
-        build_source = extract_source(version, source_path, work)
         archives = [source_path]
         for spec in specs:
             build = build_platform(version, build_source, spec, work, args.jobs)
-            binary_path = build_binary_archive(
-                version, spec, product_source, checkout, source_map_sha256,
-                core_commit, libusb_version, libusb_url, libusb_sha256,
-                source_root, source_path, source_sha256, build, work, output_dir)
+            platform = str(spec["platform"])
+            if platform == DARWIN_PLATFORM:
+                binary_path = build_darwin_archive(
+                    version, spec, product_source, checkout, source_map_sha256,
+                    core_commit, libusb_version, libusb_url, libusb_sha256,
+                    source_root, source_path, source_sha256, build, work, output_dir)
+            elif platform == WINDOWS_PLATFORM:
+                binary_path = build_windows_archive(
+                    version, spec, product_source, checkout, source_map_sha256,
+                    core_commit, libusb_version, libusb_url, libusb_sha256,
+                    source_root, source_path, source_sha256, build, work, output_dir)
+            else:
+                binary_path = build_binary_archive(
+                    version, spec, product_source, checkout, source_map_sha256,
+                    core_commit, libusb_version, libusb_url, libusb_sha256,
+                    source_root, source_path, source_sha256, build, work, output_dir)
             verify_extracted(binary_path, version, spec, work)
             archives.append(binary_path)
         checksums = write_outer_checksums(output_dir, archives)
@@ -823,7 +1371,8 @@ def main() -> int:
 
     print(f"source_archive={output_dir / (PRODUCT + '-' + version + '-source.tar.gz')}")
     for platform in platforms:
-        print(f"binary_archive[{platform}]={output_dir / (PRODUCT + '-' + version + '-' + platform + '.tar.gz')}")
+        suffix = "zip" if platform == WINDOWS_PLATFORM else "tar.gz"
+        print(f"binary_archive[{platform}]={output_dir / (PRODUCT + '-' + version + '-' + platform + '.' + suffix)}")
     print(f"checksums={output_dir / 'SHA256SUMS'}")
     return 0
 

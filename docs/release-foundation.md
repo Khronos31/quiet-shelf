@@ -85,6 +85,106 @@ scripts/release/build-candidate.sh \
   --toolchain-config /path/to/linux-matrix-toolchains.json
 ```
 
+## macOS darwin-arm64
+
+`--darwin-arm64` builds the native arm64 3 CLIs and the candidate IFD bundle on
+macOS. The output archive is
+`torne-userland-<version>-darwin-arm64.tar.gz`; the IFD is under
+`ifd/torne-userland-ifd.bundle`, with `Info.plist`, the bundle executable,
+COPYING/provenance, and the product/Core license copies. `ifd/torne.reader.conf.in`
+is included as the reader configuration template. The helper checks
+Mach-O arm64 identity, Apple system framework/libc++/libSystem dependencies,
+the bundle executable/plist binding, the 10 IFDH symbols, and native
+`--version`/`--help`. It does not register the bundle with the OS PC/SC
+service.
+
+Darwin defaults to the system C++ runtime: omitting `exe_linker_flags` and
+`shared_linker_flags` no longer applies the Linux `-static-libstdc++
+-static-libgcc` defaults. Linux and Windows keep their existing static-runtime
+defaults. The product-managed macOS toolchain entry is
+`scripts/release/macos-toolchain.json`; docs and the existing macOS Release job
+use this one file instead of separate inline values. It supplies only the
+build-only PC/SC header location:
+
+```json
+{
+  "schema": 1,
+  "platforms": {
+    "darwin-arm64": {
+      "cc": "/usr/bin/cc",
+      "cxx": "/usr/bin/c++",
+      "cmake_args": [
+        "-DDTV_USERLAND_PCSC_IFD_INCLUDE_DIR=/opt/homebrew/opt/pcsc-lite/include/PCSC"
+      ],
+      "system_processor": "arm64",
+      "run_checks": true,
+      "build_kind": "native"
+    }
+  }
+}
+```
+
+The local and CI entry share the same helper and config:
+
+```sh
+scripts/release/build-candidate.sh \
+  --output /tmp/torne-release-macos \
+  --core-source /path/to/dtv-userland-core \
+  --libusb-source-archive /path/to/libusb-1.0.30.tar.bz2 \
+  --darwin-arm64 \
+  --toolchain-config scripts/release/macos-toolchain.json
+```
+
+The CI entry for the existing macOS Release job is
+`scripts/release/ci-macos-release.sh`. It reads the fixed Core commit from
+`cmake/TorneCoreDependency.cmake` and the libusb version/URL/SHA from
+`cmake/TorneLibusb.cmake`, verifies those inputs, and then invokes the same
+helper/config. It manufactures the source archive and the Mac archive in the
+same run, verifies inner/outer SHA-256, extracts the archive, checks
+`--version`/`--help`, and inspects the IFD bundle/plist, the 10 `IFDH*` entries,
+system-only dependencies, and the notice/provenance files. The job does not
+upload the artifact or register a reader.
+
+In the existing 8-job macOS Release job, add only:
+
+```yaml
+- name: Install build-only pcsc-lite headers
+  if: matrix.config == 'Release'
+  run: brew install pcsc-lite
+
+- name: Manufacture and verify macOS release archive
+  if: matrix.config == 'Release'
+  run: scripts/release/ci-macos-release.sh
+```
+
+No new job, matrix, upload, Release, secret, or write permission is added. The
+Core commit is read from `cmake/TorneCoreDependency.cmake` rather than copied as
+a literal.
+
+## Windows x86_64 (llvm-mingw UCRT)
+
+`--windows-x86_64` builds the 3 CLIs and the app-local WinSCard DLL with the
+fixed llvm-mingw/UCRT toolchain. The output archive is
+`torne-userland-<version>-windows-x86_64.zip`; `WinSCard.dll` is under
+`winscard/` with COPYING, adapter README, Core license, and the MinGW runtime
+notice. The helper checks COFF x86-64 identity, system/UCRT imports, absence
+of libusb/libstdc++/libgcc/libwinpthread runtime DLLs, and the 13 WinSCard
+exports. The zip is not executed on Linux; device-free execution is a separate
+native-host check.
+
+The toolchain entry uses `cmake_system_name: Windows`, `readobj`, and the
+fixed compiler paths. The Windows package does not modify System32 or register
+readers.
+
+## Reusing a fixed source archive
+
+Pass `--source-archive` to build from an already-manufactured source archive
+instead of creating a new one from the current checkout. The helper reads
+`SOURCE-METADATA.json` from the archive, preserves the archive in the output,
+and records its SHA-256 in `BUILD-METADATA.json`. This is the intended way to
+build the macOS and Windows packages from the same fixed source archive
+without pretending an old stage is a new-source build.
+
 ## Dependency source
 
 | input | fixed location |

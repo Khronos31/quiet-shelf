@@ -7,13 +7,15 @@
 ## dtv-userland-core
 
 - repository: `https://github.com/Khronos31/dtv-userland-core.git`
-- commit: `548a04605d9e224be179547de30f590ff693a128`（Core main、Windows共通WinSCard fixtureとUnix IFD torne profileを含む採用pin）
+- version: `v1.0.2`
+- commit: `cf2aedfaba588827c3dcf024be12b400aa881874`（annotated tag `v1.0.2` object `2fb38e74`。548a046からCMake版1行のみ。Windows共通WinSCard fixtureとUnix IFD torne profileを含む採用pin）
 - 固定箇所: `cmake/TorneCoreDependency.cmake`
 - 用途: `host_ctl`、`host_ts`、`identity`、`json`、`host_runtime`、
   `host_facade`、`host_card_t1` の既存 API。製品側でATR/T=1/APDU契約を複製しない。
 - ライセンス: Core リポジトリの `LICENSE` / `PROVENANCE.json` に従う。
   portable 部分は MIT、GPL adapter は GPL-2.0-only。
 - この commit はCardService接続とWindows共通WinSCard fixtureを含む採用pinであり、最終5製品同pinではない。
+- 旧pin `548a046` の実装来歴・部品出典は下の履歴記述に残し、現行の固定依存だけをv1.0.2へ更新する。
 
 Core のソースは FetchContent で取得するか、`TORNE_CORE_SOURCE_DIR` で同じ
 commit を checkout 済みのツリーを指定する。生成物や取得物はこのリポジトリへ
@@ -75,8 +77,8 @@ vendor しない。
   `torne_drv` `fc662902a3e4ad56566b00cae4a0ead922e3dd02`
   `driver/torne_fw_gen.h:221-245` に基づく。製品コードはhash/entry/語だけを保持し、
   旧画像のbyte列を製品FWやロード対象へ埋め込まない。
-- SHA-256はCoreの `include/dtv/userland/detail/sha256.h`（Core入力
-  `548a046...`、MIT範囲）を使用する。外部runtime依存は増やしていない。
+- SHA-256はCore v1.0.2（source系列548a046）の
+  `include/dtv/userland/detail/sha256.h`（MIT範囲）を使用する。外部runtime依存は増やしていない。
 - `tests/widen_recognition_tests.cpp` に置く85語/340Bの旧画像は、登録tupleの
   受理・変異試験専用の固定参照データであり、製品FWではない。出典は同じ
   `torne_drv` commitの `torne_addressing0_code[85]`（GPL-2.0-only、coax/Linux由来）。
@@ -165,13 +167,13 @@ vendor しない。
   TRIGGERとして再送しない。不正・short・unknown後はセッションを無効化し、
   後続操作を止める。実カード、presence極性、FIFO上限、byte lane、ATR/T=1は
   未実測。fake EP0/clockのみで検証する。
-- `src/card/service.*` は製品UARTを共有Core **548a046** の公開
+- `src/card/service.*` は製品UARTを共有Core **v1.0.2**（source系列548a046）の公開
   `CardHardware`/`CardTime`/`CardSession`/`CardProtocolSessionAdapter`へ接続する
   自作host adapter。ATR構文・T=1・IFSD・EDC・R/S/WTX・APDUはCore既存APIに任せ、
   製品側で複製しない。`src/product/hardware_device.cpp`が同じ単一Transportから
   `CardPort`を公開し、`src/product/core_family.cpp`が`EnclosureFamily`の
   card backend/protocolとして`CardService`へ渡す。
-- Core 548a046はMIT/GPL-2.0-onlyの既存Core sourceであり、製品は公開APIだけに依存
+- Core v1.0.2（source系列548a046）はMIT/GPL-2.0-onlyの既存Core sourceであり、製品は公開APIだけに依存
   する。Coreの生成物や他製品sourceをvendorしない。
 
 ## DiB8096 C11 frontend
@@ -202,7 +204,7 @@ vendor しない。
 
 ## PC/SC adapter packaging
 
-- Windows adapter: Core `548a04605d9e224be179547de30f590ff693a128` の
+- Windows adapter: Core v1.0.2（source系列548a046）の
   `adapters/windows_winscard/`（GPL-2.0-only、PX4由来）。製品はCore既存の
   `dtv_windows_winscard` / `WinSCard.dll` targetを選択し、同一DLL byteを
   `torne_pcsc_stage`でアプリローカルへstageする。OS全体のreader登録・

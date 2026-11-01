@@ -112,7 +112,7 @@
   presence、冷resetの10/2/1ms、電源断、FIFO count/RX/TX、SEND一度、
   9600/19200/38400のbaud、注入clockを実装し、short/timeout/USB喪失/unknownの
   非再送・セッション無効化をfakeで確認する。
-- `card/service` で製品UARTをCore 548a046の`CardHardware`/`CardTime`/
+- `card/service` で製品UARTをCore v1.0.2（source系列548a046）の`CardHardware`/`CardTime`/
   `CardSession`/`CardProtocolSessionAdapter`へ接続した。`EnclosureFamily`の
   card backend/protocolを`CardService`へ渡し、通常daemonのCore listener経路に
   乗る。ATR構文/T=1/APDU/IFSD/WTXはCore既存APIに任せ、CONSUMING_READ/
@@ -158,12 +158,11 @@
 | 項目 | 値 |
 | --- | --- |
 | repository | `https://github.com/Khronos31/dtv-userland-core.git` |
-| commit | `548a04605d9e224be179547de30f590ff693a128`（Core main、Windows共通WinSCard fixtureとUnix IFD torne profileを含む採用pin） |
+| version | `v1.0.2` |
+| commit | `cf2aedfaba588827c3dcf024be12b400aa881874`（annotated tag `v1.0.2` object `2fb38e74`。548a046からCMake版1行のみ） |
 | 定義場所 | `cmake/TorneCoreDependency.cmake` の1か所 |
 
-548a046 はWindows共通WinSCard fixtureとUnix IFDのtorne profileを含む採用pinであり、最終5製品同pin・
-tagではない。最終pin確定後に5製品と同じ新Coreへ揃える。更新するときは上記の
-ファイルだけを変える。
+cf2aedfa はWindows共通WinSCard fixtureとUnix IFDのtorne profileを含む採用pinであり、最終5製品同pinではない。旧548a046の実装来歴は履歴記述として残す。更新するときは上記のファイルだけを変える。
 
 既定の FetchContent 経路は `GIT_TAG` で上記 commit を取得する。一方
 `TORNE_CORE_SOURCE_DIR` は**開発者が指定する未検証の入力**であり、CMake は
