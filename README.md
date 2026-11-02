@@ -49,6 +49,10 @@ CLI do not require `ifdhandler.h`.
   `LICENSE.dtv-userland-core`; the macOS bundle loader is checked in CI, while
   OS registration, real-card use, Linux system-pcscd/other-UID use, and the
   remaining OS integration stay unverified.
+  macOS archives include an ad-hoc sealed IFD bundle (no Developer ID signature
+  or notarization); after copying it during installation, run
+  `codesign --verify --strict <bundle>`. The release helper seals the completed
+  bundle and verifies it strictly before hashing or packaging it.
 - No packaging target edits `/etc`, starts pcscd, installs a system service, or
   replaces a system DLL. The Windows DLL is installed beside the application
   when the product install target is used.

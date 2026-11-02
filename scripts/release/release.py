@@ -867,7 +867,7 @@ def check_macos_macho(path: Path, spec: dict[str, object]) -> list[str]:
     return deps
 
 
-def check_macos_ifd_bundle(bundle: Path) -> dict[str, object]:
+def check_macos_ifd_bundle(bundle: Path, *, include_hashes: bool = True) -> dict[str, object]:
     executable_name = "torne-userland-ifd"
     info_path = bundle / "Contents" / "Info.plist"
     executable = bundle / "Contents" / "MacOS" / executable_name
@@ -893,13 +893,15 @@ def check_macos_ifd_bundle(bundle: Path) -> dict[str, object]:
     for symbol in IFD_SYMBOLS:
         if re.search(rf"\s_?{re.escape(symbol)}$", symbols, re.MULTILINE) is None:
             fail(f"missing macOS IFD symbol: {symbol}")
-    return {
+    result = {
         "CFBundleExecutable": executable_name,
-        "executable_sha256": sha256(executable),
-        "Info.plist_sha256": sha256(info_path),
         "dependencies": deps,
         "symbols": list(IFD_SYMBOLS),
     }
+    if include_hashes:
+        result["executable_sha256"] = sha256(executable)
+        result["Info.plist_sha256"] = sha256(info_path)
+    return result
 
 
 def windows_info(path: Path, spec: dict[str, object]) -> tuple[list[str], list[str]]:
@@ -1147,14 +1149,18 @@ def build_darwin_archive(version: str, spec: dict[str, object],
         if not source.is_file():
             fail(f"missing built binary: {source}")
         shutil.copy2(source, stage / "bin" / name)
-        binary_hashes[name] = sha256(stage / "bin" / name)
         binary_dependencies[name] = check_macos_macho(stage / "bin" / name, spec)
     bundle_source = build / "pcsc" / "torne-userland-ifd.bundle"
     if not bundle_source.is_dir():
         fail("missing macOS IFD bundle")
     bundle = stage / "ifd" / "torne-userland-ifd.bundle"
     shutil.copytree(bundle_source, bundle)
+    check_macos_ifd_bundle(bundle, include_hashes=False)
+    output(["codesign", "--force", "--deep", "--sign", "-", str(bundle)])
+    output(["codesign", "--verify", "--strict", "--verbose=2", str(bundle)])
     bundle_info = check_macos_ifd_bundle(bundle)
+    for name in BINARIES:
+        binary_hashes[name] = sha256(stage / "bin" / name)
     shutil.copy2(source_root / "packaging" / "pcsc" / "torne.reader.conf.in",
                  stage / "ifd" / "torne.reader.conf.in")
     copy_release_docs(source_root, stage)

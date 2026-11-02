@@ -1,7 +1,7 @@
 # Public CI snapshot of torne-userland
 
 - **Source repository**: `Khronos31/torne-userland` (private at snapshot time).
-- **Source commit**: `af7525a8f8d14a18d2a5ee960f5c39ff86701e49` (main; product tree `4ecdcd2932149c5e23f262de3c9e9e9035298b57`; merge parents `4096082326d5931351da5074c17264b1794b9f57` + `6c37d108f4c66a681e1cfba9ad4ff02db2e9dfad`; Core v1.0.2; Torne version `0.1.0`; Android release helper PR32 is included).
+- **Source commit**: `5328446011057998489bcf1c915eb6fb78635b6c` (main; product tree `5d1deaf6f6a9b40e6a1211927d7f2b349aab7d5e`; merge parents `af7525a8f8d14a18d2a5ee960f5c39ff86701e49` + `4eb153427337866e50a6c938321c6560da91e1c2`; Core v1.0.2; Torne version `0.1.0`; Android release helper PR32 and macOS IFD packaging seal PR37 are included).
 - **License**: GPL-2.0-only. The product `LICENSE`, `PROVENANCE.md`, and the upstream attribution `NOTICE` are preserved.
 - **Dependency pin**: `Khronos31/dtv-userland-core` at
   `cf2aedfaba588827c3dcf024be12b400aa881874` (v1.0.2 tag object `2fb38e74`;
@@ -100,8 +100,9 @@
   review. The source delta is the reviewed PR25 Android FD change, the
   reviewed DOC26 documentation merge, PR28's approved test-only Termux path
   change, the approved PR24 release helper/provenance guard, PR29's Linux
-  4-archive manufacturing path, PR30's macOS/Windows packaging path, and the
-  Core v1.0.2 `cf2aedfa` pin commit. The existing macOS Release matrix job runs
+  4-archive manufacturing path, PR30's macOS/Windows packaging path, PR37's
+  macOS IFD bundle seal before archive metadata and checksums, and the Core
+  v1.0.2 `cf2aedfa` pin commit. The existing macOS Release matrix job runs
   the product-owned macOS release helper/config; the Linux Release smoke runs
   the default x64 glibc helper without source-only, upload, or release
   workflow. No new job is added. PR29 is merged as main `9115feb7`; PR30
@@ -112,4 +113,4 @@ PR22 adds the cold-start Widen clock-gate initialization (`src/product/clock_gat
 The source snapshot includes the upstream `torne_drv` attribution notice for the DiB8096-derived files (coax and Linux DiBcom notices, with the px4_drv section scoped to upstream files not included here). It contains the CLI framework, USB transport/discovery, Android/Termux borrowed-FD launcher, Widen, Core 1 and Core 0 host runtimes, DiB8096 C11 frontend, card UART/CardService adapters, the product daemon/family path, FR30 candidate images/fixtures, and optional PC/SC packaging. The normal build does not generate FR30 images; it uses the tracked Widen/Core 0/Core 1 images. CI does not open, claim, tune, or stream from a tuner; the CLI smoke may perform read-only USB enumeration. The direct `torne-ts --device usb:BUS-PORT` path is the product startup path that performs Widen/FR30/Core startup, tune, and TS on hardware; it is outside CI. The daemon listener/family connection and CardService adapter are included, but real device I/O remains outside CI. The card path is tested with fake UART/Core in CI; a separate same-UID isolated Linux PC/SC record exists, but OS registration/other UID, macOS service registration, and real IFD/card operation remain unverified. Optional PC/SC packaging is a CI-staged candidate. OS PC/SC system registration is not included.
 
 - `SOURCE-MAP.json` is a tracked product-source mapping for the public synthetic checkout; the actual checkout identity is recorded separately by the helper.
-  Source map SHA-256: `d85a497545d7d3b07a2ac662380e06ef4f8402ce052c88b5f1aa0b72a7e8ed34`.
+  Source map SHA-256: `f9d6278c87bee762df863307ccb6e359c5bca957060f4a822e3b6d4d849d29d4`.
