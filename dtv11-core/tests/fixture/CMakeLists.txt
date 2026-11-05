@@ -15,11 +15,35 @@ dtv_add_product(NAME ${PRODUCT_NAME}
                 COMMAND ${PRODUCT_COMMAND}
                 VERSION ${PRODUCT_VERSION}
                 DEFAULT_MODEL "${PRODUCT_DEFAULT_MODEL}"
-                SOURCES lib/devices.cpp)
+                MODELS fixture_one fixture_two)
+
+dtv_add_product(NAME i0_asicen_fixture
+                COMMAND i0asicenctl
+                VERSION 0.0.0
+                DEFAULT_MODEL ""
+                MODELS px_w3u3)
+
+dtv_add_product(NAME i0_torne_fixture
+                COMMAND i0tornectl
+                VERSION 0.0.0
+                DEFAULT_MODEL ""
+                MODELS cech_zd1j)
+
+dtv_add_product(NAME i0_pix_fixture
+                COMMAND i0pixctl
+                VERSION 0.0.0
+                DEFAULT_MODEL ""
+                MODELS pix_dt295_custom_v25)
 
 if(BUILD_TESTING)
+    add_library(spi_types_c_consumer OBJECT spi-types-consumer.c)
+    target_include_directories(spi_types_c_consumer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     add_executable(c_consumer consumer.c)
     target_link_libraries(c_consumer PRIVATE dtv::userland)
+    add_test(NAME i0_pix_model_metadata
+        COMMAND ${CMAKE_COMMAND}
+            "-DCLI=$<TARGET_FILE:i0pixctl>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/pix-model-contract.cmake")
     add_test(NAME cli_contract_table
         COMMAND ${CMAKE_COMMAND}
             "-DCLI=$<TARGET_FILE:fixturectl>"

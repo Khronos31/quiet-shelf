@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <array>
+#include <cstddef>
+#include <span>
+
+#include <dtv/spi/device_ops.hpp>
+
+namespace dtv::spi {
+
+@model_declarations@
+
+std::span<const ModelEntry *const> product_models()
+{
+    static const std::array<const ModelEntry *, @PRODUCT_MODELS_COUNT@> models{{
+@model_values@    }};
+    return {models.data(), models.size()};
+}
+
+}
+
+extern "C" size_t dtv_product_model_count(void)
+{
+    return dtv::spi::product_models().size();
+}
+
+extern "C" const dtv_model_info *dtv_product_model_at(size_t index)
+{
+    const auto models = dtv::spi::product_models();
+    return index < models.size() ? &models[index]->model : nullptr;
+}
