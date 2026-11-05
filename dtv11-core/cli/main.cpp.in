@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <dtv/cli.h>
+
+#ifndef _WIN32
+#include <csignal>
+#endif
+
+extern "C" const dtv_model_info *dtv_product_model_at(size_t index);
+extern "C" size_t dtv_product_model_count(void);
+
+int main(int argc, char **argv)
+{
+#ifndef _WIN32
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        return 70;
+    }
+#endif
+    const dtv_cli_config config{"@PRODUCT_NAME@", "@PRODUCT_COMMAND@", "@PRODUCT_VERSION@",
+                                "@PRODUCT_DEFAULT_MODEL@"};
+    return dtv_cli_main(argc, const_cast<const char *const *>(argv), &config,
+                        dtv_product_model_at, dtv_product_model_count());
+}

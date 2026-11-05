@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Core build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: CLI contract
+        run: ctest --test-dir build -C Release --output-on-failure
