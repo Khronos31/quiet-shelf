@@ -40,6 +40,36 @@ struct ModelEntry {
     const FirmwareEntry *firmware;
     // Zero entries leave the model unbound; there is no default operations table.
     std::size_t firmware_count;
+    dtv_result (*create_state)(dtv_device, dtv_context **);
+    void (*destroy_state)(dtv_context *);
+};
+
+class ProductInstance {
+public:
+    ProductInstance(const ModelEntry &model, dtv_device device) : model_(&model)
+    {
+        if (model_->create_state) {
+            result_ = model_->create_state(device, &context_);
+        }
+    }
+
+    ~ProductInstance()
+    {
+        if (context_ && model_->destroy_state) {
+            model_->destroy_state(context_);
+        }
+    }
+
+    ProductInstance(const ProductInstance &) = delete;
+    ProductInstance &operator=(const ProductInstance &) = delete;
+
+    dtv_context *context() const { return context_; }
+    dtv_result result() const { return result_; }
+
+private:
+    const ModelEntry *model_;
+    dtv_context *context_ = nullptr;
+    dtv_result result_{};
 };
 
 std::span<const ModelEntry *const> product_models();

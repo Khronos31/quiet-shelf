@@ -40,6 +40,9 @@ if(BUILD_TESTING)
     target_include_directories(spi_types_c_consumer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     add_executable(c_consumer consumer.c)
     target_link_libraries(c_consumer PRIVATE dtv::userland)
+    add_executable(spi_state_lifecycle spi-state-lifecycle.cpp)
+    target_link_libraries(spi_state_lifecycle PRIVATE fixture)
+    add_test(NAME spi_state_lifecycle COMMAND spi_state_lifecycle)
     add_test(NAME i0_pix_model_metadata
         COMMAND ${CMAKE_COMMAND}
             "-DCLI=$<TARGET_FILE:i0pixctl>"
