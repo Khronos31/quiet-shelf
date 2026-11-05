@@ -1,9 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# Product integration
+# 製品への組み込み
 
-The fixture under `tests/fixture` is a small product directory that adds Core with
-`add_subdirectory`, declares its product library from `lib/*.cpp`, and builds its
-command from the Core template. From the Core repository root, run:
+`tests/fixture` 配下の fixture は、`add_subdirectory` で Core を追加し、`lib/*.cpp` から製品ライブラリを宣言して、Core のテンプレートからコマンドをビルドする最小構成の製品ディレクトリである。Core リポジトリのルートからは、次のコマンドを実行する。
 
 ```sh
 cmake -S . -B build -DBUILD_TESTING=ON
@@ -11,7 +9,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-To build the fixture as an independent product directory:
+fixture を独立した製品ディレクトリとしてビルドする場合:
 
 ```sh
 cmake -S tests/fixture -B build/fixture -DBUILD_TESTING=ON
@@ -19,16 +17,9 @@ cmake --build build/fixture
 ctest --test-dir build/fixture --output-on-failure
 ```
 
-The fixture's `CMakeLists.txt` supplies product name, command name, and version, then
-calls `dtv_add_product`. Its `lib/devices.cpp` contains the `DeviceOps` table and the
-model accessor used by the generated command. The accessor is pulled from the static
-product archive because the generated Core main calls its C ABI symbol. Unlisted
-callbacks are null and therefore not implemented. The CLI and option contract stays
-in Core; products do not copy an option mapping table. `DEFAULT_MODEL` is embedded at
-build time; the fixture leaves it empty so no device is selected implicitly. This
-initial metadata-only CLI does not yet apply operational defaults.
+fixture の `CMakeLists.txt` は、製品名、コマンド名、バージョンを指定して `dtv_add_product` を呼び出す。`lib/devices.cpp` には、生成コマンドが使用する `DeviceOps` テーブルとモデルのアクセサを記述する。生成された Core の main 関数が C ABI シンボルを呼び出すため、アクセサは製品の静的アーカイブから解決される。登録されていないコールバックは null となり、未実装として扱われる。CLI やオプションの規約は Core 側に保持されるため、製品側でオプション対応表を複製する必要はない。`DEFAULT_MODEL` はビルド時に埋め込まれる。fixture ではこれを空にしており、暗黙にデバイスが選択されることはない。このメタデータのみを扱う初期 CLI では、動作時のデフォルト値はまだ適用されない。
 
-A product repository uses the same function after adding its pinned Core checkout:
+各製品リポジトリでも、固定した Core のチェックアウトを追加したうえで、同じ関数を使用する。
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -42,7 +33,7 @@ dtv_add_product(NAME siano
                 SOURCES lib/models.cpp)
 ```
 
-The first model table in the fixture shows the source shape:
+fixture 内の最初のモデルテーブルは、次のような構成をとる。
 
 ```cpp
 std::span<const DeviceOps> product_devices()
@@ -55,21 +46,11 @@ std::span<const DeviceOps> product_devices()
 }
 ```
 
-The table lives in a source file inside `libfoo.a`. The product also implements the
-two C-typed model accessors called by the generated main; see
-`tests/fixture/lib/devices.cpp` for the complete working file. The `DeviceOps` entries
-use null for the initial open/close slots because this fixture has no hardware path.
+このテーブルは `libfoo.a` 内のソースファイルに配置する。製品側では、生成された main から呼ばれる C 型のモデルアクセサ2つも実装する。完全に動作するファイル全体は `tests/fixture/lib/devices.cpp` を参照すること。この fixture にはハードウェア制御パスが存在しないため、`DeviceOps` の open/close スロットには初期値として null を指定している。
 
-`include/dtv/cli.h` is the C ABI consumed by the generated main and non-C++ clients.
-It exposes only C-compatible types. `include/dtv/spi/device_ops.hpp` is the C++ product
-SPI for model descriptors and nullable operation callbacks. Strings and callback
-tables are borrowed from static storage and remain valid for the process lifetime.
-The caller owns every buffer it passes to the C API; the API retains no caller-owned
-memory. No C++ exception is part of the C ABI contract.
+`include/dtv/cli.h` は、生成された main や非 C++ クライアントが使用する C ABI である。C 互換の型のみを公開する。`include/dtv/spi/device_ops.hpp` は、モデル記述子と null 許容の操作コールバックを定義する C++ 製品向け SPI である。文字列やコールバックテーブルは静的記憶域から借用され、プロセスの生存期間中は常に有効である。C API に渡されるバッファの所有権は呼び出し側にあり、API が呼び出し側所有のメモリを保持することはない。また、C ABI の規約に C++ 例外は含まれない。
 
-During development a product can pin this repository as a submodule at a reviewed
-commit SHA. Set `CORE_SSH_URL` to the private Core remote in the local environment,
-and set `CORE_SHA` to the reviewed commit SHA:
+開発中、製品リポジトリはこのリポジトリをレビュー済みコミット SHA の submodule として固定できる。ローカル環境で `CORE_SSH_URL` に private な Core の remote を設定し、`CORE_SHA` にレビュー済みコミット SHA を指定する。
 
 ```sh
 git submodule add "$CORE_SSH_URL" external/dtv11-core
@@ -77,40 +58,18 @@ git -C external/dtv11-core checkout "$CORE_SHA"
 git add external/dtv11-core
 ```
 
-The product build then adds that fixed checkout as a subdirectory before calling
-`dtv_add_product`. For the later public quiet-shelf CI, copy the pinned Core files
-into the public repository as ordinary files; do not use this private submodule URL.
-The workflow in `.github/workflows/ci.yml` runs the same fixture build and external
-contract matrix on Linux and Windows/MSVC when copied alongside those files.
+製品のビルドでは、この固定チェックアウトをサブディレクトリとして追加した上で `dtv_add_product` を呼び出す。後日の公開 quiet-shelf CI では、固定した Core のファイルを通常ファイルとして公開リポジトリへコピーする。この private submodule の URL は使用しないこと。`.github/workflows/ci.yml` にあるワークフローは、それらのファイルと共に配置された際、Linux および Windows/MSVC 上で同一の fixture ビルドと外部契約マトリクスを実行する。
 
-This initial SPI has only model identity, VID:PID, and nullable open/close slots. It
-does not define the complete hardware API. Future operations can be added to the SPI
-as their Core behavior is implemented, without claiming that null callbacks work.
+この初期 SPI は、モデルの識別情報、VID:PID、および null 許容の open/close スロットのみを持つ。完全なハードウェア API を定義しているわけではない。今後の各操作は、Core 側の動作が実装されるにつれて SPI に追加可能であるが、null コールバックが機能すると偽ってはならない。
 
-## License and provenance
+## ライセンスと由来
 
-The Core sources in this repository were written for dtv11 and do not copy code from
-the read-only reference Core. Each source and documentation file carries the
-GPL-2.0-or-later SPDX identifier. Any future third-party source must be checked for
-compatible licensing before it is included.
+本リポジトリの Core ソースコードは dtv11 向けに新規作成されたものであり、読み取り専用の参照用 Core からコードをコピーしていない。各ソースファイルおよび文書ファイルには GPL-2.0-or-later の SPDX 識別子が付与されている。将来サードパーティ製ソースを追加する場合は、取り込み前にライセンスの互換性を確認しなければならない。
 
-## Output errors and SIGPIPE
+## 出力エラーと SIGPIPE
 
-The C API checks stdout writes and flushes and returns 70 when they fail. It does not
-change process signal dispositions. The generated command ignores SIGPIPE in its
-`main` on POSIX so a closed pipe becomes a normal write error and returns 70. An
-in-process caller keeps control of its own SIGPIPE policy; with the default policy,
-the host may terminate on a closed stdout pipe before the C API can return.
+C API は stdout への書き込みと flush を確認し、失敗した場合は 70 を返す。プロセスのシグナル設定（disposition）は変更しない。POSIX 上の生成コマンドは、`main` で SIGPIPE を無視（SIG_IGN）に設定するため、パイプが閉じられた場合も通常の書き込みエラーとして扱い 70 を返す。インプロセスで呼び出す側は自身の SIGPIPE ポリシーを維持する。デフォルトのポリシーのままでは、C API がリターンする前に、閉じた stdout パイプによってホストプロセスが終了する可能性がある。
 
-## Argument decision stages
+## 引数判定の段階
 
-The CLI sends the original argument vector into the Core C API. The Core handles
-metadata before ordinary argument validation: help wins over version, and both win
-over models and invalid arguments. Models is accepted only on its own. The PR147 L1
-contract assigns unknown input error code 2; unsupported known hardware capability
-is a later, distinct result (code 3). This increment implements no hardware operation
-as a known command, so non-metadata arguments are unknown and rejected with code 2.
-Once a command is added, the Core will first recognize it and then use the selected
-device's callback table to decide whether that hardware supports it. Required runtime
-inputs such as daemon firmware do not apply to metadata-only requests and are not
-implemented here.
+CLI は元の引数配列を Core の C API へ渡す。Core は通常の引数検証に先立ってメタデータを処理する。help は version より優先され、両者とも models や無効な引数より優先される。models は単独で指定された場合のみ受け付けられる。PR147 L1 契約では、未知の入力に対するエラーコードとして 2 を割り当てている。サポートされていない既知のハードウェア機能は、後日実装される別の結果（コード 3）となる。本実装段階では既知のコマンドとしてのハードウェア操作を実装していないため、メタデータ以外の引数は未知として扱われ、コード 2 で拒否される。コマンドが追加された後は、Core がまずそのコマンドを認識し、選択されたデバイスのコールバックテーブルを用いてハードウェアがそれをサポートしているかを判定する。デーモンのファームウェアなど実行時に必要となる入力は、メタデータのみの要求には適用されず、ここでは実装されていない。

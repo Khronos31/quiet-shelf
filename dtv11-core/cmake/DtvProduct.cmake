@@ -6,7 +6,7 @@ function(dtv_add_product)
     endif()
 
     add_library(${PRODUCT_NAME} STATIC ${PRODUCT_SOURCES})
-    target_link_libraries(${PRODUCT_NAME} PUBLIC dtv)
+    target_link_libraries(${PRODUCT_NAME} PUBLIC dtv::userland)
     target_compile_features(${PRODUCT_NAME} PUBLIC cxx_std_20)
     set_target_properties(${PRODUCT_NAME} PROPERTIES CXX_EXTENSIONS OFF)
 
@@ -17,6 +17,6 @@ function(dtv_add_product)
     configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../cli/main.cpp.in"
                    "${cli_source}" @ONLY)
     add_executable(${PRODUCT_COMMAND} "${cli_source}")
-    target_link_libraries(${PRODUCT_COMMAND} PRIVATE ${PRODUCT_NAME} dtv)
+    target_link_libraries(${PRODUCT_COMMAND} PRIVATE ${PRODUCT_NAME} dtv::userland)
     set_target_properties(${PRODUCT_COMMAND} PROPERTIES CXX_EXTENSIONS OFF)
 endfunction()

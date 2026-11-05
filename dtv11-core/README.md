@@ -1,12 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # dtv11-userland-core
 
-Shared core for the dtv11 userland products. It builds `libdtv.a` and provides the
-generated command-line entry point and product CMake function.
+dtv11 userland 各製品の共通コア。`libdtv-userland.a` をビルドし、生成コマンドラインのエントリポイントと製品向け CMake 関数を提供する。
 
-See [product integration](docs/product-integration.md) for the fixture and build
-commands, and [quiet-shelf CI](docs/quiet-shelf-ci.md) for the public snapshot
-procedure. This initial increment implements metadata requests only; hardware and
-daemon operations remain unimplemented.
+fixture やビルド手順は [製品への組み込み](docs/product-integration.md) を、公開スナップショットの手順は [quiet-shelf CI](docs/quiet-shelf-ci.md) を参照すること。この初期段階の実装はメタデータ要求のみに対応しており、ハードウェアやデーモンの操作は未実装である。
 
-This project is licensed under GPL-2.0-or-later; see [LICENSE](LICENSE).
+本プロジェクトは GPL-2.0-or-later の下でライセンスされている。[LICENSE](LICENSE) を参照すること。

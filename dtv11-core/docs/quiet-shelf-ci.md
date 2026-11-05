@@ -1,13 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# quiet-shelf CI snapshot
+# quiet-shelf CI スナップショット
 
-This repository is private. The public quiet-shelf CI must use ordinary files and
-must not fetch this repository as a submodule.
+本リポジトリは private である。公開の quiet-shelf CI では通常ファイルを使用する必要があり、本リポジトリを submodule として取得してはならない。
 
-## Prepare a public snapshot
+## 公開スナップショットの準備
 
-From a local clone of this repository, select the reviewed Core commit SHA and export
-its tracked files into a folder in a quiet-shelf working branch:
+本リポジトリのローカルクローンから、レビュー済みの Core コミット SHA を選択し、追跡対象ファイルを quiet-shelf の作業ブランチ内フォルダへ展開する。
 
 ```sh
 CORE_SHA='reviewed-commit-sha'
@@ -15,21 +13,16 @@ mkdir -p dtv11-core
 git -C /path/to/local/dtv11-core archive "$CORE_SHA" | tar -x -C dtv11-core
 ```
 
-The `dtv11-core` folder contains the Core and its product fixture as ordinary files.
-Do not copy `build/` or add a gitlink. Copy
-`dtv11-core/.github/workflows/quiet-shelf-ci.yml` into the quiet-shelf repository's
-`.github/workflows/core-ci.yml` so GitHub Actions runs the included fixture from its
-subdirectory. The private Core `.github/workflows/ci.yml` remains for Core PRs.
+`dtv11-core` フォルダには、Core と製品 fixture が通常ファイルとして配置される。`build/` をコピーしたり、gitlink を追加したりしてはならない。`dtv11-core/.github/workflows/quiet-shelf-ci.yml` を quiet-shelf リポジトリの `.github/workflows/core-ci.yml` にコピーすることで、GitHub Actions がサブディレクトリから同梱の fixture を実行できるようにする。private な Core の `.github/workflows/ci.yml` は、Core の PR 用としてそのまま残す。
 
 ```sh
 cp dtv11-core/.github/workflows/quiet-shelf-ci.yml \
   /path/to/quiet-shelf/.github/workflows/core-ci.yml
 ```
 
-## Pull request
+## プルリクエスト
 
-Commit the snapshot and workflow on a branch of `Khronos31/quiet-shelf`, then open a
-Japanese-language PR to `main`:
+スナップショットとワークフローを `Khronos31/quiet-shelf` のブランチにコミットし、`main` 宛てに日本語の PR を作成する。
 
 ```sh
 git -C /path/to/quiet-shelf switch main
@@ -43,5 +36,4 @@ gh pr create -R Khronos31/quiet-shelf --base main --head dtv11-core-ci \
   --body 'Coreを通常ファイルとして同梱し、LinuxとMSVCでfixtureのbuildとCLI契約表を確認します。'
 ```
 
-This procedure only describes the later public validation step. This fix task does
-not publish the snapshot or create the quiet-shelf PR.
+この手順は後日の公開検証ステップを説明するものである。本修正タスクではスナップショットの公開や quiet-shelf PR の作成は行わない。

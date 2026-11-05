@@ -4,11 +4,11 @@ project(dtv11_userland_core VERSION 0.1.0 LANGUAGES C CXX)
 
 include(CTest)
 
-add_library(dtv STATIC src/cli.cpp)
-add_library(dtv11::dtv ALIAS dtv)
-target_include_directories(dtv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_features(dtv PUBLIC c_std_11 cxx_std_20)
-set_target_properties(dtv PROPERTIES CXX_EXTENSIONS OFF)
+add_library(dtv-userland STATIC src/cli.cpp)
+add_library(dtv::userland ALIAS dtv-userland)
+target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
+set_target_properties(dtv-userland PROPERTIES CXX_EXTENSIONS OFF)
 
 include(cmake/DtvProduct.cmake)
 

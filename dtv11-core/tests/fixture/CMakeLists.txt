@@ -19,7 +19,7 @@ dtv_add_product(NAME ${PRODUCT_NAME}
 
 if(BUILD_TESTING)
     add_executable(c_consumer consumer.c)
-    target_link_libraries(c_consumer PRIVATE dtv)
+    target_link_libraries(c_consumer PRIVATE dtv::userland)
     add_test(NAME cli_contract_table
         COMMAND ${CMAKE_COMMAND}
             "-DCLI=$<TARGET_FILE:fixturectl>"
