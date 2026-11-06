@@ -57,7 +57,7 @@ std::uint64_t fake_now(void *user)
 dtv_internal_result fake_is_cancelled(void *user, const dtv_cancel *, std::uint32_t *out)
 {
     *out = static_cast<FakeClockState *>(user)->cancelled;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 struct FakeProvider final : dtv::internal::BootUsbProvider {
@@ -80,7 +80,7 @@ struct FakeProvider final : dtv::internal::BootUsbProvider {
         const dtv::internal::UsbDeviceSnapshot &, int, const dtv_runtime_clock *,
         dtv_internal_result *result) override
     {
-        *result = {DTV_INTERNAL_RESULT_UNSUPPORTED, 0};
+        *result = dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
         return nullptr;
     }
 
@@ -92,16 +92,16 @@ struct FakeProvider final : dtv::internal::BootUsbProvider {
         opened_candidates.push_back(snapshot.candidate_id);
         claim_sets.emplace_back(claims.begin(), claims.end());
         if (snapshot.candidate_id == fail_candidate) {
-            *result = {DTV_INTERNAL_RESULT_USB_IO, 23};
+            *result = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 23);
             return nullptr;
         }
         if (std::any_of(claims.begin(), claims.end(), [&](const auto &claim) {
                 return claim.interface_number == fail_interface;
             })) {
-            *result = {DTV_INTERNAL_RESULT_USB_IO, 23};
+            *result = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 23);
             return std::make_unique<Owner>(*this, snapshot.candidate_id);
         }
-        *result = {DTV_INTERNAL_RESULT_OK, 0};
+        *result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         return std::make_unique<Owner>(*this, snapshot.candidate_id);
     }
 };
@@ -109,7 +109,7 @@ struct FakeProvider final : dtv::internal::BootUsbProvider {
 dtv_internal_result create_state(dtv_device_id, dtv_context **out)
 {
     *out = new FunctionState;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 void destroy_state(dtv_context *context)
@@ -131,16 +131,16 @@ dtv_internal_result open_function(dtv_context *context, const dtv_usb_io *io,
         args->usb_observation->port_path_length != 2 ||
         args->interface_number > 1 || args->alternate_setting != 0 ||
         args->usb_observation->interface_count != 2) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
-    if (state->role == fail_open_role) return {DTV_INTERNAL_RESULT_BUSY, 41};
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    if (state->role == fail_open_role) return dtv_internal_result_make(DTV_INTERNAL_RESULT_BUSY, 41);
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result close_function(dtv_context *context, dtv_timeout)
 {
     closed_roles.push_back(static_cast<FunctionState *>(context)->role);
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result identify_function(dtv_context *context, dtv_identify_info *info, dtv_timeout)
@@ -150,13 +150,13 @@ dtv_internal_result identify_function(dtv_context *context, dtv_identify_info *i
     if (state->role == force_unknown_role) {
         info->state = DTV_IDENTIFY_UNKNOWN;
         info->firmware_key = 0;
-        return {DTV_INTERNAL_RESULT_OK, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     const bool written = std::find(written_roles.begin(), written_roles.end(), state->role) !=
                          written_roles.end();
     info->state = written ? DTV_IDENTIFY_RUNTIME : DTV_IDENTIFY_LOADER;
     info->firmware_key = state->role + 100;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result firmware_function(dtv_context *context, std::uint32_t stage, dtv_bytes bytes,
@@ -164,23 +164,23 @@ dtv_internal_result firmware_function(dtv_context *context, std::uint32_t stage,
 {
     auto *state = static_cast<FunctionState *>(context);
     if (timeout.operation_deadline_ns == 0 || bytes.data == nullptr || bytes.size != 3) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     const std::string_view image(reinterpret_cast<const char *>(bytes.data), bytes.size);
     if ((state->role == kFirst && (stage != 41 || image != "abc")) ||
         (state->role == kSecond && (stage != 42 || image != "def")) ||
         (state->role == kOtherDevice && (stage != 43 || image != "abc"))) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, stage};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, stage);
     }
     ++firmware_write_count;
     written_stages.push_back(stage);
     written_roles.push_back(state->role);
     if (state->role == fail_firmware_role && stage == fail_firmware_stage) {
-        return {DTV_INTERNAL_RESULT_USB_IO, 91};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 91);
     }
     if (cancel_on_firmware != nullptr) cancel_on_firmware->cancelled = true;
     result->transition = DTV_FIRMWARE_SAME_HANDLE;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 const dtv::spi::DeviceOps bootstrap_ops{
@@ -230,29 +230,29 @@ dtv_internal_result select_group(const dtv_usb_candidate_info *, std::uint32_t c
     if (force_no_match) {
         *out_count = 0;
         *match = DTV_USB_GROUP_NO_MATCH;
-        return {DTV_INTERNAL_RESULT_OK, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     if (force_ambiguous) {
         *out_count = 0;
         *match = DTV_USB_GROUP_AMBIGUOUS;
-        return {DTV_INTERNAL_RESULT_OK, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     if (force_duplicate_selection) {
         *match = DTV_USB_GROUP_INCOMPLETE;
         *out_count = 2;
         out[0] = {anchor, kFirst, 0, 0};
         out[1] = {anchor, kFirst, force_duplicate_interface ? std::uint8_t{0} : std::uint8_t{1}, 0};
-        return {DTV_INTERNAL_RESULT_OK, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     *match = force_complete ? DTV_USB_GROUP_COMPLETE : DTV_USB_GROUP_INCOMPLETE;
     *out_count = visible_one ? 1 : include_other_device && count > 1 ? 3 : 2;
-    if (*out_count > capacity) return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+    if (*out_count > capacity) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     out[0] = {0, kFirst, static_cast<std::uint8_t>(force_invalid_interface ? 9 : 0),
               static_cast<std::uint8_t>(force_invalid_alternate ? 7 : 0)};
     if (*out_count > 1) out[1] = {0, kSecond,
         static_cast<std::uint8_t>(force_duplicate_interface ? 0 : 1), 0};
     if (*out_count == 3) out[2] = {1, kOtherDevice, 0, 0};
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 const dtv::spi::ModelEntry model{

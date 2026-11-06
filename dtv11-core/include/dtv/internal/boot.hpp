@@ -100,7 +100,7 @@ private:
     std::vector<std::unique_ptr<PhysicalOwner>> owners_;
     std::vector<std::unique_ptr<FunctionContext>> functions_;
     dtv_runtime_clock clock_{};
-    dtv_internal_result open_result_{DTV_INTERNAL_RESULT_OK, 0};
+    dtv_internal_result open_result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     bool closed_ = false;
 };
 

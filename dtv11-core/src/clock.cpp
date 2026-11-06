@@ -22,13 +22,13 @@ uint64_t monotonic_now_ns(void *)
 dtv_internal_result is_cancelled(void *, const dtv_cancel *cancel, uint32_t *cancelled)
 {
     if (cancelled == nullptr) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     if (cancel != nullptr) {
-        return {DTV_INTERNAL_RESULT_UNSUPPORTED, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
     }
     *cancelled = 0;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result delay_until(void *user, uint64_t wake_at_ns,
@@ -36,12 +36,12 @@ dtv_internal_result delay_until(void *user, uint64_t wake_at_ns,
                                 const dtv_cancel *cancel, uint32_t *cancelled)
 {
     if (cancelled == nullptr) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     *cancelled = 0;
     const auto *clock = static_cast<const dtv_runtime_clock *>(user);
     if (clock == nullptr || clock->monotonic_now_ns == nullptr) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     while (true) {
         uint32_t is_cancelled = 0;
@@ -53,14 +53,14 @@ dtv_internal_result delay_until(void *user, uint64_t wake_at_ns,
         }
         if (is_cancelled != 0) {
             *cancelled = 1;
-            return {DTV_INTERNAL_RESULT_OK, 0};
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         }
         const auto now = clock->monotonic_now_ns(clock->user);
         if (now >= operation_deadline_ns) {
-            return {DTV_INTERNAL_RESULT_TIMEOUT, 0};
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
         }
         if (now >= wake_at_ns) {
-            return {DTV_INTERNAL_RESULT_OK, 0};
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         }
         const auto wake = std::min(wake_at_ns, operation_deadline_ns);
         const auto pause = std::min<uint64_t>(wake - now, 1000000);

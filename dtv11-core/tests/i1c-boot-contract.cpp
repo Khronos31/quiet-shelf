@@ -8,6 +8,7 @@
 #include <fstream>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 namespace {
@@ -29,7 +30,7 @@ int cleanup_order = 0;
 int close_order = 0;
 int destroy_order = 0;
 int owner_order = 0;
-dtv_internal_result bootstrap_open_result{DTV_INTERNAL_RESULT_OK, 0};
+dtv_internal_result bootstrap_open_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 uint32_t fake_transition = DTV_FIRMWARE_SAME_HANDLE;
 bool throw_firmware = false;
 uint32_t final_identify_state = DTV_IDENTIFY_RUNTIME;
@@ -60,7 +61,7 @@ struct FakeProvider final : dtv::internal::BootUsbProvider {
         const dtv_runtime_clock *, dtv_internal_result *result) override
     {
         ++opens;
-        *result = {DTV_INTERNAL_RESULT_OK, 0};
+        *result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         return std::make_unique<FakeOwner>();
     }
 };
@@ -76,14 +77,14 @@ dtv_internal_result fake_open(dtv_context *, const dtv_usb_io *io,
         return bootstrap_open_result;
     }
     return args->timeout.operation_deadline_ns != 0
-        ? dtv_internal_result{DTV_INTERNAL_RESULT_OK, 0}
-        : dtv_internal_result{DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        ? dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0)
+        : dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
 }
 
 dtv_internal_result fake_create_state(dtv_device_id, dtv_context **context)
 {
     *context = new int(1);
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 void fake_destroy_state(dtv_context *context)
@@ -97,7 +98,9 @@ dtv_internal_result fake_close(dtv_context *, dtv_timeout)
 {
     ++bootstrap_close_calls;
     close_order = ++cleanup_order;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    auto result = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0x5678);
+    dtv_internal_result_set_diagnostic(&result, "cleanup", 7);
+    return result;
 }
 
 dtv_internal_result fake_identify(dtv_context *, dtv_identify_info *info, dtv_timeout timeout)
@@ -108,7 +111,7 @@ dtv_internal_result fake_identify(dtv_context *, dtv_identify_info *info, dtv_ti
     ++identify_calls;
     info->state = identify_calls == 1 ? DTV_IDENTIFY_LOADER : final_identify_state;
     info->firmware_key = final_firmware_key;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result fake_firmware(dtv_context *, uint32_t stage, dtv_bytes bytes,
@@ -119,13 +122,13 @@ dtv_internal_result fake_firmware(dtv_context *, uint32_t stage, dtv_bytes bytes
     if (stage != 42 || bytes.size != 3 || bytes.data[0] != 'a' ||
         bytes.data[1] != 'b' || bytes.data[2] != 'c' ||
         timeout.operation_deadline_ns == 0) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     if (throw_firmware) {
         throw std::runtime_error("fixture callback failure");
     }
     result->transition = fake_transition;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 const dtv::spi::DeviceOps fake_bootstrap{
@@ -158,13 +161,13 @@ uint64_t fake_clock_now(void *user)
 dtv_internal_result fake_clock_cancelled(void *user, const dtv_cancel *, uint32_t *cancelled)
 {
     *cancelled = static_cast<FakeClockState *>(user)->cancelled;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result fake_clock_delay(void *, uint64_t, uint64_t, const dtv_cancel *, uint32_t *cancelled)
 {
     *cancelled = 0;
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result throwing_create(dtv_device_id, dtv_context **out)
@@ -176,7 +179,7 @@ dtv_internal_result throwing_create(dtv_device_id, dtv_context **out)
 dtv_internal_result failed_create(dtv_device_id, dtv_context **out)
 {
     *out = new State{2};
-    return {DTV_INTERNAL_RESULT_UNSUPPORTED, 37};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 37);
 }
 
 void throwing_destroy(dtv_context *context)
@@ -209,6 +212,68 @@ bool exception_mapping()
     const auto other = dtv::internal::exception_result(std::make_exception_ptr(1));
     return oom.code == DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED && oom.detail == 0 &&
            other.code == DTV_INTERNAL_RESULT_INTERNAL && other.detail == 0;
+}
+
+bool result_diagnostic_values()
+{
+    auto empty = dtv_internal_result_make(DTV_INTERNAL_RESULT_BUSY, 17);
+    if (empty.code != DTV_INTERNAL_RESULT_BUSY || empty.detail != 17 ||
+        dtv_internal_result_diagnostic_length(&empty) != 0) {
+        return false;
+    }
+
+    const char short_text[] = "short diagnostic";
+    dtv_internal_result_set_diagnostic(&empty, short_text, sizeof(short_text) - 1);
+    auto copied = empty;
+    auto independent = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 29);
+    dtv_internal_result_set_diagnostic(&independent, "other", 5);
+    dtv_internal_result_set_diagnostic(&empty, "changed", 7);
+    if (copied.code != DTV_INTERNAL_RESULT_BUSY || copied.detail != 17 ||
+        dtv_internal_result_diagnostic_length(&copied) != sizeof(short_text) - 1 ||
+        copied.diagnostic[0] != 's' || copied.diagnostic[sizeof(short_text) - 2] != 'c' ||
+        independent.code != DTV_INTERNAL_RESULT_USB_IO || independent.detail != 29 ||
+        dtv_internal_result_diagnostic_length(&independent) != 5 ||
+        independent.diagnostic[0] != 'o') {
+        return false;
+    }
+
+    std::string long_text(DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY + 30, 'x');
+    auto truncated = dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 41);
+    dtv_internal_result_set_diagnostic(&truncated, long_text.data(), long_text.size());
+    if (truncated.code != DTV_INTERNAL_RESULT_TIMEOUT || truncated.detail != 41 ||
+        dtv_internal_result_diagnostic_length(&truncated) !=
+            DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY - 1 ||
+        truncated.diagnostic[DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY - 1] != '\0') {
+        return false;
+    }
+
+    auto unterminated = dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 53);
+    for (std::size_t index = 0; index < sizeof(unterminated.diagnostic); ++index) {
+        unterminated.diagnostic[index] = 'z';
+    }
+    return dtv_internal_result_diagnostic_length(&unterminated) ==
+               DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY &&
+           unterminated.code == DTV_INTERNAL_RESULT_INTERNAL && unterminated.detail == 53;
+}
+
+bool concurrent_result_diagnostics()
+{
+    dtv_internal_result first{};
+    dtv_internal_result second{};
+    std::thread first_thread([&] {
+        first = dtv_internal_result_make(DTV_INTERNAL_RESULT_BUSY, 1);
+        dtv_internal_result_set_diagnostic(&first, "first", 5);
+    });
+    std::thread second_thread([&] {
+        second = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 2);
+        dtv_internal_result_set_diagnostic(&second, "second", 6);
+    });
+    first_thread.join();
+    second_thread.join();
+    return first.code == DTV_INTERNAL_RESULT_BUSY && first.detail == 1 &&
+           dtv_internal_result_diagnostic_length(&first) == 5 && first.diagnostic[0] == 'f' &&
+           second.code == DTV_INTERNAL_RESULT_USB_IO && second.detail == 2 &&
+           dtv_internal_result_diagnostic_length(&second) == 6 && second.diagnostic[0] == 's';
 }
 
 bool product_state_cleanup()
@@ -402,7 +467,8 @@ bool same_handle_boot()
         result.code == DTV_INTERNAL_RESULT_TIMEOUT;
     request.cancel = nullptr;
 
-    bootstrap_open_result = {DTV_INTERNAL_RESULT_BUSY, 0x1234};
+    bootstrap_open_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_BUSY, 0x1234);
+    dtv_internal_result_set_diagnostic(&bootstrap_open_result, "primary", 7);
     provider.opens = 0;
     identify_calls = 0;
     firmware_calls = 0;
@@ -418,10 +484,11 @@ bool same_handle_boot()
     auto busy = dtv::internal::boot_selected_candidate(usb, request, &result);
     const bool busy_preserved = !busy && provider.opens == 1 && bootstrap_open_calls == 1 &&
         result.code == DTV_INTERNAL_RESULT_BUSY && result.detail == 0x1234 &&
+        dtv_internal_result_diagnostic_length(&result) == 7 && result.diagnostic[0] == 'p' &&
         identify_calls == 0 && firmware_calls == 0 && bootstrap_close_calls == 1 &&
         product_destroy_calls == 1 && owner_destroy_calls == 1 &&
         close_order < destroy_order && destroy_order < owner_order;
-    bootstrap_open_result = {DTV_INTERNAL_RESULT_OK, 0};
+    bootstrap_open_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
@@ -434,7 +501,8 @@ bool same_handle_boot()
 
 int main()
 {
-    return exception_mapping() && product_state_cleanup() && exact_binding() && clock_deadline() &&
+    return result_diagnostic_values() && concurrent_result_diagnostics() && exception_mapping() &&
+           product_state_cleanup() && exact_binding() && clock_deadline() &&
            boot_rejects_before_open() && same_handle_boot()
         ? 0
         : 1;

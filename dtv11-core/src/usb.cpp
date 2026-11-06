@@ -22,7 +22,7 @@ namespace dtv::internal {
 
 struct UsbContext::State {
     libusb_context *context = nullptr;
-    dtv_internal_result result = {DTV_INTERNAL_RESULT_OK, 0};
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     ~State()
     {
         if (context != nullptr) {
@@ -47,7 +47,7 @@ struct UsbDevice::State {
     libusb_device_handle *handle = nullptr;
     std::vector<int> claimed_interfaces;
     int owned_descriptor = -1;
-    dtv_internal_result open_result = {DTV_INTERNAL_RESULT_OK, 0};
+    dtv_internal_result open_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     dtv_runtime_clock clock{};
     dtv_usb_io io{};
     ~State()
@@ -71,7 +71,7 @@ namespace {
 
 dtv_internal_result make_result(std::int32_t code, std::uint32_t detail = 0)
 {
-    return {code, detail};
+    return dtv_internal_result_make(code, detail);
 }
 
 dtv_internal_result usb_result(int code)

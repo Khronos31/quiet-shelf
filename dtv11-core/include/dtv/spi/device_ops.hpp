@@ -104,7 +104,7 @@ public:
     ProductInstance(const ModelEntry &model, dtv_device_id device) : model_(&model)
     {
         if ((model_->create_state == nullptr) != (model_->destroy_state == nullptr)) {
-            result_ = {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+            result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
             return;
         }
         if (model_->create_state) {
@@ -150,7 +150,7 @@ private:
 
     const ModelEntry *model_;
     dtv_context *context_ = nullptr;
-    dtv_internal_result result_{};
+    dtv_internal_result result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 };
 
 std::span<const ProductEntry *const> product_registry();

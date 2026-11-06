@@ -19,9 +19,10 @@ int main()
         return 2;
     }
 
-    dtv_internal_result result{};
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     if (dtv::internal::open_usb_fd(-1, 0, &result) ||
-        result.code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT) {
+        result.code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT ||
+        dtv_internal_result_diagnostic_length(&result) != 0) {
         return 3;
     }
 

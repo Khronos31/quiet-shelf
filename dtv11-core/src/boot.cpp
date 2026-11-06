@@ -14,7 +14,7 @@ namespace dtv::internal {
 
 namespace {
 
-constexpr dtv_internal_result make_result(int32_t code, uint32_t detail = 0);
+dtv_internal_result make_result(int32_t code, uint32_t detail = 0);
 bool succeeded(dtv_internal_result result);
 
 class UsbBootOwner final : public BootUsbOwner {
@@ -63,9 +63,9 @@ private:
     const UsbContext &usb_;
 };
 
-constexpr dtv_internal_result make_result(int32_t code, uint32_t detail)
+dtv_internal_result make_result(int32_t code, uint32_t detail)
 {
-    return {code, detail};
+    return dtv_internal_result_make(code, detail);
 }
 
 bool succeeded(dtv_internal_result result)
@@ -488,7 +488,7 @@ struct BootGroupSession::FunctionContext {
     dtv_context *context = nullptr;
     void (*destroy_state)(dtv_context *) = nullptr;
     const spi::DeviceOps *runtime_ops = nullptr;
-    dtv_internal_result firmware_failure{DTV_INTERNAL_RESULT_OK, 0};
+    dtv_internal_result firmware_failure = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     bool open_attempted = false;
 };
 

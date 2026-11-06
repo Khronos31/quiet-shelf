@@ -2,6 +2,7 @@
 #ifndef DTV_SPI_TYPES_H
 #define DTV_SPI_TYPES_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include <dtv/types.h>
@@ -20,6 +21,8 @@ typedef uint64_t dtv_stream_id;
 typedef uint32_t dtv_spi_receiver_id;
 typedef uint32_t dtv_function;
 typedef uint64_t dtv_fw_key;
+
+#define DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY 128u
 
 /* OperationRequirement.operationには公開DTV_OP_*と同じ値を指定する。 */
 typedef enum dtv_spi_operation {
@@ -61,7 +64,45 @@ typedef struct dtv_internal_result {
     int32_t code;
     /* 操作固有値。USBの実長・libusb detailの既存意味を保つ。 */
     uint32_t detail;
+    /* 診断専用のNUL終端本文。分岐条件には使わない。 */
+    char diagnostic[DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY];
 } dtv_internal_result;
+
+/* result全体をゼロにしてからcode/detailを設定する。 */
+static inline dtv_internal_result dtv_internal_result_make(int32_t code, uint32_t detail)
+{
+    dtv_internal_result result = {0};
+    result.code = code;
+    result.detail = detail;
+    return result;
+}
+
+/* length byteまでを上限付きでコピーし、必ずNUL終端する。 */
+static inline void dtv_internal_result_set_diagnostic(
+    dtv_internal_result *result, const char *diagnostic, size_t length)
+{
+    size_t copied = 0;
+    if (result == NULL) return;
+    if (diagnostic != NULL) {
+        while (copied < length && copied + 1 < sizeof(result->diagnostic) &&
+               diagnostic[copied] != '\0') {
+            result->diagnostic[copied] = diagnostic[copied];
+            ++copied;
+        }
+    }
+    result->diagnostic[copied] = '\0';
+}
+
+/* NULがない値も配列範囲内でだけ読み取る。 */
+static inline size_t dtv_internal_result_diagnostic_length(const dtv_internal_result *result)
+{
+    size_t length = 0;
+    if (result == NULL) return 0;
+    while (length < sizeof(result->diagnostic) && result->diagnostic[length] != '\0') {
+        ++length;
+    }
+    return length;
+}
 
 /* Descriptor fields are fixed-width observations borrowed for callback duration only. */
 typedef struct dtv_usb_endpoint_info {
@@ -151,7 +192,7 @@ typedef struct dtv_runtime_clock {
  *
  *   dtv_internal_result result = io->bulk_out(io->user, endpoint, bytes, timeout);
  *   if (result.code != DTV_INTERNAL_RESULT_OK) return result;
- *   dtv_internal_result rejected = {DTV_INTERNAL_RESULT_UNSUPPORTED, 0};
+ *   dtv_internal_result rejected = dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
  *   return rejected;
  */
 

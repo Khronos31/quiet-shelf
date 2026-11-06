@@ -131,6 +131,41 @@ extern const dtv::spi::FunctionEntry sample_functions[]{
 };
 ```
 
+## 内部結果と診断メッセージ（dtv_internal_result）
+
+製品コールバックや内部処理が返す `dtv_internal_result`（`include/dtv/spi/types.h`）は、既存の `code`（`int32_t`）および `detail`（`uint32_t`）のフィールド幅・順序・意味を維持したまま、末尾に 128 バイトのインライン診断配列（`char diagnostic[DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY]`、定数 `DTV_INTERNAL_RESULT_DIAGNOSTIC_CAPACITY = 128u`）を追加している。
+
+診断内容は `dtv_internal_result` の値自身が所有するため、コールバック復帰後も値コピーによってその内容と寿命が独立して保持される。スタック上のポインタ、スレッドローカルストレージ（TLS）、共有ミュータブル変数、動的メモリ確保（アロケータ）に依存しない。なお、`diagnostic` に格納される文字列は診断参考情報であり、呼び出し側がエラーコード（`code`）に基づいて行う条件分岐を置き換えるものではない。
+
+### 初期化規則とヘルパー関数
+
+部分代入による未初期化領域の残留を防ぐため、結果オブジェクトは必ず構造体全体をゼロ初期化してから生成する規則とする。C/C++ 共通のインラインヘルパー関数が提供されている。
+
+- `dtv_internal_result dtv_internal_result_make(int32_t code, uint32_t detail)`:
+  構造体全体をゼロ初期化（`{0}`）した上で `code` と `detail` を設定した結果値を返す。
+- `void dtv_internal_result_set_diagnostic(dtv_internal_result *result, const char *diagnostic, size_t length)`:
+  指定された `length` バイトまでを上限付きでコピーし、最大 127 バイトをコピーして末尾を必ず NUL 終端する。元の `code` および `detail` は保持される。
+- `size_t dtv_internal_result_diagnostic_length(const dtv_internal_result *result)`:
+  配列範囲内（最大 128 バイト）でのみ文字数を読み取る。NUL 終端が存在しない場合も配列外アクセスを行わず、安全に最大 128 を返す。
+
+#### 最小の使い方
+
+```c
+dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_IO_ERROR, 0);
+dtv_internal_result_set_diagnostic(&result, "bulk transfer timeout", 21);
+return result;
+```
+
+### ABI 変更と再ビルド
+
+`dtv_internal_result` の値返しサイズが増加したため、内部 ABI が変更されている。旧 SPI で構築された製品アーカイブと新 Core を混在させることはできず、全製品コールバックおよび製品アーカイブを同一の SPI に対して再ビルドする必要がある。
+
+### 公開境界と未決事項
+
+本内部 SPI の診断欄は内部での生成・保持・値伝播を対象としたものであり、公開 L3 の `dtv_error.message` アダプターへの接続は未接続である。
+
+成功時や診断なし時の公開バッファ消去規則、文字エンコーディングおよびマルチバイト文字境界での切詰め処理、ならびに主たる失敗（primary failure）とクリーンアップ失敗（cleanup failure）の個別報告仕様は未決事項として扱われる。本内部 SPI の定義によってこれらに関する公開保証を新たに追加するものではなく、既存のクリーンアップ失敗破棄の動作（主たる失敗がクリーンアップ結果で上書きされない挙動）もそのまま維持される。
+
 ## ライセンスと由来
 
 本リポジトリの Core ソースコードは dtv11 向けに新規作成されたものであり、読み取り専用の参照用 Core からコードをコピーしていない。各ソースファイルおよび文書ファイルには GPL-2.0-or-later の SPDX 識別子が付与されている。将来サードパーティ製ソースを追加する場合は、取り込み前にライセンスの互換性を確認しなければならない。

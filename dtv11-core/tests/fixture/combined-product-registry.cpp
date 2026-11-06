@@ -19,32 +19,32 @@ dtv_internal_result select_group(const dtv_usb_candidate_info *candidates, std::
 {
     ++callback_count;
     if (selection_case == SelectionCase::callback_error) {
-        return {DTV_INTERNAL_RESULT_UNSUPPORTED, 19};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 19);
     }
     if (selection_case == SelectionCase::no_match) {
         *out_count = 0;
         *match = DTV_USB_GROUP_NO_MATCH;
-        return {DTV_INTERNAL_RESULT_OK, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     if (selection_case == SelectionCase::ambiguous) {
         *out_count = 0;
         *match = DTV_USB_GROUP_AMBIGUOUS;
-        return {DTV_INTERNAL_RESULT_OK, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     if (candidates[anchor].port_path_length != 2 || candidates[anchor].interface_count == 0 ||
         candidates[anchor].interfaces[0].endpoint_count != 1) {
-        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     *match = DTV_USB_GROUP_COMPLETE;
     *out_count = selection_case == SelectionCase::empty_complete ? 0 : 2;
-    if (*out_count > capacity) return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+    if (*out_count > capacity) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     const auto first_candidate = use_two_devices && candidate_count == 2 ? 0u : anchor;
     const auto second_candidate = use_two_devices && candidate_count == 2 ? 1u : anchor;
     out[0] = {selection_case == SelectionCase::bad_index ? 4u : first_candidate, 1, 0, 0};
     out[1] = {second_candidate, selection_case == SelectionCase::duplicate_role ? 1u : 2u,
               static_cast<std::uint8_t>(selection_case == SelectionCase::duplicate_interface || use_two_devices ? 0 : 1),
               static_cast<std::uint8_t>(selection_case == SelectionCase::bad_alternate ? 3 : 0)};
-    return {DTV_INTERNAL_RESULT_OK, 0};
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 const dtv_usb_identity cold_ids[]{{0x1234, 0x0001}};
