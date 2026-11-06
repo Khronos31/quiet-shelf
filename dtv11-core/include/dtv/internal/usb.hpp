@@ -11,6 +11,8 @@
 
 namespace dtv::internal {
 
+struct UsbTestDeviceFactory;
+
 struct UsbInterfaceSnapshot {
     dtv_usb_interface_info info{};
     std::vector<dtv_usb_endpoint_info> endpoints;
@@ -40,6 +42,7 @@ struct UsbDeviceSnapshot {
 private:
     std::shared_ptr<State> state_;
     friend class UsbContext;
+    friend struct UsbTestDeviceFactory;
 };
 
 class UsbDevice;
@@ -63,7 +66,9 @@ public:
                                     const dtv_runtime_clock *clock = nullptr) const;
 
 private:
+    explicit UsbContext(std::shared_ptr<State>);
     std::shared_ptr<State> state_;
+    friend struct UsbTestDeviceFactory;
 };
 
 class UsbDevice {

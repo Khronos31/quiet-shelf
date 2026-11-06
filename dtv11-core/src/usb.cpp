@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <condition_variable>
 #include <climits>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,7 @@ namespace {
 
 class LibusbTransferBackend final : public UsbTransferBackend {
 public:
+    int init_context(libusb_context **context) override { return libusb_init(context); }
     libusb_transfer *allocate_transfer() override { return libusb_alloc_transfer(0); }
     void free_transfer(libusb_transfer *transfer) override { libusb_free_transfer(transfer); }
     int submit_transfer(libusb_transfer *transfer) override { return libusb_submit_transfer(transfer); }
@@ -37,6 +39,60 @@ public:
     {
         return libusb_handle_events_timeout(context, timeout);
     }
+    int get_device_descriptor(libusb_device *device,
+                              libusb_device_descriptor *descriptor) override
+    {
+        return libusb_get_device_descriptor(device, descriptor);
+    }
+    std::uint8_t get_bus_number(libusb_device *device) override
+    {
+        return libusb_get_bus_number(device);
+    }
+    std::uint8_t get_device_address(libusb_device *device) override
+    {
+        return libusb_get_device_address(device);
+    }
+    int get_active_config_descriptor(libusb_device *device,
+                                     libusb_config_descriptor **descriptor) override
+    {
+        return libusb_get_active_config_descriptor(device, descriptor);
+    }
+    int get_config_descriptor(libusb_device *device, std::uint8_t index,
+                              libusb_config_descriptor **descriptor) override
+    {
+        return libusb_get_config_descriptor(device, index, descriptor);
+    }
+    void free_config_descriptor(libusb_config_descriptor *descriptor) override
+    {
+        libusb_free_config_descriptor(descriptor);
+    }
+    int open_device(libusb_device *device, libusb_device_handle **handle) override
+    {
+        return libusb_open(device, handle);
+    }
+    int claim_interface(libusb_device_handle *handle, int interface_number) override
+    {
+        return libusb_claim_interface(handle, interface_number);
+    }
+    int set_interface_alt_setting(libusb_device_handle *handle, int interface_number,
+                                  int alternate_setting) override
+    {
+        return libusb_set_interface_alt_setting(handle, interface_number, alternate_setting);
+    }
+    int wrap_sys_device(libusb_context *context, std::intptr_t descriptor,
+                        libusb_device_handle **handle) override
+    {
+        return libusb_wrap_sys_device(context, descriptor, handle);
+    }
+    libusb_device *get_device(libusb_device_handle *handle) override
+    {
+        return libusb_get_device(handle);
+    }
+    libusb_device *ref_device(libusb_device *device) override
+    {
+        return libusb_ref_device(device);
+    }
+    void unref_device(libusb_device *device) override { libusb_unref_device(device); }
     int release_interface(libusb_device_handle *handle, int interface_number) override
     {
         return libusb_release_interface(handle, interface_number);
@@ -100,7 +156,7 @@ struct UsbDeviceSnapshot::State {
     ~State()
     {
         if (device != nullptr) {
-            libusb_unref_device(device);
+            context->backend->unref_device(device);
         }
     }
 };
@@ -506,7 +562,7 @@ dtv_usb_io make_io(void *user, const dtv_runtime_clock *clock)
 
 UsbContext::UsbContext() : state_(std::make_shared<State>())
 {
-    const int result = libusb_init(&state_->context);
+    const int result = state_->backend->init_context(&state_->context);
     if (result != LIBUSB_SUCCESS) {
         state_->result = usb_result(result);
         return;
@@ -519,6 +575,7 @@ UsbContext::UsbContext() : state_(std::make_shared<State>())
 }
 
 UsbContext::~UsbContext() = default;
+UsbContext::UsbContext(std::shared_ptr<State> state) : state_(std::move(state)) {}
 UsbContext::UsbContext(UsbContext &&) noexcept = default;
 UsbContext &UsbContext::operator=(UsbContext &&) noexcept = default;
 
@@ -547,7 +604,7 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
     try {
         for (ssize_t i = 0; i < count; ++i) {
             libusb_device_descriptor descriptor{};
-            if (libusb_get_device_descriptor(devices[i], &descriptor) != LIBUSB_SUCCESS) {
+            if (state_->backend->get_device_descriptor(devices[i], &descriptor) != LIBUSB_SUCCESS) {
                 continue;
             }
             UsbDeviceSnapshot snapshot{};
@@ -557,8 +614,8 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             snapshot.device_class = descriptor.bDeviceClass;
             snapshot.device_subclass = descriptor.bDeviceSubClass;
             snapshot.device_protocol = descriptor.bDeviceProtocol;
-            snapshot.bus_number = libusb_get_bus_number(devices[i]);
-            snapshot.device_address = libusb_get_device_address(devices[i]);
+            snapshot.bus_number = state_->backend->get_bus_number(devices[i]);
+            snapshot.device_address = state_->backend->get_device_address(devices[i]);
             snapshot.configuration_count = descriptor.bNumConfigurations;
             snapshot.candidate_id = static_cast<std::uint64_t>(i) + 1;
             std::uint8_t ports[8]{};
@@ -569,11 +626,15 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             for (std::uint8_t config_index = 0; config_index < descriptor.bNumConfigurations;
                  ++config_index) {
                 libusb_config_descriptor *config = nullptr;
-                if (libusb_get_config_descriptor(devices[i], config_index, &config) != LIBUSB_SUCCESS) {
+                if (state_->backend->get_config_descriptor(devices[i], config_index, &config) !=
+                    LIBUSB_SUCCESS) {
                     continue;
                 }
-                std::unique_ptr<libusb_config_descriptor, decltype(&libusb_free_config_descriptor)>
-                    config_guard(config, &libusb_free_config_descriptor);
+                    std::unique_ptr<libusb_config_descriptor,
+                                    std::function<void(libusb_config_descriptor *)>>
+                    config_guard(config, [backend = state_->backend](auto *value) {
+                        backend->free_config_descriptor(value);
+                    });
                 for (std::uint8_t interface_index = 0; interface_index < config->bNumInterfaces;
                      ++interface_index) {
                     const auto &interface = config->interface[interface_index];
@@ -598,7 +659,7 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             }
             snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
             snapshot.state_->context = state_;
-            snapshot.state_->device = libusb_ref_device(devices[i]);
+            snapshot.state_->device = state_->backend->ref_device(devices[i]);
             snapshots.push_back(std::move(snapshot));
         }
     } catch (...) {
@@ -662,8 +723,8 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
     }
 
     libusb_device_descriptor device_descriptor{};
-    const int descriptor_result = libusb_get_device_descriptor(snapshot.state_->device,
-                                                                &device_descriptor);
+    const int descriptor_result = state_->backend->get_device_descriptor(snapshot.state_->device,
+                                                                           &device_descriptor);
     if (descriptor_result != LIBUSB_SUCCESS) {
         device_state->open_result = usb_result(descriptor_result);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
@@ -675,23 +736,27 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
         device_descriptor.bDeviceSubClass != snapshot.device_subclass ||
         device_descriptor.bDeviceProtocol != snapshot.device_protocol ||
         device_descriptor.bNumConfigurations != snapshot.configuration_count ||
-        libusb_get_bus_number(snapshot.state_->device) != snapshot.bus_number ||
-        libusb_get_device_address(snapshot.state_->device) != snapshot.device_address) {
+        state_->backend->get_bus_number(snapshot.state_->device) != snapshot.bus_number ||
+        state_->backend->get_device_address(snapshot.state_->device) != snapshot.device_address) {
         device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
 
     libusb_config_descriptor *configuration = nullptr;
-    int status = libusb_get_active_config_descriptor(snapshot.state_->device, &configuration);
+    int status = state_->backend->get_active_config_descriptor(snapshot.state_->device,
+                                                               &configuration);
     if (status == LIBUSB_ERROR_NOT_FOUND) {
-        status = libusb_get_config_descriptor(snapshot.state_->device, 0, &configuration);
+        status = state_->backend->get_config_descriptor(snapshot.state_->device, 0,
+                                                         &configuration);
     }
     if (status != LIBUSB_SUCCESS || configuration == nullptr) {
         device_state->open_result = usb_result(status);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    std::unique_ptr<libusb_config_descriptor, decltype(&libusb_free_config_descriptor)>
-        configuration_guard(configuration, &libusb_free_config_descriptor);
+    std::unique_ptr<libusb_config_descriptor, std::function<void(libusb_config_descriptor *)>>
+        configuration_guard(configuration, [backend = state_->backend](auto *value) {
+            backend->free_config_descriptor(value);
+        });
     device_state->binding.handle->claimed_interfaces.reserve(claims.size());
     std::vector<int> seen_interfaces;
     seen_interfaces.reserve(claims.size());
@@ -717,17 +782,18 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
             return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
         }
     }
-    status = libusb_open(snapshot.state_->device, &device_state->binding.handle->handle);
+    status = state_->backend->open_device(snapshot.state_->device,
+                                          &device_state->binding.handle->handle);
     for (const auto &claim : claims) {
         if (status != LIBUSB_SUCCESS) break;
-        status = libusb_claim_interface(device_state->binding.handle->handle,
-                                        claim.interface_number);
+        status = state_->backend->claim_interface(device_state->binding.handle->handle,
+                                                  claim.interface_number);
         if (status != LIBUSB_SUCCESS) break;
         device_state->binding.handle->claimed_interfaces.push_back(claim.interface_number);
         if (claim.alternate_setting != 0) {
-            status = libusb_set_interface_alt_setting(device_state->binding.handle->handle,
-                                                       claim.interface_number,
-                                                       claim.alternate_setting);
+            status = state_->backend->set_interface_alt_setting(
+                device_state->binding.handle->handle, claim.interface_number,
+                claim.alternate_setting);
         }
     }
     if (status != LIBUSB_SUCCESS) {
@@ -738,8 +804,9 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 }
 
-std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
-                                       dtv_internal_result *result)
+std::unique_ptr<UsbDevice> UsbTestDeviceFactory::open_usb_fd_impl(
+    int descriptor, int interface_number, dtv_internal_result *result,
+    std::shared_ptr<UsbTransferBackend> backend)
 {
     auto device_state = std::make_unique<UsbDevice::State>();
     if (result == nullptr || descriptor < 0 || interface_number < 0 || interface_number > 255) {
@@ -757,7 +824,8 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
     device_state->binding.handle = std::make_shared<UsbHandleLease>();
     device_state->binding.handle->context = std::make_shared<UsbContext::State>();
     auto &context = *device_state->binding.handle->context;
-    const int init_result = libusb_init(&context.context);
+    context.backend = std::move(backend);
+    const int init_result = context.backend->init_context(&context.context);
     if (init_result != LIBUSB_SUCCESS) {
         close(owned_descriptor);
         *result = usb_result(init_result);
@@ -770,24 +838,23 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
         *result = exception_result();
         return nullptr;
     }
-    const int wrap_result = libusb_wrap_sys_device(context.context,
-                                                   owned_descriptor,
-                                                   &device_state->binding.handle->handle);
+    const int wrap_result = context.backend->wrap_sys_device(
+        context.context, owned_descriptor, &device_state->binding.handle->handle);
     if (wrap_result != LIBUSB_SUCCESS) {
         close(owned_descriptor);
         *result = usb_result(wrap_result);
         return nullptr;
     }
     device_state->binding.handle->owned_descriptor = owned_descriptor;
-    auto *wrapped_device = libusb_get_device(device_state->binding.handle->handle);
+    auto *wrapped_device = context.backend->get_device(device_state->binding.handle->handle);
     libusb_device_descriptor descriptor_info{};
     libusb_config_descriptor *configuration = nullptr;
     int descriptor_result = wrapped_device == nullptr
         ? LIBUSB_ERROR_NO_DEVICE
-        : libusb_get_device_descriptor(wrapped_device, &descriptor_info);
+        : context.backend->get_device_descriptor(wrapped_device, &descriptor_info);
     if (descriptor_result == LIBUSB_SUCCESS) {
-        descriptor_result = libusb_get_active_config_descriptor(wrapped_device,
-                                                                 &configuration);
+        descriptor_result = context.backend->get_active_config_descriptor(wrapped_device,
+                                                                           &configuration);
     }
     if (descriptor_result != LIBUSB_SUCCESS || configuration == nullptr) {
         device_state->open_result = descriptor_result == LIBUSB_SUCCESS
@@ -805,15 +872,15 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
             }
         }
     }
-    libusb_free_config_descriptor(configuration);
+    context.backend->free_config_descriptor(configuration);
     if (!interface_found) {
         device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
     device_state->binding.handle->claimed_interfaces.reserve(1);
-    const int claim_result = libusb_claim_interface(device_state->binding.handle->handle,
-                                                    interface_number);
+    const int claim_result = context.backend->claim_interface(
+        device_state->binding.handle->handle, interface_number);
     if (claim_result != LIBUSB_SUCCESS) {
         device_state->open_result = usb_result(claim_result);
         *result = device_state->open_result;
@@ -831,22 +898,43 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
 #endif
 }
 
-std::unique_ptr<UsbDevice> UsbTestDeviceFactory::create(
-    std::shared_ptr<UsbTransferBackend> backend, libusb_device_handle *handle,
-    std::vector<int> claimed_interfaces, int owned_descriptor)
+std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
+                                       dtv_internal_result *result)
+{
+    return UsbTestDeviceFactory::open_usb_fd_impl(
+        descriptor, interface_number, result, make_libusb_transfer_backend());
+}
+
+UsbContext UsbTestDeviceFactory::context(std::shared_ptr<UsbTransferBackend> backend)
 {
     auto context = std::make_shared<UsbContext::State>();
     context->backend = std::move(backend);
     context->context = reinterpret_cast<libusb_context *>(1);
     context->start_event_thread();
-    auto state = std::make_unique<UsbDevice::State>();
-    state->binding.handle = std::make_shared<UsbHandleLease>();
-    state->binding.handle->context = std::move(context);
-    state->binding.handle->handle = handle;
-    state->binding.handle->claimed_interfaces = std::move(claimed_interfaces);
-    state->binding.handle->owned_descriptor = owned_descriptor;
-    state->io = make_io(&state->binding, nullptr);
-    return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(state)));
+    return UsbContext(std::move(context));
+}
+
+UsbDeviceSnapshot UsbTestDeviceFactory::snapshot(const UsbContext &context)
+{
+    UsbDeviceSnapshot snapshot{};
+    snapshot.vendor_id = 0x1234;
+    snapshot.product_id = 0x5678;
+    snapshot.device_version = 1;
+    snapshot.bus_number = 1;
+    snapshot.device_address = 2;
+    snapshot.configuration_count = 1;
+    snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
+    snapshot.state_->context = context.state_;
+    snapshot.state_->device = context.state_->backend->ref_device(
+        reinterpret_cast<libusb_device *>(static_cast<std::uintptr_t>(3)));
+    return snapshot;
+}
+
+std::unique_ptr<UsbDevice> UsbTestDeviceFactory::open_usb_fd(
+    int descriptor, int interface_number, dtv_internal_result *result,
+    std::shared_ptr<UsbTransferBackend> backend)
+{
+    return open_usb_fd_impl(descriptor, interface_number, result, std::move(backend));
 }
 
 }

@@ -4,11 +4,14 @@
 #include "usb-transfer-backend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,18 +33,36 @@ struct Completion {
 
 class FakeBackend final : public dtv::internal::UsbTransferBackend {
 public:
+    FakeBackend()
+    {
+        config_.bNumInterfaces = 2;
+        config_.interface = interfaces_;
+        for (std::size_t i = 0; i < 2; ++i) {
+            interfaces_[i].num_altsetting = 1;
+            interfaces_[i].altsetting = &alternate_settings_[i];
+            alternate_settings_[i].bInterfaceNumber = i == 0 ? 1 : 3;
+            alternate_settings_[i].bAlternateSetting = 0;
+        }
+    }
+
+    int init_context(libusb_context **context) override
+    {
+        *context = reinterpret_cast<libusb_context *>(static_cast<std::uintptr_t>(1));
+        return LIBUSB_SUCCESS;
+    }
+
     libusb_transfer *allocate_transfer() override
     {
         std::lock_guard lock(mutex_);
         ++allocated_;
-        return new libusb_transfer{};
+        return static_cast<libusb_transfer *>(std::calloc(1, sizeof(libusb_transfer)));
     }
 
     void free_transfer(libusb_transfer *transfer) override
     {
         std::lock_guard lock(mutex_);
         ++freed_;
-        delete transfer;
+        std::free(transfer);
     }
 
     int submit_transfer(libusb_transfer *transfer) override
@@ -96,10 +117,76 @@ public:
         return LIBUSB_SUCCESS;
     }
 
-    int release_interface(libusb_device_handle *, int) override
+    int get_device_descriptor(libusb_device *, libusb_device_descriptor *descriptor) override
+    {
+        descriptor->idVendor = 0x1234;
+        descriptor->idProduct = 0x5678;
+        descriptor->bcdDevice = 1;
+        descriptor->bNumConfigurations = 1;
+        return LIBUSB_SUCCESS;
+    }
+
+    std::uint8_t get_bus_number(libusb_device *) override { return 1; }
+    std::uint8_t get_device_address(libusb_device *) override { return 2; }
+
+    int get_active_config_descriptor(libusb_device *, libusb_config_descriptor **descriptor) override
+    {
+        *descriptor = &config_;
+        return LIBUSB_SUCCESS;
+    }
+
+    int get_config_descriptor(libusb_device *, std::uint8_t,
+                              libusb_config_descriptor **descriptor) override
+    {
+        *descriptor = &config_;
+        return LIBUSB_SUCCESS;
+    }
+
+    void free_config_descriptor(libusb_config_descriptor *) override {}
+
+    int open_device(libusb_device *, libusb_device_handle **handle) override
+    {
+        std::lock_guard lock(mutex_);
+        ++opened_;
+        *handle = reinterpret_cast<libusb_device_handle *>(static_cast<std::uintptr_t>(4));
+        return LIBUSB_SUCCESS;
+    }
+
+    int claim_interface(libusb_device_handle *, int interface_number) override
+    {
+        std::lock_guard lock(mutex_);
+        claimed_.push_back(interface_number);
+        return LIBUSB_SUCCESS;
+    }
+
+    int set_interface_alt_setting(libusb_device_handle *, int, int) override
+    {
+        return LIBUSB_SUCCESS;
+    }
+
+    int wrap_sys_device(libusb_context *, std::intptr_t descriptor,
+                        libusb_device_handle **handle) override
+    {
+        std::lock_guard lock(mutex_);
+        ++wrapped_;
+        wrapped_descriptor_ = static_cast<int>(descriptor);
+        *handle = reinterpret_cast<libusb_device_handle *>(static_cast<std::uintptr_t>(5));
+        return LIBUSB_SUCCESS;
+    }
+
+    libusb_device *get_device(libusb_device_handle *) override
+    {
+        return reinterpret_cast<libusb_device *>(static_cast<std::uintptr_t>(3));
+    }
+
+    libusb_device *ref_device(libusb_device *device) override { return device; }
+    void unref_device(libusb_device *) override {}
+
+    int release_interface(libusb_device_handle *, int interface_number) override
     {
         std::lock_guard lock(mutex_);
         ++released_;
+        released_interfaces_.push_back(interface_number);
         return LIBUSB_SUCCESS;
     }
 
@@ -150,17 +237,41 @@ public:
         return output_[key];
     }
 
-    bool drained_and_closed()
+    bool drained_and_closed(std::size_t expected_releases = 1)
     {
         std::lock_guard lock(mutex_);
         return active_ == 0 && pending_.empty() && allocated_ == freed_ &&
-               released_ == 1 && closed_ == 1 && exited_ == 1;
+               released_ == expected_releases && closed_ == 1 && exited_ == 1;
     }
 
     bool resources_held_for_completion()
     {
         std::lock_guard lock(mutex_);
         return outstanding_ != 0 && allocated_ > freed_ && released_ == 0 && closed_ == 0;
+    }
+
+    bool opened_one_device_with_claims(std::vector<int> claims)
+    {
+        std::lock_guard lock(mutex_);
+        return opened_ == 1 && claimed_ == claims;
+    }
+
+    bool wrapped_one_fd(int descriptor)
+    {
+        std::lock_guard lock(mutex_);
+        return wrapped_ == 1 && wrapped_descriptor_ == descriptor;
+    }
+
+    int wrapped_descriptor()
+    {
+        std::lock_guard lock(mutex_);
+        return wrapped_descriptor_;
+    }
+
+    bool released_in_order(std::vector<int> interfaces)
+    {
+        std::lock_guard lock(mutex_);
+        return released_interfaces_ == interfaces;
     }
 
     bool event_thread_is_separate(std::thread::id caller)
@@ -180,6 +291,9 @@ private:
     std::vector<Completion> completions_;
     std::vector<std::thread::id> event_threads_;
     std::vector<unsigned char> output_[256];
+    libusb_interface_descriptor alternate_settings_[2]{};
+    libusb_interface interfaces_[2]{};
+    libusb_config_descriptor config_{};
     std::size_t allocated_ = 0;
     std::size_t freed_ = 0;
     std::size_t active_ = 0;
@@ -187,14 +301,28 @@ private:
     std::size_t released_ = 0;
     std::size_t closed_ = 0;
     std::size_t exited_ = 0;
+    std::size_t opened_ = 0;
+    std::size_t wrapped_ = 0;
+    int wrapped_descriptor_ = -1;
+    std::vector<int> claimed_;
+    std::vector<int> released_interfaces_;
 };
 
 bool io_callbacks()
 {
     auto backend = std::make_shared<FakeBackend>();
-    auto device = dtv::internal::UsbTestDeviceFactory::create(
-        backend, reinterpret_cast<libusb_device_handle *>(static_cast<std::uintptr_t>(1)), {1});
-    const dtv_usb_io io = *device->io();
+    const bool callbacks_completed = [&] {
+        auto usb = dtv::internal::UsbTestDeviceFactory::context(backend);
+        auto snapshot = dtv::internal::UsbTestDeviceFactory::snapshot(usb);
+        const std::array claims{
+            dtv::internal::UsbInterfaceClaim{1, 0},
+            dtv::internal::UsbInterfaceClaim{3, 0}
+        };
+        auto device = usb.open(snapshot, claims);
+        if (!device || device->result().code != DTV_INTERNAL_RESULT_OK || !device->io()) {
+            return false;
+        }
+        const dtv_usb_io io = *device->io();
 
     const unsigned char control_out_bytes[]{'c', 't', 'l'};
     dtv_buffer control_out{const_cast<unsigned char *>(control_out_bytes), 3, 3};
@@ -356,8 +484,13 @@ bool io_callbacks()
         !backend->event_thread_is_separate(parallel_callers[1])) {
         return false;
     }
-    device.reset();
-    return backend->drained_and_closed();
+        device.reset();
+        return true;
+    }();
+    const bool drained = backend->drained_and_closed(2);
+    const bool opened = backend->opened_one_device_with_claims({1, 3});
+    const bool released = backend->released_in_order({3, 1});
+    return callbacks_completed && drained && opened && released;
 }
 
 bool request_holds_fd_owner()
@@ -365,15 +498,16 @@ bool request_holds_fd_owner()
 #if defined(__linux__)
     int descriptors[2]{};
     if (pipe(descriptors) != 0) return false;
-    const int owned = fcntl(descriptors[0], F_DUPFD_CLOEXEC, 0);
-    if (owned < 0) {
+    auto backend = std::make_shared<FakeBackend>();
+    dtv_internal_result open_result{};
+    auto device = dtv::internal::UsbTestDeviceFactory::open_usb_fd(
+        descriptors[0], 1, &open_result, backend);
+    if (!device || open_result.code != DTV_INTERNAL_RESULT_OK || !device->io()) {
         close(descriptors[0]);
         close(descriptors[1]);
         return false;
     }
-    auto backend = std::make_shared<FakeBackend>();
-    auto device = dtv::internal::UsbTestDeviceFactory::create(
-        backend, reinterpret_cast<libusb_device_handle *>(static_cast<std::uintptr_t>(2)), {4}, owned);
+    const int owned = backend->wrapped_descriptor();
     const dtv_usb_io io = *device->io();
     unsigned char bytes[]{'f', 'd'};
     dtv_internal_result result{};
@@ -390,8 +524,10 @@ bool request_holds_fd_owner()
     const bool owned_fd_closed = fcntl(owned, F_GETFD) < 0 && errno == EBADF;
     close(descriptors[0]);
     close(descriptors[1]);
-    return submitted && still_owned && held_until_completion && completed && caller_fd_open && owned_fd_closed &&
-           result.code == DTV_INTERNAL_RESULT_OK && backend->drained_and_closed();
+    return submitted && owned >= 0 && owned != descriptors[0] &&
+           backend->wrapped_one_fd(owned) && still_owned && held_until_completion && completed &&
+           caller_fd_open && owned_fd_closed && result.code == DTV_INTERNAL_RESULT_OK &&
+           backend->drained_and_closed() && backend->released_in_order({1});
 #else
     return true;
 #endif
