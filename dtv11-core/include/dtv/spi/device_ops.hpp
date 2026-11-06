@@ -16,14 +16,14 @@ struct DeviceOps {
     dtv_internal_result (*identify)(dtv_context *, dtv_identify_info *, dtv_timeout);
     dtv_internal_result (*firmware)(dtv_context *, uint32_t, dtv_bytes, dtv_firmware_result *,
                            dtv_timeout);
-    dtv_internal_result (*tune_t)(dtv_context *, dtv_receiver, uint32_t, uint64_t,
+    dtv_internal_result (*tune_t)(dtv_context *, dtv_spi_receiver_id, uint32_t, uint64_t,
                          dtv_spi_tune_result *, dtv_timeout);
-    dtv_internal_result (*signal)(dtv_context *, dtv_receiver, dtv_signal_result *, dtv_timeout);
-    dtv_internal_result (*ts_prepare)(dtv_context *, dtv_receiver, uint64_t,
+    dtv_internal_result (*signal)(dtv_context *, dtv_spi_receiver_id, dtv_signal_result *, dtv_timeout);
+    dtv_internal_result (*ts_prepare)(dtv_context *, dtv_spi_receiver_id, uint64_t,
                              const dtv_stream_program *, dtv_timeout);
     dtv_internal_result (*service_tick)(dtv_context *, const dtv_usb_io *, uint64_t, dtv_timeout);
-    dtv_internal_result (*ts_transform)(dtv_context *, dtv_receiver, dtv_bytes, dtv_buffer *);
-    dtv_internal_result (*ts_stop_device)(dtv_context *, dtv_receiver, dtv_timeout);
+    dtv_internal_result (*ts_transform)(dtv_context *, dtv_spi_receiver_id, dtv_bytes, dtv_buffer *);
+    dtv_internal_result (*ts_stop_device)(dtv_context *, dtv_spi_receiver_id, dtv_timeout);
     dtv_internal_result (*close)(dtv_context *, dtv_timeout);
     dtv_internal_result (*card_uart_write_byte)(dtv_context *, uint8_t, dtv_timeout);
     dtv_internal_result (*card_uart_read_byte)(dtv_context *, uint8_t *, dtv_timeout);

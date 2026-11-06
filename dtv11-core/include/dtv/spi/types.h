@@ -16,9 +16,15 @@ typedef struct dtv_signal_result dtv_signal_result;
 
 typedef uint64_t dtv_device_id;
 typedef uint64_t dtv_stream_id;
-typedef uint32_t dtv_receiver;
+typedef uint32_t dtv_spi_receiver_id;
 typedef uint32_t dtv_function;
 typedef uint64_t dtv_fw_key;
+
+typedef struct dtv_spi_measurement {
+    uint64_t value;
+    uint32_t valid;
+    uint32_t unit;
+} dtv_spi_measurement;
 
 typedef struct dtv_timeout {
     uint64_t timeout_ms;
@@ -124,7 +130,7 @@ struct dtv_spi_tune_result {
 };
 
 struct dtv_signal_result {
-    dtv_measurement *measurements;
+    dtv_spi_measurement *measurements;
     uint32_t capacity;
     uint32_t count;
 };
