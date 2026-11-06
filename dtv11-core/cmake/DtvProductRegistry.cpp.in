@@ -1,38 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include <array>
-#include <cstddef>
-#include <span>
-
 #include <dtv/spi/device_ops.hpp>
 
 namespace dtv::spi {
 
 @model_declarations@
 
-std::span<const ModelEntry *const> product_models()
-{
-    static const std::array<const ModelEntry *, @PRODUCT_MODELS_COUNT@> models{{
-@model_values@    }};
-    return {models.data(), models.size()};
-}
+extern const ProductEntry @PRODUCT_ENTRY_SYMBOL@{
+    "@PRODUCT_NAME@",
+    [] {
+        static const ModelEntry *const models[] = {
+@model_values@        };
+        return models;
+    }(),
+    @PRODUCT_MODELS_COUNT@
+};
 
-}
-
-extern "C" dtv_result dtv_model_count(uint32_t *out_count)
-{
-    if (out_count == nullptr) {
-        return {DTV_ERROR_INVALID_ARGUMENT, 0};
-    }
-    *out_count = static_cast<uint32_t>(dtv::spi::product_models().size());
-    return {DTV_ERROR_OK, 0};
-}
-
-extern "C" dtv_result dtv_model_get(uint32_t index, dtv_model_info *out_model)
-{
-    const auto models = dtv::spi::product_models();
-    if (out_model == nullptr || index >= models.size()) {
-        return {DTV_ERROR_INVALID_ARGUMENT, 0};
-    }
-    *out_model = models[index]->model;
-    return {DTV_ERROR_OK, 0};
 }

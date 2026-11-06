@@ -47,6 +47,7 @@ add_library(dtv-userland STATIC
     src/boot.cpp
     src/cli.cpp
     src/clock.cpp
+    src/discovery.cpp
     src/firmware.cpp
     src/result.cpp
     src/usb.cpp)

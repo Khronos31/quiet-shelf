@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <climits>
 #include <limits>
+#include <memory>
 #include <utility>
 
 #include <libusb.h>
@@ -305,6 +306,42 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             snapshot.bus_number = libusb_get_bus_number(devices[i]);
             snapshot.device_address = libusb_get_device_address(devices[i]);
             snapshot.configuration_count = descriptor.bNumConfigurations;
+            snapshot.candidate_id = static_cast<std::uint64_t>(i) + 1;
+            std::uint8_t ports[8]{};
+            const int port_count = libusb_get_port_numbers(devices[i], ports, sizeof(ports));
+            if (port_count > 0) {
+                snapshot.port_path.assign(ports, ports + port_count);
+            }
+            for (std::uint8_t config_index = 0; config_index < descriptor.bNumConfigurations;
+                 ++config_index) {
+                libusb_config_descriptor *config = nullptr;
+                if (libusb_get_config_descriptor(devices[i], config_index, &config) != LIBUSB_SUCCESS) {
+                    continue;
+                }
+                std::unique_ptr<libusb_config_descriptor, decltype(&libusb_free_config_descriptor)>
+                    config_guard(config, &libusb_free_config_descriptor);
+                for (std::uint8_t interface_index = 0; interface_index < config->bNumInterfaces;
+                     ++interface_index) {
+                    const auto &interface = config->interface[interface_index];
+                    for (int alt_index = 0; alt_index < interface.num_altsetting; ++alt_index) {
+                        const auto &alt = interface.altsetting[alt_index];
+                        UsbInterfaceSnapshot view{};
+                        view.info.configuration = config->bConfigurationValue;
+                        view.info.interface_number = alt.bInterfaceNumber;
+                        view.info.alternate_setting = alt.bAlternateSetting;
+                        view.info.class_code = alt.bInterfaceClass;
+                        view.info.subclass_code = alt.bInterfaceSubClass;
+                        view.info.protocol_code = alt.bInterfaceProtocol;
+                        for (std::uint8_t endpoint_index = 0; endpoint_index < alt.bNumEndpoints;
+                             ++endpoint_index) {
+                            const auto &endpoint = alt.endpoint[endpoint_index];
+                            view.endpoints.push_back({endpoint.bEndpointAddress, endpoint.bmAttributes,
+                                                      endpoint.wMaxPacketSize, endpoint.bInterval});
+                        }
+                        snapshot.interfaces.push_back(std::move(view));
+                    }
+                }
+            }
             snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
             snapshot.state_->context = state_;
             snapshot.state_->device = libusb_ref_device(devices[i]);

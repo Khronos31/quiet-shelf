@@ -10,6 +10,11 @@
 
 namespace dtv::internal {
 
+struct UsbInterfaceSnapshot {
+    dtv_usb_interface_info info{};
+    std::vector<dtv_usb_endpoint_info> endpoints;
+};
+
 struct UsbDeviceSnapshot {
     struct State;
     struct State;
@@ -22,6 +27,9 @@ struct UsbDeviceSnapshot {
     std::uint8_t bus_number;
     std::uint8_t device_address;
     std::uint8_t configuration_count;
+    std::uint64_t candidate_id = 0;
+    std::vector<std::uint8_t> port_path;
+    std::vector<UsbInterfaceSnapshot> interfaces;
 
 private:
     std::shared_ptr<State> state_;

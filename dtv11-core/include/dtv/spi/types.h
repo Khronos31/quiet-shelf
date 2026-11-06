@@ -45,6 +45,61 @@ typedef struct dtv_internal_result {
     uint32_t detail;
 } dtv_internal_result;
 
+/* Descriptor fields are fixed-width observations borrowed for selector invocation only. */
+typedef struct dtv_usb_endpoint_info {
+    uint8_t address;
+    uint8_t attributes;
+    uint16_t max_packet_size;
+    uint8_t interval;
+} dtv_usb_endpoint_info;
+
+typedef struct dtv_usb_interface_info {
+    uint8_t configuration;
+    uint8_t interface_number;
+    uint8_t alternate_setting;
+    uint8_t class_code;
+    uint8_t subclass_code;
+    uint8_t protocol_code;
+    const dtv_usb_endpoint_info *endpoints;
+    uint32_t endpoint_count;
+} dtv_usb_interface_info;
+
+typedef struct dtv_usb_candidate_info {
+    uint64_t candidate_id;
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint16_t device_version;
+    uint8_t bus_number;
+    uint8_t device_address;
+    const uint8_t *port_path;
+    uint32_t port_path_length;
+    const dtv_usb_interface_info *interfaces;
+    uint32_t interface_count;
+} dtv_usb_candidate_info;
+
+typedef struct dtv_usb_function_selection {
+    uint32_t candidate_index;
+    dtv_function function;
+    uint8_t interface_number;
+    uint8_t alternate_setting;
+} dtv_usb_function_selection;
+
+typedef enum dtv_usb_group_match {
+    DTV_USB_GROUP_NO_MATCH = 0,
+    DTV_USB_GROUP_COMPLETE = 1,
+    DTV_USB_GROUP_AMBIGUOUS = 2
+} dtv_usb_group_match;
+
+typedef struct dtv_usb_identity {
+    uint16_t vendor_id;
+    uint16_t product_id;
+} dtv_usb_identity;
+
+/* capacity is the complete one-shot selection capacity; outputs are borrowed for this call. */
+typedef dtv_internal_result (*dtv_select_usb_group_fn)(
+    const dtv_usb_candidate_info *, uint32_t, uint32_t,
+    dtv_usb_function_selection *, uint32_t, uint32_t *, dtv_usb_group_match *);
+
 enum dtv_internal_result_code {
     DTV_INTERNAL_RESULT_OK = 0, /* 操作成功。 */
     DTV_INTERNAL_RESULT_INVALID_ARGUMENT = 2, /* callbackへの入力が不正。 */

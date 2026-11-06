@@ -47,7 +47,7 @@ extern const ModelEntry fixture_one_model{
 }
 ```
 
-機種表、`product_models()`、および生成 main から呼ばれる C 型モデルアクセサは Core の CMake が生成し、製品側に定型登録コードは不要である。fixture の実例は `tests/fixture/lib/fixture_one.cpp` と `fixture_two.cpp` を参照すること。
+各製品archiveは一意な製品登録symbolを持つ。consumerは使う製品を `dtv_add_product_aggregate(target PRODUCTS ...)` で明示し、そのaggregateが製品・所属model一覧とC型model accessorを提供する。複数製品を同じconsumerへlinkするときも同じaggregateへ列挙する。既存の `dtv_add_product` と `ModelEntry` initializerは変更不要である。fixtureのaggregate例は `tests/fixture/CMakeLists.txt` を参照すること。
 
 `include/dtv/cli.h` は、生成された main や非 C++ クライアントが使用する L3 C ABI である。`include/dtv/spi/types.h` は製品 SPI の C 互換値型を定義し、`include/dtv/spi/device_ops.hpp` はそれを使う C++ 製品向け SPI aggregate を定義する。文字列やコールバックテーブルは静的記憶域から借用され、プロセスの生存期間中は常に有効である。C API に渡されるバッファの所有権は呼び出し側にあり、API が呼び出し側所有のメモリを保持することはない。また、C ABI の規約に C++ 例外は含まれない。
 

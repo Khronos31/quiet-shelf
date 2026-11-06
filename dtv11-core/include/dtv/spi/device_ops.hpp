@@ -44,6 +44,16 @@ struct ModelEntry {
     dtv_internal_result (*create_state)(dtv_device_id, dtv_context **);
     void (*destroy_state)(dtv_context *);
     const DeviceOps *bootstrap_ops;
+    /* Explicit loader/cold USB identities; runtime model IDs are never inferred as cold IDs. */
+    const dtv_usb_identity *cold_identities = nullptr;
+    std::size_t cold_identity_count = 0;
+    dtv_select_usb_group_fn select_usb_group = nullptr;
+};
+
+struct ProductEntry {
+    const char *product_id;
+    const ModelEntry *const *models;
+    std::size_t model_count;
 };
 
 class ProductInstance {
@@ -100,7 +110,7 @@ private:
     dtv_internal_result result_{};
 };
 
-std::span<const ModelEntry *const> product_models();
+std::span<const ProductEntry *const> product_registry();
 
 }
 
