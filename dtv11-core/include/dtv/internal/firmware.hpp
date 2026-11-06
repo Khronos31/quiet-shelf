@@ -60,7 +60,7 @@ public:
 private:
     friend FirmwarePreflightResult load_firmware_package(
         std::span<const uint8_t>, std::span<const FirmwarePackageImageSpec>,
-        VerifiedFirmwarePackage *);
+        VerifiedFirmwarePackage *, std::uint64_t, const char *);
     std::vector<std::vector<uint8_t>> images_;
 };
 
@@ -69,7 +69,8 @@ FirmwarePreflightResult load_firmware_bundle(
     std::span<const FirmwareImageSpec> images, VerifiedFirmwareBundle *out_bundle);
 FirmwarePreflightResult load_firmware_package(
     std::span<const uint8_t> package, std::span<const FirmwarePackageImageSpec> images,
-    VerifiedFirmwarePackage *out_package);
+    VerifiedFirmwarePackage *out_package, std::uint64_t expected_package_size = 0,
+    const char *expected_package_sha256 = nullptr);
 
 }
 

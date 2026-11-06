@@ -11,6 +11,7 @@ namespace {
 constexpr dtv_function kFirst = 10;
 constexpr dtv_function kSecond = 20;
 constexpr dtv_function kOtherDevice = 30;
+constexpr char kAbcdefHash[] = "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721";
 constexpr char kAbcHash[] = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 constexpr char kDefHash[] = "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34";
 constexpr char kWrongHash[] = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -168,7 +169,7 @@ dtv_internal_result firmware_function(dtv_context *context, std::uint32_t stage,
     const std::string_view image(reinterpret_cast<const char *>(bytes.data), bytes.size);
     if ((state->role == kFirst && (stage != 41 || image != "abc")) ||
         (state->role == kSecond && (stage != 42 || image != "def")) ||
-        state->role == kOtherDevice) {
+        (state->role == kOtherDevice && (stage != 43 || image != "abc"))) {
         return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, stage};
     }
     ++firmware_write_count;
@@ -203,11 +204,11 @@ dtv::spi::FunctionFirmwareStage second_stages[]{{42, 0, DTV_IDENTIFY_LOADER,
                                                   DTV_IDENTIFY_RUNTIME}};
 const dtv::spi::FunctionFirmwareStage other_stages[]{{43, 0, DTV_IDENTIFY_LOADER,
                                                        DTV_IDENTIFY_RUNTIME}};
-const dtv::spi::FunctionEntry function_entries[]{
+dtv::spi::FunctionEntry function_entries[]{
     {kFirst, &bootstrap_ops, first_runtime_entries, 1, first_images, 1, first_stages, 1,
-     create_state, destroy_state},
+     create_state, destroy_state, 6, kAbcdefHash},
     {kSecond, &bootstrap_ops, second_runtime_entries, 1, second_images, 1, second_stages, 1,
-     create_state, destroy_state},
+     create_state, destroy_state, 6, kAbcdefHash},
     {kOtherDevice, &bootstrap_ops, other_runtime_entries, 1, other_images, 1, other_stages, 1,
      create_state, destroy_state},
 };
@@ -418,6 +419,14 @@ bool same_handle_package()
     }
 
     std::array<std::uint8_t, 6> package{'a', 'b', 'c', 'd', 'e', 'f'};
+    std::array<std::uint8_t, 7> package_with_extra{'a', 'b', 'c', 'd', 'e', 'f', 'x'};
+    const auto extra_byte = session->send_firmware(0,
+        {package_with_extra.data(), package_with_extra.size()}, {1000, 0});
+    std::array<std::uint8_t, 5> short_package{'a', 'b', 'c', 'd', 'e'};
+    const auto short_input = session->send_firmware(0,
+        {short_package.data(), short_package.size()}, {1000, 0});
+    if (extra_byte.code == DTV_INTERNAL_RESULT_OK || short_input.code == DTV_INTERNAL_RESULT_OK ||
+        firmware_write_count != 0 || !identify_roles.empty()) return false;
     const auto bad_hash = session->send_firmware(0, {package.data(), package.size()}, {1000, 0});
     if (bad_hash.code == DTV_INTERNAL_RESULT_OK || firmware_write_count != 0 ||
         !identify_roles.empty()) return false;
@@ -428,14 +437,45 @@ bool same_handle_package()
     if (bad_stage.code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT || firmware_write_count != 0 ||
         !identify_roles.empty()) return false;
 
+    function_entries[1].expected_package_size = 7;
+    const auto conflicting_size = session->send_firmware(0,
+        {package.data(), package.size()}, {1000, 0});
+    function_entries[1].expected_package_size = 6;
+    if (conflicting_size.code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT || firmware_write_count != 0 ||
+        !identify_roles.empty()) return false;
+    function_entries[1].expected_package_sha256 = kWrongHash;
+    const auto conflicting_hash = session->send_firmware(0,
+        {package.data(), package.size()}, {1000, 0});
+    function_entries[1].expected_package_sha256 = kAbcdefHash;
+    if (conflicting_hash.code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT || firmware_write_count != 0 ||
+        !identify_roles.empty()) return false;
+
+    function_entries[0].expected_package_sha256 = kWrongHash;
+    function_entries[1].expected_package_sha256 = kWrongHash;
+    const auto bad_package_hash = session->send_firmware(0,
+        {package.data(), package.size()}, {1000, 0});
+    function_entries[0].expected_package_sha256 = kAbcdefHash;
+    function_entries[1].expected_package_sha256 = kAbcdefHash;
+    if (bad_package_hash.code == DTV_INTERNAL_RESULT_OK || firmware_write_count != 0 ||
+        !identify_roles.empty()) return false;
+
     const auto completed = session->send_firmware(0, {package.data(), package.size()}, {1000, 0});
     const bool package_ok = completed.code == DTV_INTERNAL_RESULT_OK && firmware_write_count == 2 &&
         written_stages == std::vector<std::uint32_t>{41, 42} &&
         session->ops(kFirst) == &first_runtime && session->ops(kSecond) == &second_runtime &&
         session->ops(kOtherDevice) == nullptr;
+    std::array<std::uint8_t, 106> offset_package{};
+    offset_package[100] = 'a';
+    offset_package[101] = 'b';
+    offset_package[102] = 'c';
+    const auto other_completed = session->send_firmware(1,
+        {offset_package.data(), offset_package.size()}, {1000, 0});
+    const bool other_package_ok = other_completed.code == DTV_INTERNAL_RESULT_OK &&
+        firmware_write_count == 3 && written_stages == std::vector<std::uint32_t>{41, 42, 43} &&
+        session->ops(kOtherDevice) == &other_runtime;
     session.reset();
     const bool reverse_release = provider.released_candidates == std::vector<std::uint64_t>{2, 1};
-    return package_ok && reverse_release;
+    return package_ok && other_package_ok && reverse_release;
 }
 
 bool failed_claim_and_open_cleanup()

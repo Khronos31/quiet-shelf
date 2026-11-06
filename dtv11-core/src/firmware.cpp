@@ -261,10 +261,25 @@ FirmwarePreflightResult load_firmware_bundle(
 
 FirmwarePreflightResult load_firmware_package(
     std::span<const uint8_t> package, std::span<const FirmwarePackageImageSpec> images,
-    VerifiedFirmwarePackage *out_package)
+    VerifiedFirmwarePackage *out_package, std::uint64_t expected_package_size,
+    const char *expected_package_sha256)
 {
     if (out_package) out_package->images_.clear();
     if (!out_package || images.empty()) return fail(FirmwarePreflightError::InvalidArgument, 0);
+    if (expected_package_size != 0 && package.size() != expected_package_size) {
+        return fail(FirmwarePreflightError::SizeMismatch, 0);
+    }
+    if (expected_package_sha256 != nullptr) {
+        std::array<uint8_t, 32> expected_hash{};
+        if (!parse_sha256(expected_package_sha256, &expected_hash)) {
+            return fail(FirmwarePreflightError::InvalidHash, 0);
+        }
+        Sha256 sha256;
+        sha256.update(package);
+        if (sha256.finish() != expected_hash) {
+            return fail(FirmwarePreflightError::HashMismatch, 0);
+        }
+    }
     VerifiedFirmwarePackage verified;
     try {
         verified.images_.reserve(images.size());

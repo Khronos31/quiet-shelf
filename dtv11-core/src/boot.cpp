@@ -724,10 +724,26 @@ dtv_internal_result BootGroupSession::send_firmware(
         std::vector<FunctionContext *> targets;
         std::vector<FirmwarePackageImageSpec> specs;
         std::vector<std::size_t> image_bases;
+        std::uint64_t expected_package_size = 0;
+        const char *expected_package_sha256 = nullptr;
         for (const auto &state : functions_) {
             if (state->candidate_index != candidate_index) continue;
             const auto *entry = state->entry;
             if (entry->image_count == 0 && entry->stage_count == 0) continue;
+            if (entry->expected_package_size != 0) {
+                if (expected_package_size != 0 &&
+                    expected_package_size != entry->expected_package_size) {
+                    return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                }
+                expected_package_size = entry->expected_package_size;
+            }
+            if (entry->expected_package_sha256 != nullptr) {
+                if (expected_package_sha256 != nullptr &&
+                    std::string_view(expected_package_sha256) != entry->expected_package_sha256) {
+                    return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                }
+                expected_package_sha256 = entry->expected_package_sha256;
+            }
             if (entry->images == nullptr || entry->image_count == 0 ||
                 (entry->stage_count != 0 && entry->stages == nullptr)) {
                 return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
@@ -776,7 +792,8 @@ dtv_internal_result BootGroupSession::send_firmware(
         if (!succeeded(status)) return status;
         VerifiedFirmwarePackage verified;
         const auto preflight = load_firmware_package(
-            std::span<const std::uint8_t>(package.data, package.size), specs, &verified);
+            std::span<const std::uint8_t>(package.data, package.size), specs, &verified,
+            expected_package_size, expected_package_sha256);
         const auto preflight_status = preflight_result(preflight);
         if (!succeeded(preflight_status)) return preflight_status;
         status = checkpoint(clock_, deadline, cancel);

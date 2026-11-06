@@ -61,6 +61,10 @@ struct FunctionEntry {
     std::size_t stage_count;
     dtv_internal_result (*create_state)(dtv_device_id, dtv_context **);
     void (*destroy_state)(dtv_context *);
+    /* 0ならpackage全長の指定なし。指定時は入力全体と一致させる。 */
+    std::uint64_t expected_package_size = 0;
+    /* nullptrならpackage全体hashの指定なし。imageごとのhash検証とは独立する。 */
+    const char *expected_package_sha256 = nullptr;
 };
 
 struct OperationRequirement {
