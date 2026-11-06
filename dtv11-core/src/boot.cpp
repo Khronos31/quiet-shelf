@@ -488,6 +488,7 @@ struct BootGroupSession::FunctionContext {
     dtv_context *context = nullptr;
     void (*destroy_state)(dtv_context *) = nullptr;
     const spi::DeviceOps *runtime_ops = nullptr;
+    dtv_internal_result firmware_failure{DTV_INTERNAL_RESULT_OK, 0};
     bool open_attempted = false;
 };
 
@@ -715,6 +716,11 @@ dtv_internal_result BootGroupSession::send_firmware(
         if ((package.size != 0 && package.data == nullptr) || timeout.timeout_ms == 0) {
             return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
         }
+        for (const auto &state : functions_) {
+            if (state->candidate_index == candidate_index && !succeeded(state->firmware_failure)) {
+                return state->firmware_failure;
+            }
+        }
         std::vector<FunctionContext *> targets;
         std::vector<FirmwarePackageImageSpec> specs;
         std::vector<std::size_t> image_bases;
@@ -821,7 +827,10 @@ dtv_internal_result BootGroupSession::send_firmware(
                             state.entry->stages[stage_index].stage,
                             {image.data(), image.size()}, &firmware_result, remaining);
                     });
-                    if (!succeeded(status)) return status;
+                    if (!succeeded(status)) {
+                        state.firmware_failure = status;
+                        return status;
+                    }
                     status = checkpoint(clock_, deadline, cancel);
                     if (!succeeded(status)) return status;
                     if (firmware_result.transition != DTV_FIRMWARE_SAME_HANDLE) {

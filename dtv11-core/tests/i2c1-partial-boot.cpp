@@ -28,6 +28,8 @@ std::vector<dtv_function> written_roles;
 std::vector<std::uint32_t> identify_roles;
 std::uint32_t firmware_write_count = 0;
 dtv_function fail_open_role = 0;
+dtv_function fail_firmware_role = 0;
+std::uint32_t fail_firmware_stage = 0;
 struct FakeClockState {
     std::uint64_t now_ns = 0;
     bool cancelled = false;
@@ -172,6 +174,9 @@ dtv_internal_result firmware_function(dtv_context *context, std::uint32_t stage,
     ++firmware_write_count;
     written_stages.push_back(stage);
     written_roles.push_back(state->role);
+    if (state->role == fail_firmware_role && stage == fail_firmware_stage) {
+        return {DTV_INTERNAL_RESULT_USB_IO, 91};
+    }
     if (cancel_on_firmware != nullptr) cancel_on_firmware->cancelled = true;
     result->transition = DTV_FIRMWARE_SAME_HANDLE;
     return {DTV_INTERNAL_RESULT_OK, 0};
@@ -303,6 +308,8 @@ void reset_observations()
     identify_roles.clear();
     firmware_write_count = 0;
     fail_open_role = 0;
+    fail_firmware_role = 0;
+    fail_firmware_stage = 0;
     force_unknown_role = 0;
 }
 
@@ -478,6 +485,46 @@ bool failed_claim_and_open_cleanup()
         open_failure.released_candidates == std::vector<std::uint64_t>{1};
 }
 
+bool failed_stage_blocks_retry_and_closes()
+{
+    reset_observations();
+    force_no_match = force_ambiguous = force_duplicate_selection = false;
+    include_other_device = false;
+    second_images[0].sha256 = kDefHash;
+    auto group = discover();
+    dtv::internal::UsbContext usb;
+    FakeProvider provider;
+    dtv_internal_result result{};
+    auto session = dtv::internal::open_boot_group(usb, group, 99, {1000, 0}, nullptr,
+                                                  nullptr, &provider, &result);
+    if (!session || result.code != DTV_INTERNAL_RESULT_OK) return false;
+
+    std::array<std::uint8_t, 6> package{'a', 'b', 'c', 'd', 'e', 'f'};
+    fail_firmware_role = kFirst;
+    fail_firmware_stage = 41;
+    const auto failed = session->send_firmware(0, {package.data(), package.size()}, {1000, 0});
+    fail_firmware_role = 0;
+    fail_firmware_stage = 0;
+    const auto identify_count = identify_roles.size();
+    if (failed.code != DTV_INTERNAL_RESULT_USB_IO || failed.detail != 91 ||
+        firmware_write_count != 1 || written_stages != std::vector<std::uint32_t>{41} ||
+        session->context(kFirst) == nullptr || session->context(kSecond) == nullptr) {
+        return false;
+    }
+
+    const auto retry = session->send_firmware(0, {package.data(), package.size()}, {1000, 0});
+    if (retry.code != failed.code || retry.detail != failed.detail || firmware_write_count != 1 ||
+        written_stages != std::vector<std::uint32_t>{41} || identify_roles.size() != identify_count) {
+        return false;
+    }
+    session->close();
+    const bool closed = closed_roles == std::vector<dtv_function>{kSecond, kFirst} &&
+        destroyed_roles == std::vector<dtv_function>{kSecond, kFirst} &&
+        provider.released_candidates == std::vector<std::uint64_t>{1};
+    session.reset();
+    return closed;
+}
+
 bool deadline_and_unknown_boundaries()
 {
     second_images[0].sha256 = kDefHash;
@@ -525,5 +572,5 @@ bool deadline_and_unknown_boundaries()
 int main()
 {
     return partial_and_ambiguous() && same_handle_package() && failed_claim_and_open_cleanup() &&
-        deadline_and_unknown_boundaries() ? 0 : 1;
+        failed_stage_blocks_retry_and_closes() && deadline_and_unknown_boundaries() ? 0 : 1;
 }
