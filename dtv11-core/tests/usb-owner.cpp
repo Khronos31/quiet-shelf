@@ -42,5 +42,9 @@ int main()
     }
     close(descriptors[0]);
     close(descriptors[1]);
+#elif defined(_WIN32)
+    if (dtv::internal::open_usb_fd(1, 0, &result) || result.code != 3) {
+        return 8;
+    }
 #endif
 }

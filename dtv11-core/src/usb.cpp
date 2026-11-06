@@ -80,15 +80,26 @@ dtv_result usb_result(int code)
     return make_result(usb_error, static_cast<std::uint32_t>(-code));
 }
 
-bool valid_timeout(dtv_timeout timeout, unsigned int *milliseconds)
+enum class TimeoutConversion {
+    ready,
+    no_wait,
+    invalid
+};
+
+TimeoutConversion transfer_timeout(dtv_timeout timeout, unsigned int *milliseconds)
 {
     if (timeout.timeout_ms == 0) {
-        return false;
+        return TimeoutConversion::no_wait;
     }
-    *milliseconds = timeout.timeout_ms > UINT_MAX
-                        ? UINT_MAX
-                        : static_cast<unsigned int>(timeout.timeout_ms);
-    return true;
+    if (timeout.timeout_ms == UINT64_MAX) {
+        *milliseconds = 0;
+        return TimeoutConversion::ready;
+    }
+    if (timeout.timeout_ms > UINT_MAX) {
+        return TimeoutConversion::invalid;
+    }
+    *milliseconds = static_cast<unsigned int>(timeout.timeout_ms);
+    return TimeoutConversion::ready;
 }
 
 dtv_result invalid()
@@ -109,10 +120,18 @@ dtv_result control_transfer(void *user, std::uint8_t request_type,
     auto *state = static_cast<UsbDevice::State *>(user);
     unsigned int milliseconds;
     if (state == nullptr || state->handle == nullptr || data == nullptr ||
-        !valid_timeout(timeout, &milliseconds) || data->capacity > UINT16_MAX ||
+        data->capacity > UINT16_MAX ||
         data->size > data->capacity ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
+    }
+    const auto timeout_conversion = transfer_timeout(timeout, &milliseconds);
+    if (timeout_conversion == TimeoutConversion::invalid) {
+        return invalid();
+    }
+    if (timeout_conversion == TimeoutConversion::no_wait) {
+        data->size = 0;
+        return make_result(timeout_error);
     }
     const bool input = (request_type & LIBUSB_ENDPOINT_IN) != 0;
     const auto length = input ? data->capacity : data->size;
@@ -123,6 +142,9 @@ dtv_result control_transfer(void *user, std::uint8_t request_type,
         return usb_result(transferred);
     }
     data->size = static_cast<std::uint64_t>(transferred);
+    if (!input && data->size != length) {
+        return make_result(usb_error, static_cast<std::uint32_t>(transferred));
+    }
     return make_result(0);
 }
 
@@ -132,17 +154,26 @@ dtv_result bulk_out_transfer(void *user, std::uint8_t endpoint,
     auto *state = static_cast<UsbDevice::State *>(user);
     unsigned int milliseconds;
     if (state == nullptr || state->handle == nullptr || data.size > INT_MAX ||
-        (data.size != 0 && data.data == nullptr) ||
-        !valid_timeout(timeout, &milliseconds)) {
+        (data.size != 0 && data.data == nullptr)) {
         return invalid();
+    }
+    const auto timeout_conversion = transfer_timeout(timeout, &milliseconds);
+    if (timeout_conversion == TimeoutConversion::invalid) {
+        return invalid();
+    }
+    if (timeout_conversion == TimeoutConversion::no_wait) {
+        return make_result(timeout_error);
     }
     int transferred = 0;
     const int result = libusb_bulk_transfer(
         state->handle, endpoint, const_cast<unsigned char *>(data.data),
         static_cast<int>(data.size), &transferred, milliseconds);
-    return result == LIBUSB_SUCCESS
+    if (result != LIBUSB_SUCCESS) {
+        return usb_result(result);
+    }
+    return static_cast<std::uint64_t>(transferred) == data.size
         ? make_result(0, static_cast<std::uint32_t>(transferred))
-        : usb_result(result);
+        : make_result(usb_error, static_cast<std::uint32_t>(transferred));
 }
 
 dtv_result input_transfer(void *user, std::uint8_t endpoint,
@@ -153,9 +184,16 @@ dtv_result input_transfer(void *user, std::uint8_t endpoint,
     unsigned int milliseconds;
     if (state == nullptr || state->handle == nullptr || data == nullptr ||
         data->capacity > INT_MAX ||
-        (data->capacity != 0 && data->data == nullptr) ||
-        !valid_timeout(timeout, &milliseconds)) {
+        (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
+    }
+    const auto timeout_conversion = transfer_timeout(timeout, &milliseconds);
+    if (timeout_conversion == TimeoutConversion::invalid) {
+        return invalid();
+    }
+    if (timeout_conversion == TimeoutConversion::no_wait) {
+        data->size = 0;
+        return make_result(timeout_error);
     }
     int transferred = 0;
     const int result = interrupt
@@ -269,7 +307,9 @@ dtv_result UsbDevice::result() const
 
 const dtv_usb_io *UsbDevice::io() const
 {
-    return state_ && state_->handle != nullptr ? &state_->io : nullptr;
+    return state_ && state_->handle != nullptr && state_->interface_number >= 0
+               ? &state_->io
+               : nullptr;
 }
 
 std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
