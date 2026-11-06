@@ -8,6 +8,8 @@
 
 #include <libusb.h>
 
+#include <dtv/internal/result.hpp>
+
 #if defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -43,6 +45,7 @@ struct UsbDevice::State {
     int interface_number = -1;
     int owned_descriptor = -1;
     dtv_internal_result open_result = {DTV_INTERNAL_RESULT_OK, 0};
+    dtv_runtime_clock clock{};
     dtv_usb_io io{};
     ~State()
     {
@@ -81,19 +84,38 @@ enum class TimeoutConversion {
     invalid
 };
 
-TimeoutConversion transfer_timeout(dtv_timeout timeout, unsigned int *milliseconds)
+TimeoutConversion transfer_timeout(dtv_timeout timeout, const dtv_runtime_clock *clock,
+                                   unsigned int *milliseconds,
+                                   dtv_internal_result *failure)
 {
-    if (timeout.timeout_ms == 0) {
+    auto timeout_ms = timeout.timeout_ms;
+    if (timeout.operation_deadline_ns != 0 && timeout.operation_deadline_ns != UINT64_MAX &&
+        clock != nullptr && clock->monotonic_now_ns != nullptr) {
+        uint64_t now = 0;
+        try {
+            now = clock->monotonic_now_ns(clock->user);
+        } catch (...) {
+            *failure = exception_result();
+            return TimeoutConversion::invalid;
+        }
+        if (now >= timeout.operation_deadline_ns) {
+            return TimeoutConversion::no_wait;
+        }
+        const auto remaining_ns = timeout.operation_deadline_ns - now;
+        const auto remaining_ms = remaining_ns / 1000000 + (remaining_ns % 1000000 != 0 ? 1 : 0);
+        timeout_ms = std::min(timeout_ms, remaining_ms);
+    }
+    if (timeout_ms == 0) {
         return TimeoutConversion::no_wait;
     }
-    if (timeout.timeout_ms == UINT64_MAX) {
+    if (timeout_ms == UINT64_MAX) {
         *milliseconds = 0;
         return TimeoutConversion::ready;
     }
-    if (timeout.timeout_ms > UINT_MAX) {
+    if (timeout_ms > UINT_MAX) {
         return TimeoutConversion::invalid;
     }
-    *milliseconds = static_cast<unsigned int>(timeout.timeout_ms);
+    *milliseconds = static_cast<unsigned int>(timeout_ms);
     return TimeoutConversion::ready;
 }
 
@@ -115,15 +137,17 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
 {
     auto *state = static_cast<UsbDevice::State *>(user);
     unsigned int milliseconds;
+    dtv_internal_result failure = invalid();
     if (state == nullptr || state->handle == nullptr || data == nullptr ||
         data->capacity > UINT16_MAX ||
         data->size > data->capacity ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, &milliseconds);
+    const auto timeout_conversion = transfer_timeout(timeout, state->io.clock,
+                                                     &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
-        return invalid();
+        return failure;
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
         data->size = 0;
@@ -149,13 +173,15 @@ dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
 {
     auto *state = static_cast<UsbDevice::State *>(user);
     unsigned int milliseconds;
+    dtv_internal_result failure = invalid();
     if (state == nullptr || state->handle == nullptr || data.size > INT_MAX ||
         (data.size != 0 && data.data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, &milliseconds);
+    const auto timeout_conversion = transfer_timeout(timeout, state->io.clock,
+                                                     &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
-        return invalid();
+        return failure;
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
@@ -178,14 +204,16 @@ dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
 {
     auto *state = static_cast<UsbDevice::State *>(user);
     unsigned int milliseconds;
+    dtv_internal_result failure = invalid();
     if (state == nullptr || state->handle == nullptr || data == nullptr ||
         data->capacity > INT_MAX ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, &milliseconds);
+    const auto timeout_conversion = transfer_timeout(timeout, state->io.clock,
+                                                     &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
-        return invalid();
+        return failure;
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
         data->size = 0;
@@ -219,10 +247,10 @@ dtv_internal_result interrupt_in_transfer(void *user, std::uint8_t endpoint,
     return input_transfer(user, endpoint, data, timeout, true);
 }
 
-dtv_usb_io make_io(void *user)
+dtv_usb_io make_io(void *user, const dtv_runtime_clock *clock)
 {
     return {user, control_transfer, bulk_out_transfer,
-            bulk_in_transfer, interrupt_in_transfer};
+            bulk_in_transfer, interrupt_in_transfer, clock};
 }
 
 }
@@ -309,9 +337,13 @@ const dtv_usb_io *UsbDevice::io() const
 }
 
 std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
-                                             int interface_number) const
+                                             int interface_number,
+                                             const dtv_runtime_clock *clock) const
 {
     auto device_state = std::make_unique<UsbDevice::State>();
+    if (clock != nullptr) {
+        device_state->clock = *clock;
+    }
     device_state->context = state_;
     if (!state_ || state_->context == nullptr || !snapshot.state_ ||
         snapshot.state_->context != state_ || interface_number < 0 || interface_number > 255) {
@@ -372,7 +404,7 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
     device_state->interface_number = interface_number;
-    device_state->io = make_io(device_state.get());
+    device_state->io = make_io(device_state.get(), clock != nullptr ? &device_state->clock : nullptr);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 }
 
@@ -447,7 +479,7 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
     device_state->interface_number = interface_number;
-    device_state->io = make_io(device_state.get());
+    device_state->io = make_io(device_state.get(), nullptr);
     *result = make_result(DTV_INTERNAL_RESULT_OK);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 #else

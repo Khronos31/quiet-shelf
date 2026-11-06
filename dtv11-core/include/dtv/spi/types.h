@@ -22,6 +22,8 @@ typedef uint64_t dtv_fw_key;
 
 typedef struct dtv_timeout {
     uint64_t timeout_ms;
+    /* 全callback/転送で共有する単調時計上の絶対期限。0は指定なし。 */
+    uint64_t operation_deadline_ns;
 } dtv_timeout;
 
 struct dtv_open_args {
@@ -42,8 +44,20 @@ enum dtv_internal_result_code {
     DTV_INTERNAL_RESULT_INVALID_ARGUMENT = 2, /* callbackへの入力が不正。 */
     DTV_INTERNAL_RESULT_UNSUPPORTED = 3, /* 有効な操作だが機種・OS等で非対応。 */
     DTV_INTERNAL_RESULT_USB_IO = 7, /* USB I/O失敗。 */
-    DTV_INTERNAL_RESULT_TIMEOUT = 10 /* 期限切れ、または即時確認時に未完了。 */
+    DTV_INTERNAL_RESULT_TIMEOUT = 10, /* 期限切れ、または即時確認時に未完了。 */
+    DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED = 11, /* Coreまたは製品の資源不足。 */
+    DTV_INTERNAL_RESULT_INTERNAL = 12 /* その他の予期しない例外。 */
 };
+
+typedef struct dtv_runtime_clock {
+    void *user;
+    uint64_t (*monotonic_now_ns)(void *);
+    /* wake、期限、cancelのいずれかまで待つ。cancel時はcancelledを非0にする。 */
+    dtv_internal_result (*delay_until)(void *, uint64_t, uint64_t,
+                                       const dtv_cancel *, uint32_t *);
+    /* Core runtimeが所有するcancel状態の照会。未接続tokenはUNSUPPORTEDを返す。 */
+    dtv_internal_result (*is_cancelled)(void *, const dtv_cancel *, uint32_t *);
+} dtv_runtime_clock;
 
 /*
  * 成功判定はcode == DTV_INTERNAL_RESULT_OKだけで行う。製品callbackはUSB結果を
@@ -66,6 +80,8 @@ typedef struct dtv_usb_io {
     dtv_internal_result (*bulk_out)(void *, uint8_t, dtv_bytes, dtv_timeout);
     dtv_internal_result (*bulk_in)(void *, uint8_t, dtv_buffer *, dtv_timeout);
     dtv_internal_result (*interrupt_in)(void *, uint8_t, dtv_buffer *, dtv_timeout);
+    /* transport generationの寿命中だけ借用できるCore clock view。 */
+    const dtv_runtime_clock *clock;
 } dtv_usb_io;
 
 typedef struct dtv_pid_route {
@@ -85,7 +101,13 @@ typedef struct dtv_stream_program {
 
 struct dtv_identify_info {
     dtv_fw_key firmware_key;
+    /* DTV_IDENTIFY_*。firmware_keyはRUNTIME時だけ有効。 */
+    uint32_t state;
 };
+
+#define DTV_IDENTIFY_UNKNOWN 0u
+#define DTV_IDENTIFY_LOADER 1u
+#define DTV_IDENTIFY_RUNTIME 2u
 
 #define DTV_FIRMWARE_SAME_HANDLE 0u
 #define DTV_FIRMWARE_REENUMERATE 1u

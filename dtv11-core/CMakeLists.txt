@@ -43,7 +43,13 @@ if(NOT DTV_LIBUSB_HAS_FD_WRAPPER)
     message(FATAL_ERROR "libusb 1.0.23 or newer with libusb_wrap_sys_device is required")
 endif()
 
-add_library(dtv-userland STATIC src/cli.cpp src/firmware.cpp src/usb.cpp)
+add_library(dtv-userland STATIC
+    src/boot.cpp
+    src/cli.cpp
+    src/clock.cpp
+    src/firmware.cpp
+    src/result.cpp
+    src/usb.cpp)
 add_library(dtv::userland ALIAS dtv-userland)
 target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
@@ -60,4 +66,7 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(firmware_preflight_contract tests/firmware-preflight.cpp)
     target_link_libraries(firmware_preflight_contract PRIVATE dtv::userland)
     add_test(NAME firmware_preflight_contract COMMAND firmware_preflight_contract)
+    add_executable(i1c_boot_contract tests/i1c-boot-contract.cpp)
+    target_link_libraries(i1c_boot_contract PRIVATE dtv::userland)
+    add_test(NAME i1c_boot_contract COMMAND i1c_boot_contract)
 endif()

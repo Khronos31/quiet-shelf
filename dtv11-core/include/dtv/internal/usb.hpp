@@ -42,7 +42,8 @@ public:
 
     dtv_internal_result result() const;
     std::vector<UsbDeviceSnapshot> enumerate(dtv_internal_result *result = nullptr) const;
-    std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &, int interface_number) const;
+    std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &, int interface_number,
+                                    const dtv_runtime_clock *clock = nullptr) const;
 
 private:
     std::shared_ptr<State> state_;

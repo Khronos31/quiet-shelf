@@ -6,6 +6,7 @@
 #include <span>
 
 #include <dtv/cli.h>
+#include <dtv/internal/result.hpp>
 #include <dtv/spi/types.h>
 
 namespace dtv::spi {
@@ -42,21 +43,38 @@ struct ModelEntry {
     std::size_t firmware_count;
     dtv_internal_result (*create_state)(dtv_device_id, dtv_context **);
     void (*destroy_state)(dtv_context *);
+    const DeviceOps *bootstrap_ops;
 };
 
 class ProductInstance {
 public:
     ProductInstance(const ModelEntry &model, dtv_device_id device) : model_(&model)
     {
+        if ((model_->create_state == nullptr) != (model_->destroy_state == nullptr)) {
+            result_ = {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+            return;
+        }
         if (model_->create_state) {
-            result_ = model_->create_state(device, &context_);
+            dtv_context *temporary = nullptr;
+            result_ = dtv::internal::call_callback([&] {
+                return model_->create_state(device, &temporary);
+            });
+            if (result_.code == DTV_INTERNAL_RESULT_OK) {
+                context_ = temporary;
+            } else if (temporary != nullptr) {
+                destroy(temporary);
+            }
         }
     }
 
-    ~ProductInstance()
+    ~ProductInstance() { reset(); }
+
+    void reset() noexcept
     {
-        if (context_ && model_->destroy_state) {
-            model_->destroy_state(context_);
+        auto *context = context_;
+        context_ = nullptr;
+        if (context && model_->destroy_state) {
+            destroy(context);
         }
     }
 
@@ -67,6 +85,16 @@ public:
     dtv_internal_result result() const { return result_; }
 
 private:
+    void destroy(dtv_context *context) noexcept
+    {
+        if (model_->destroy_state) {
+            try {
+                model_->destroy_state(context);
+            } catch (...) {
+            }
+        }
+    }
+
     const ModelEntry *model_;
     dtv_context *context_ = nullptr;
     dtv_internal_result result_{};
