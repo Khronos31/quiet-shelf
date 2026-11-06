@@ -9,17 +9,19 @@
 int main()
 {
     dtv::internal::UsbContext context;
-    if (context.result().code != 0) {
+    if (context.result().code != DTV_INTERNAL_RESULT_OK) {
         return 1;
     }
     dtv::internal::UsbDeviceSnapshot invalid_snapshot{};
     auto invalid_device = context.open(invalid_snapshot, 0);
-    if (invalid_device->result().code != 2 || invalid_device->io() != nullptr) {
+    if (invalid_device->result().code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT ||
+        invalid_device->io() != nullptr) {
         return 2;
     }
 
     dtv_internal_result result{};
-    if (dtv::internal::open_usb_fd(-1, 0, &result) || result.code != 2) {
+    if (dtv::internal::open_usb_fd(-1, 0, &result) ||
+        result.code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT) {
         return 3;
     }
 
@@ -32,7 +34,7 @@ int main()
         return 5;
     }
     auto wrapped = dtv::internal::open_usb_fd(descriptors[0], 0, &result);
-    if (result.code == 0 || fcntl(descriptors[0], F_GETFD) < 0 ||
+    if (result.code == DTV_INTERNAL_RESULT_OK || fcntl(descriptors[0], F_GETFD) < 0 ||
         (wrapped != nullptr && wrapped->io() != nullptr)) {
         return 6;
     }
@@ -43,7 +45,8 @@ int main()
     close(descriptors[0]);
     close(descriptors[1]);
 #elif defined(_WIN32)
-    if (dtv::internal::open_usb_fd(1, 0, &result) || result.code != 3) {
+    if (dtv::internal::open_usb_fd(1, 0, &result) ||
+        result.code != DTV_INTERNAL_RESULT_UNSUPPORTED) {
         return 8;
     }
 #endif

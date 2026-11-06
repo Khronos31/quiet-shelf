@@ -16,7 +16,8 @@ int main()
     {
         ProductInstance first{fixture_one_model, 11};
         ProductInstance second{fixture_one_model, 12};
-        if (first.result().code != 0 || second.result().code != 0 ||
+        if (first.result().code != DTV_INTERNAL_RESULT_OK ||
+            second.result().code != DTV_INTERNAL_RESULT_OK ||
             !first.context() || !second.context() || first.context() == second.context()) {
             return 1;
         }
@@ -24,7 +25,7 @@ int main()
         dtv_identify_info info{};
         const auto result = fixture_one_model.firmware[0].ops->identify(
             first.context(), &info, {});
-        if (result.code != 0 || info.firmware_key != 11) {
+        if (result.code != DTV_INTERNAL_RESULT_OK || info.firmware_key != 11) {
             return 2;
         }
     }

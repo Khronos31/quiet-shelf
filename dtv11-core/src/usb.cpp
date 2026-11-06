@@ -17,7 +17,7 @@ namespace dtv::internal {
 
 struct UsbContext::State {
     libusb_context *context = nullptr;
-    dtv_internal_result result = {0, 0};
+    dtv_internal_result result = {DTV_INTERNAL_RESULT_OK, 0};
     ~State()
     {
         if (context != nullptr) {
@@ -42,7 +42,7 @@ struct UsbDevice::State {
     libusb_device_handle *handle = nullptr;
     int interface_number = -1;
     int owned_descriptor = -1;
-    dtv_internal_result open_result = {0, 0};
+    dtv_internal_result open_result = {DTV_INTERNAL_RESULT_OK, 0};
     dtv_usb_io io{};
     ~State()
     {
@@ -62,11 +62,6 @@ struct UsbDevice::State {
 
 namespace {
 
-constexpr std::int32_t invalid_argument = 2;
-constexpr std::int32_t unsupported = 3;
-constexpr std::int32_t usb_error = 7;
-constexpr std::int32_t timeout_error = 10;
-
 dtv_internal_result make_result(std::int32_t code, std::uint32_t detail = 0)
 {
     return {code, detail};
@@ -75,9 +70,9 @@ dtv_internal_result make_result(std::int32_t code, std::uint32_t detail = 0)
 dtv_internal_result usb_result(int code)
 {
     if (code == LIBUSB_ERROR_TIMEOUT) {
-        return make_result(timeout_error, static_cast<std::uint32_t>(-code));
+        return make_result(DTV_INTERNAL_RESULT_TIMEOUT, static_cast<std::uint32_t>(-code));
     }
-    return make_result(usb_error, static_cast<std::uint32_t>(-code));
+    return make_result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(-code));
 }
 
 enum class TimeoutConversion {
@@ -104,12 +99,13 @@ TimeoutConversion transfer_timeout(dtv_timeout timeout, unsigned int *millisecon
 
 dtv_internal_result invalid()
 {
-    return make_result(invalid_argument);
+    return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
 }
 
 dtv_internal_result no_context()
 {
-    return make_result(usb_error, static_cast<std::uint32_t>(-LIBUSB_ERROR_OTHER));
+    return make_result(DTV_INTERNAL_RESULT_USB_IO,
+                       static_cast<std::uint32_t>(-LIBUSB_ERROR_OTHER));
 }
 
 dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
@@ -131,7 +127,7 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
         data->size = 0;
-        return make_result(timeout_error);
+        return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
     const bool input = (request_type & LIBUSB_ENDPOINT_IN) != 0;
     const auto length = input ? data->capacity : data->size;
@@ -143,9 +139,9 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
     }
     data->size = static_cast<std::uint64_t>(transferred);
     if (!input && data->size != length) {
-        return make_result(usb_error, static_cast<std::uint32_t>(transferred));
+        return make_result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(transferred));
     }
-    return make_result(0);
+    return make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
@@ -162,7 +158,7 @@ dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
         return invalid();
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
-        return make_result(timeout_error);
+        return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
     int transferred = 0;
     const int result = libusb_bulk_transfer(
@@ -172,8 +168,8 @@ dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
         return usb_result(result);
     }
     return static_cast<std::uint64_t>(transferred) == data.size
-        ? make_result(0, static_cast<std::uint32_t>(transferred))
-        : make_result(usb_error, static_cast<std::uint32_t>(transferred));
+        ? make_result(DTV_INTERNAL_RESULT_OK, static_cast<std::uint32_t>(transferred))
+        : make_result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(transferred));
 }
 
 dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
@@ -193,7 +189,7 @@ dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
         data->size = 0;
-        return make_result(timeout_error);
+        return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
     int transferred = 0;
     const int result = interrupt
@@ -208,7 +204,7 @@ dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
         return usb_result(result);
     }
     data->size = static_cast<std::uint64_t>(transferred);
-    return make_result(0);
+    return make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result bulk_in_transfer(void *user, std::uint8_t endpoint,
@@ -292,7 +288,7 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
     }
     libusb_free_device_list(devices, 1);
     if (result != nullptr) {
-        *result = make_result(0);
+        *result = make_result(DTV_INTERNAL_RESULT_OK);
     }
     return snapshots;
 }
@@ -339,7 +335,7 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
         device_descriptor.bNumConfigurations != snapshot.configuration_count ||
         libusb_get_bus_number(snapshot.state_->device) != snapshot.bus_number ||
         libusb_get_device_address(snapshot.state_->device) != snapshot.device_address) {
-        device_state->open_result = make_result(unsupported);
+        device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
 
@@ -363,7 +359,7 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
     }
     libusb_free_config_descriptor(configuration);
     if (!interface_found) {
-        device_state->open_result = make_result(unsupported);
+        device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
 
@@ -424,7 +420,7 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
     }
     if (descriptor_result != LIBUSB_SUCCESS || configuration == nullptr) {
         device_state->open_result = descriptor_result == LIBUSB_SUCCESS
-            ? make_result(unsupported)
+            ? make_result(DTV_INTERNAL_RESULT_UNSUPPORTED)
             : usb_result(descriptor_result);
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
@@ -440,7 +436,7 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
     }
     libusb_free_config_descriptor(configuration);
     if (!interface_found) {
-        device_state->open_result = make_result(unsupported);
+        device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
@@ -452,12 +448,12 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
     }
     device_state->interface_number = interface_number;
     device_state->io = make_io(device_state.get());
-    *result = make_result(0);
+    *result = make_result(DTV_INTERNAL_RESULT_OK);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 #else
     (void)descriptor;
     (void)interface_number;
-    *result = make_result(unsupported);
+    *result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
     return nullptr;
 #endif
 }

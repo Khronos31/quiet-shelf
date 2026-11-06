@@ -31,10 +31,33 @@ struct dtv_open_args {
 };
 
 typedef struct dtv_internal_result {
-    /* 内部SPI/USB用番号。dtv_resultの公開L3番号へ直接コピーしない。 */
+    /* dtv_internal_result_code。dtv_resultとは別の番号空間。 */
     int32_t code;
+    /* 操作固有値。USBの実長・libusb detailの既存意味を保つ。 */
     uint32_t detail;
 } dtv_internal_result;
+
+enum dtv_internal_result_code {
+    DTV_INTERNAL_RESULT_OK = 0, /* 操作成功。 */
+    DTV_INTERNAL_RESULT_INVALID_ARGUMENT = 2, /* callbackへの入力が不正。 */
+    DTV_INTERNAL_RESULT_UNSUPPORTED = 3, /* 有効な操作だが機種・OS等で非対応。 */
+    DTV_INTERNAL_RESULT_USB_IO = 7, /* USB I/O失敗。 */
+    DTV_INTERNAL_RESULT_TIMEOUT = 10 /* 期限切れ、または即時確認時に未完了。 */
+};
+
+/*
+ * 成功判定はcode == DTV_INTERNAL_RESULT_OKだけで行う。製品callbackはUSB結果を
+ * dtv_internal_resultのまま伝播できる。detailは共通化・変換せず保持する。
+ * USBではlibusb失敗のdetailはlibusb errorの絶対値、short OUTと成功bulk OUTの
+ * detailは転送byte数、INの実長はbuffer->sizeであり、local拒否/即時timeoutは0。
+ * 製品自身の拒否は同じ内部番号で作る。後続の公開API境界では明示的にmappingし、
+ * 公開dtv_resultへ数値cast/aliasしてはならない。
+ *
+ *   dtv_internal_result result = io->bulk_out(io->user, endpoint, bytes, timeout);
+ *   if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+ *   dtv_internal_result rejected = {DTV_INTERNAL_RESULT_UNSUPPORTED, 0};
+ *   return rejected;
+ */
 
 typedef struct dtv_usb_io {
     void *user;
