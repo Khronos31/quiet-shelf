@@ -65,6 +65,7 @@ struct FunctionEntry {
 
 struct OperationRequirement {
     dtv_spi_receiver_id receiver;
+    /* dtv_spi_operationを使用する。公開DTV_OP_*と値・意味を共有する。 */
     std::uint32_t operation;
     const dtv_function *functions;
     std::size_t function_count;

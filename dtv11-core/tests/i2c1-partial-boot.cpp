@@ -216,9 +216,9 @@ const dtv_function required_first[]{kFirst};
 const dtv_function required_first_and_second[]{kFirst, kSecond};
 const dtv_function required_all[]{kFirst, kSecond, kOtherDevice};
 const dtv::spi::OperationRequirement operation_requirements[]{
-    {7, 1, required_first, 1},
-    {7, 2, required_first_and_second, 2},
-    {7, 3, required_all, 3},
+    {7, DTV_SPI_OPERATION_LNB_POWER, required_first, 1},
+    {7, DTV_SPI_OPERATION_CARD, required_first_and_second, 2},
+    {7, DTV_SPI_OPERATION_OUTPUT_PID_FILTER, required_all, 3},
 };
 
 dtv_internal_result select_group(const dtv_usb_candidate_info *, std::uint32_t count,
@@ -320,17 +320,17 @@ bool partial_and_ambiguous()
     auto group = discover();
     if (group.match != DTV_USB_GROUP_INCOMPLETE || group.functions.size() != 2 ||
         group.snapshots.size() != 1 ||
-        dtv::internal::check_operation_requirements(group, 7, 1).code != DTV_INTERNAL_RESULT_OK ||
-        dtv::internal::check_operation_requirements(group, 7, 2).code != DTV_INTERNAL_RESULT_OK ||
-        dtv::internal::check_operation_requirements(group, 7, 3).code != DTV_INTERNAL_RESULT_NOT_READY) {
+        dtv::internal::check_operation_requirements(group, 7, DTV_SPI_OPERATION_LNB_POWER).code != DTV_INTERNAL_RESULT_OK ||
+        dtv::internal::check_operation_requirements(group, 7, DTV_SPI_OPERATION_CARD).code != DTV_INTERNAL_RESULT_OK ||
+        dtv::internal::check_operation_requirements(group, 7, DTV_SPI_OPERATION_OUTPUT_PID_FILTER).code != DTV_INTERNAL_RESULT_NOT_READY) {
         return false;
     }
     visible_one = true;
     auto one_visible = discover();
     visible_one = false;
     if (one_visible.match != DTV_USB_GROUP_INCOMPLETE || one_visible.functions.size() != 1 ||
-        dtv::internal::check_operation_requirements(one_visible, 7, 1).code != DTV_INTERNAL_RESULT_OK ||
-        dtv::internal::check_operation_requirements(one_visible, 7, 2).code != DTV_INTERNAL_RESULT_NOT_READY) {
+        dtv::internal::check_operation_requirements(one_visible, 7, DTV_SPI_OPERATION_LNB_POWER).code != DTV_INTERNAL_RESULT_OK ||
+        dtv::internal::check_operation_requirements(one_visible, 7, DTV_SPI_OPERATION_CARD).code != DTV_INTERNAL_RESULT_NOT_READY) {
         return false;
     }
     force_complete = true;
@@ -401,7 +401,7 @@ bool same_handle_package()
     include_other_device = false;
     if (group.match != DTV_USB_GROUP_INCOMPLETE || group.functions.size() != 3 ||
         group.snapshots.size() != 2 ||
-        dtv::internal::check_operation_requirements(group, 7, 1).code != DTV_INTERNAL_RESULT_OK) {
+        dtv::internal::check_operation_requirements(group, 7, DTV_SPI_OPERATION_LNB_POWER).code != DTV_INTERNAL_RESULT_OK) {
         return false;
     }
     FakeProvider provider;

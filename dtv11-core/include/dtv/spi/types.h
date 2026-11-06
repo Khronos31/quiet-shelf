@@ -21,6 +21,19 @@ typedef uint32_t dtv_spi_receiver_id;
 typedef uint32_t dtv_function;
 typedef uint64_t dtv_fw_key;
 
+/* OperationRequirement.operationには公開DTV_OP_*と同じ値を指定する。 */
+typedef enum dtv_spi_operation {
+    DTV_SPI_OPERATION_LNB_POWER = 1, /* DTV_OP_LNB_POWER */
+    DTV_SPI_OPERATION_CARD = 2, /* DTV_OP_CARD */
+    DTV_SPI_OPERATION_OUTPUT_PID_FILTER = 3, /* DTV_OP_OUTPUT_PID_FILTER */
+    DTV_SPI_OPERATION_TUNE_ISDB_T = 4, /* DTV_OP_TUNE_ISDB_T */
+    DTV_SPI_OPERATION_TUNE_ISDB_S = 5, /* DTV_OP_TUNE_ISDB_S */
+    DTV_SPI_OPERATION_SELECT_SLOT = 6, /* DTV_OP_SELECT_SLOT */
+    DTV_SPI_OPERATION_SELECT_TSID = 7, /* DTV_OP_SELECT_TSID */
+    DTV_SPI_OPERATION_SIGNAL = 8, /* DTV_OP_SIGNAL。lock測定を含む */
+    DTV_SPI_OPERATION_LNA = 9 /* DTV_OP_LNA */
+} dtv_spi_operation;
+
 typedef struct dtv_spi_measurement {
     uint64_t value;
     uint32_t valid;

@@ -63,6 +63,38 @@ git add external/dtv11-core
 
 この初期 SPI は、モデルの識別情報、VID:PID、C 互換境界型、および null 許容の操作スロットを持つ。完全なハードウェア API を定義しているわけではない。今後の各操作は末尾へ追加可能であるが、null コールバックが機能すると偽ってはならない。
 
+## 操作要件と操作 ID（OperationRequirement）
+
+受信機や機能の動作に必要な USB ファンクションの要件を定義する `OperationRequirement.operation`（`include/dtv/spi/device_ops.hpp`）および要件判定関数 `check_operation_requirements` に指定する操作 ID には、`include/dtv/spi/types.h` で定義された C 互換定数 `DTV_SPI_OPERATION_*`（`enum dtv_spi_operation`）を使用する。
+
+これらの定数は、公開 L3 正本（`l3/dtv.h`）の `DTV_OP_*` と値および意味が完全に一致している。
+
+| SPI 定数 | 値 | 公開正本定数 | 意味 |
+|---|---:|---|---|
+| `DTV_SPI_OPERATION_LNB_POWER` | 1 | `DTV_OP_LNB_POWER` | LNB 給電 |
+| `DTV_SPI_OPERATION_CARD` | 2 | `DTV_OP_CARD` | カード操作 |
+| `DTV_SPI_OPERATION_OUTPUT_PID_FILTER` | 3 | `DTV_OP_OUTPUT_PID_FILTER` | 出力 PID フィルター |
+| `DTV_SPI_OPERATION_TUNE_ISDB_T` | 4 | `DTV_OP_TUNE_ISDB_T` | 地上波 ISDB-T 選局 |
+| `DTV_SPI_OPERATION_TUNE_ISDB_S` | 5 | `DTV_OP_TUNE_ISDB_S` | 衛星 ISDB-S 選局 |
+| `DTV_SPI_OPERATION_SELECT_SLOT` | 6 | `DTV_OP_SELECT_SLOT` | slot 選択 |
+| `DTV_SPI_OPERATION_SELECT_TSID` | 7 | `DTV_OP_SELECT_TSID` | TSID 選択 |
+| `DTV_SPI_OPERATION_SIGNAL` | 8 | `DTV_OP_SIGNAL` | signal 取得（lock 測定を含む） |
+| `DTV_SPI_OPERATION_LNA` | 9 | `DTV_OP_LNA` | LNA 設定 |
+
+独立した LOCK 操作 ID は存在せず、lock 測定は signal 取得（`DTV_SPI_OPERATION_SIGNAL`）に含まれる。
+
+### 最小の使い方
+
+製品側で受信機の操作要件テーブルを定義する際は、以下のように `DTV_SPI_OPERATION_*` を指定する。
+
+```cpp
+const dtv::spi::OperationRequirement requirements[]{
+    {receiver, DTV_SPI_OPERATION_TUNE_ISDB_T, required_functions, function_count},
+};
+```
+
+`OperationRequirement.operation` フィールドは既存の `uint32_t`（C++ では `std::uint32_t`）のままであり、フィールド幅・配置・構造体レイアウト（ABI）に変更はない。本定義は操作 ID の値識別子と対応契約を規定したものであり、動的操作処理の追加や未接続の L3/TS 処理を伴うものではない。
+
 ## ライセンスと由来
 
 本リポジトリの Core ソースコードは dtv11 向けに新規作成されたものであり、読み取り専用の参照用 Core からコードをコピーしていない。各ソースファイルおよび文書ファイルには GPL-2.0-or-later の SPDX 識別子が付与されている。将来サードパーティ製ソースを追加する場合は、取り込み前にライセンスの互換性を確認しなければならない。
