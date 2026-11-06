@@ -103,7 +103,7 @@ TimeoutConversion transfer_timeout(dtv_timeout timeout, const dtv_runtime_clock 
         }
         const auto remaining_ns = timeout.operation_deadline_ns - now;
         const auto remaining_ms = remaining_ns / 1000000 + (remaining_ns % 1000000 != 0 ? 1 : 0);
-        timeout_ms = std::min(timeout_ms, remaining_ms);
+        timeout_ms = (std::min)(timeout_ms, remaining_ms);
     }
     if (timeout_ms == 0) {
         return TimeoutConversion::no_wait;
