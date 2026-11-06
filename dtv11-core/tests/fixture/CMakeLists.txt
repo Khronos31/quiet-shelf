@@ -37,6 +37,7 @@ dtv_add_product(NAME i0_pix_fixture
 
 if(BUILD_TESTING)
     add_library(spi_types_c_consumer OBJECT spi-types-consumer.c)
+    target_compile_features(spi_types_c_consumer PRIVATE c_std_11)
     target_include_directories(spi_types_c_consumer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     add_executable(c_consumer consumer.c)
     target_link_libraries(c_consumer PRIVATE fixture)
