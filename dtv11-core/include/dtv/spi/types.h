@@ -46,7 +46,8 @@ enum dtv_internal_result_code {
     DTV_INTERNAL_RESULT_USB_IO = 7, /* USB I/O失敗。 */
     DTV_INTERNAL_RESULT_TIMEOUT = 10, /* 期限切れ、または即時確認時に未完了。 */
     DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED = 11, /* Coreまたは製品の資源不足。 */
-    DTV_INTERNAL_RESULT_INTERNAL = 12 /* その他の予期しない例外。 */
+    DTV_INTERNAL_RESULT_INTERNAL = 12, /* その他の予期しない例外。 */
+    DTV_INTERNAL_RESULT_BUSY = 13 /* 機器controller使用中。候補曖昧さには使わない。 */
 };
 
 typedef struct dtv_runtime_clock {

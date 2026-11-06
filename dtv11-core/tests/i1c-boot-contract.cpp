@@ -21,6 +21,15 @@ const dtv_usb_io *opened_io = nullptr;
 const dtv_usb_io fake_io{};
 int identify_calls = 0;
 int firmware_calls = 0;
+int bootstrap_open_calls = 0;
+int bootstrap_close_calls = 0;
+int product_destroy_calls = 0;
+int owner_destroy_calls = 0;
+int cleanup_order = 0;
+int close_order = 0;
+int destroy_order = 0;
+int owner_order = 0;
+dtv_internal_result bootstrap_open_result{DTV_INTERNAL_RESULT_OK, 0};
 uint32_t fake_transition = DTV_FIRMWARE_SAME_HANDLE;
 bool throw_firmware = false;
 uint32_t final_identify_state = DTV_IDENTIFY_RUNTIME;
@@ -36,6 +45,11 @@ struct FakeClockState {
 };
 
 struct FakeOwner final : dtv::internal::BootUsbOwner {
+    ~FakeOwner() override
+    {
+        ++owner_destroy_calls;
+        owner_order = ++cleanup_order;
+    }
     const dtv_usb_io *io() const override { return &fake_io; }
 };
 
@@ -54,12 +68,36 @@ struct FakeProvider final : dtv::internal::BootUsbProvider {
 dtv_internal_result fake_open(dtv_context *, const dtv_usb_io *io,
                               const dtv_open_args *args)
 {
+    ++bootstrap_open_calls;
     opened_io = io;
     open_timeout_ms = args->timeout.timeout_ms;
     fake_deadline = args->timeout.operation_deadline_ns;
+    if (bootstrap_open_result.code != DTV_INTERNAL_RESULT_OK) {
+        return bootstrap_open_result;
+    }
     return args->timeout.operation_deadline_ns != 0
         ? dtv_internal_result{DTV_INTERNAL_RESULT_OK, 0}
         : dtv_internal_result{DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+}
+
+dtv_internal_result fake_create_state(dtv_device_id, dtv_context **context)
+{
+    *context = new int(1);
+    return {DTV_INTERNAL_RESULT_OK, 0};
+}
+
+void fake_destroy_state(dtv_context *context)
+{
+    delete static_cast<int *>(context);
+    ++product_destroy_calls;
+    destroy_order = ++cleanup_order;
+}
+
+dtv_internal_result fake_close(dtv_context *, dtv_timeout)
+{
+    ++bootstrap_close_calls;
+    close_order = ++cleanup_order;
+    return {DTV_INTERNAL_RESULT_OK, 0};
 }
 
 dtv_internal_result fake_identify(dtv_context *, dtv_identify_info *info, dtv_timeout timeout)
@@ -94,6 +132,7 @@ const dtv::spi::DeviceOps fake_bootstrap{
     .open = fake_open,
     .identify = fake_identify,
     .firmware = fake_firmware,
+    .close = fake_close,
 };
 const dtv::spi::DeviceOps fake_runtime{};
 const dtv::spi::FirmwareEntry fake_firmware_table[]{{9, &fake_runtime}};
@@ -101,6 +140,8 @@ const dtv::spi::ModelEntry fake_model{
     .model = {"fake", 0x1234, 0x5678},
     .firmware = fake_firmware_table,
     .firmware_count = 1,
+    .create_state = fake_create_state,
+    .destroy_state = fake_destroy_state,
     .bootstrap_ops = &fake_bootstrap,
 };
 
@@ -355,10 +396,33 @@ bool same_handle_boot()
     const bool cancel_rejected = !cancelled && provider.opens == 0 &&
         result.code == DTV_INTERNAL_RESULT_TIMEOUT;
     request.cancel = nullptr;
+
+    bootstrap_open_result = {DTV_INTERNAL_RESULT_BUSY, 0x1234};
+    provider.opens = 0;
+    identify_calls = 0;
+    firmware_calls = 0;
+    bootstrap_open_calls = 0;
+    bootstrap_close_calls = 0;
+    product_destroy_calls = 0;
+    owner_destroy_calls = 0;
+    cleanup_order = 0;
+    close_order = 0;
+    destroy_order = 0;
+    owner_order = 0;
+    clock_state = {};
+    auto busy = dtv::internal::boot_selected_candidate(usb, request, &result);
+    const bool busy_preserved = !busy && provider.opens == 1 && bootstrap_open_calls == 1 &&
+        result.code == DTV_INTERNAL_RESULT_BUSY && result.detail == 0x1234 &&
+        identify_calls == 0 && firmware_calls == 0 && bootstrap_close_calls == 1 &&
+        product_destroy_calls == 1 && owner_destroy_calls == 1 &&
+        close_order < destroy_order && destroy_order < owner_order;
+    bootstrap_open_result = {DTV_INTERNAL_RESULT_OK, 0};
+
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
     fake_transition = DTV_FIRMWARE_SAME_HANDLE;
-    return same_handle && transition_rejected && unknown_rejected && key_rejected && cancel_rejected;
+    return same_handle && transition_rejected && unknown_rejected && key_rejected && cancel_rejected &&
+           busy_preserved;
 }
 
 }
