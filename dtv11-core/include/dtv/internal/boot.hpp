@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <dtv/internal/firmware.hpp>
+#include <dtv/internal/discovery.hpp>
 #include <dtv/internal/usb.hpp>
 #include <dtv/spi/device_ops.hpp>
 
@@ -31,6 +32,9 @@ public:
     virtual std::unique_ptr<BootUsbOwner> open(
         const UsbDeviceSnapshot &, int, const dtv_runtime_clock *,
         dtv_internal_result *) = 0;
+    virtual std::unique_ptr<BootUsbOwner> open_group(
+        const UsbDeviceSnapshot &, std::span<const UsbInterfaceClaim>,
+        const dtv_runtime_clock *, dtv_internal_result *);
 };
 
 struct BootRequest {
@@ -71,10 +75,42 @@ private:
     bool open_attempted_ = false;
 };
 
+class BootGroupSession {
+public:
+    ~BootGroupSession();
+    BootGroupSession(const BootGroupSession &) = delete;
+    BootGroupSession &operator=(const BootGroupSession &) = delete;
+
+    dtv_internal_result send_firmware(std::uint32_t candidate_index, dtv_bytes package,
+                                      dtv_timeout timeout, const dtv_cancel *cancel = nullptr);
+    dtv_internal_result open_result() const { return open_result_; }
+    void close() noexcept;
+    dtv_context *context(dtv_function function) const;
+    const dtv_usb_io *io(dtv_function function) const;
+    const spi::DeviceOps *ops(dtv_function function) const;
+
+private:
+    friend std::unique_ptr<BootGroupSession> open_boot_group(
+        const UsbContext &, const BootGroupCandidate &, dtv_device_id, dtv_timeout,
+        const dtv_runtime_clock *, const dtv_cancel *, BootUsbProvider *, dtv_internal_result *);
+    struct PhysicalOwner;
+    struct FunctionContext;
+    BootGroupSession() = default;
+    void cleanup() noexcept;
+    std::vector<std::unique_ptr<PhysicalOwner>> owners_;
+    std::vector<std::unique_ptr<FunctionContext>> functions_;
+    dtv_runtime_clock clock_{};
+    dtv_internal_result open_result_{DTV_INTERNAL_RESULT_OK, 0};
+    bool closed_ = false;
+};
+
 const spi::FirmwareEntry *find_firmware_entry(const spi::ModelEntry &model,
                                               dtv_fw_key key) noexcept;
 std::unique_ptr<BootSession> boot_selected_candidate(
     const UsbContext &usb, const BootRequest &request, dtv_internal_result *result);
+std::unique_ptr<BootGroupSession> open_boot_group(
+    const UsbContext &, const BootGroupCandidate &, dtv_device_id, dtv_timeout,
+    const dtv_runtime_clock *, const dtv_cancel *, BootUsbProvider *, dtv_internal_result *);
 
 }
 

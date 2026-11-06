@@ -136,6 +136,7 @@ const dtv::spi::DeviceOps fake_bootstrap{
 };
 const dtv::spi::DeviceOps fake_runtime{};
 const dtv::spi::FirmwareEntry fake_firmware_table[]{{9, &fake_runtime}};
+const dtv_usb_identity fake_cold_identities[]{{0xabcd, 0x1000}};
 const dtv::spi::ModelEntry fake_model{
     .model = {"fake", 0x1234, 0x5678},
     .firmware = fake_firmware_table,
@@ -143,6 +144,8 @@ const dtv::spi::ModelEntry fake_model{
     .create_state = fake_create_state,
     .destroy_state = fake_destroy_state,
     .bootstrap_ops = &fake_bootstrap,
+    .cold_identities = fake_cold_identities,
+    .cold_identity_count = 1,
 };
 
 uint64_t fake_clock_now(void *user)
@@ -262,6 +265,8 @@ bool boot_rejects_before_open()
         .firmware = firmware,
         .firmware_count = 1,
         .bootstrap_ops = &bootstrap,
+        .cold_identities = fake_cold_identities,
+        .cold_identity_count = 1,
     };
     const dtv::internal::FirmwareImageSpec image{
         std::filesystem::temp_directory_path() / "dtv11-i1c-missing-firmware.bin",
@@ -312,8 +317,8 @@ bool same_handle_boot()
     };
     const dtv::internal::BootStage stage{42, 0};
     dtv::internal::UsbDeviceSnapshot candidate{};
-    candidate.vendor_id = fake_model.model.vendor_id;
-    candidate.product_id = fake_model.model.product_id;
+    candidate.vendor_id = fake_cold_identities[0].vendor_id;
+    candidate.product_id = fake_cold_identities[0].product_id;
     dtv::internal::UsbContext usb;
     FakeProvider provider;
     dtv::internal::BootRequest request{};

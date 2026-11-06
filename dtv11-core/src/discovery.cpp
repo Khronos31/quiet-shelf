@@ -16,10 +16,6 @@ namespace {
 bool identity_matches(const dtv::spi::ModelEntry &model,
                       const dtv_usb_candidate_info &candidate)
 {
-    if (model.model.vendor_id == candidate.vendor_id &&
-        model.model.product_id == candidate.product_id) {
-        return true;
-    }
     for (std::size_t i = 0; i < model.cold_identity_count; ++i) {
         if (model.cold_identities == nullptr) {
             return false;
@@ -144,9 +140,11 @@ std::vector<BootGroupCandidate> discover_boot_candidates(
                     return {};
                 }
                 if (count > capacity || match < DTV_USB_GROUP_NO_MATCH ||
-                    match > DTV_USB_GROUP_AMBIGUOUS ||
-                    (match != DTV_USB_GROUP_COMPLETE && count != 0) ||
-                    (match == DTV_USB_GROUP_COMPLETE && count == 0)) {
+                    match > DTV_USB_GROUP_INCOMPLETE ||
+                    ((match != DTV_USB_GROUP_COMPLETE && match != DTV_USB_GROUP_INCOMPLETE) &&
+                     count != 0) ||
+                    ((match == DTV_USB_GROUP_COMPLETE || match == DTV_USB_GROUP_INCOMPLETE) &&
+                     count == 0)) {
                     if (out_result) *out_result = invalid();
                     return {};
                 }
@@ -154,7 +152,7 @@ std::vector<BootGroupCandidate> discover_boot_candidates(
                 selected.resize(count);
                 std::set<dtv_function> functions;
                 std::set<std::pair<std::uint32_t, std::uint8_t>> interfaces;
-                if (match == DTV_USB_GROUP_COMPLETE) {
+                if (match == DTV_USB_GROUP_COMPLETE || match == DTV_USB_GROUP_INCOMPLETE) {
                     for (const auto &entry : selected) {
                         if (entry.candidate_index >= candidates.size() ||
                             !functions.insert(entry.function).second ||
@@ -179,17 +177,61 @@ std::vector<BootGroupCandidate> discover_boot_candidates(
                 for (const auto &prior : found) {
                     if (prior.product == product && prior.model == model && prior.match == match &&
                         ((match == DTV_USB_GROUP_AMBIGUOUS && prior.anchor_candidate_index == anchor) ||
-                         (match == DTV_USB_GROUP_COMPLETE && same_functions(prior, selected)))) {
+                         ((match == DTV_USB_GROUP_COMPLETE || match == DTV_USB_GROUP_INCOMPLETE) &&
+                          same_functions(prior, selected)))) {
                         duplicate = true;
                         break;
                     }
                 }
-                if (!duplicate) found.push_back({product, model, anchor, match, std::move(selected)});
+                if (!duplicate) {
+                    BootGroupCandidate group{product, model, anchor, match, std::move(selected), {}};
+                    group.snapshots.assign(snapshots.begin(), snapshots.end());
+                    found.push_back(std::move(group));
+                }
             }
         }
     }
     if (out_result) *out_result = {DTV_INTERNAL_RESULT_OK, 0};
     return found;
+}
+
+dtv_internal_result check_operation_requirements(
+    const BootGroupCandidate &group, dtv_spi_receiver_id receiver, std::uint32_t operation)
+{
+    if (group.model == nullptr || group.match == DTV_USB_GROUP_AMBIGUOUS ||
+        (group.match != DTV_USB_GROUP_COMPLETE && group.match != DTV_USB_GROUP_INCOMPLETE)) {
+        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+    }
+    const auto &model = *group.model;
+    if (model.operation_requirement_count != 0 && model.operation_requirements == nullptr) {
+        return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+    }
+    const dtv::spi::OperationRequirement *selected = nullptr;
+    for (std::size_t i = 0; i < model.operation_requirement_count; ++i) {
+        const auto &requirement = model.operation_requirements[i];
+        if (requirement.receiver != receiver || requirement.operation != operation) continue;
+        if (selected != nullptr) return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        selected = &requirement;
+    }
+    if (selected != nullptr) {
+        const auto &requirement = *selected;
+        if (requirement.function_count != 0 && requirement.functions == nullptr) {
+            return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+        }
+        for (std::size_t j = 0; j < requirement.function_count; ++j) {
+            if (std::find(requirement.functions, requirement.functions + j,
+                          requirement.functions[j]) != requirement.functions + j) {
+                return {DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0};
+            }
+            if (std::none_of(group.functions.begin(), group.functions.end(), [&](const auto &visible) {
+                    return visible.function == requirement.functions[j];
+                })) {
+                return {DTV_INTERNAL_RESULT_NOT_READY, 0};
+            }
+        }
+        return {DTV_INTERNAL_RESULT_OK, 0};
+    }
+    return {DTV_INTERNAL_RESULT_UNSUPPORTED, 0};
 }
 
 }

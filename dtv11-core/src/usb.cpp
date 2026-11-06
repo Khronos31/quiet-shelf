@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <dtv/internal/usb.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <limits>
@@ -43,7 +45,7 @@ struct UsbDeviceSnapshot::State {
 struct UsbDevice::State {
     std::shared_ptr<UsbContext::State> context;
     libusb_device_handle *handle = nullptr;
-    int interface_number = -1;
+    std::vector<int> claimed_interfaces;
     int owned_descriptor = -1;
     dtv_internal_result open_result = {DTV_INTERNAL_RESULT_OK, 0};
     dtv_runtime_clock clock{};
@@ -51,8 +53,9 @@ struct UsbDevice::State {
     ~State()
     {
         if (handle != nullptr) {
-            if (interface_number >= 0) {
-                libusb_release_interface(handle, interface_number);
+            for (auto interface = claimed_interfaces.rbegin();
+                 interface != claimed_interfaces.rend(); ++interface) {
+                libusb_release_interface(handle, *interface);
             }
             libusb_close(handle);
         }
@@ -368,7 +371,7 @@ dtv_internal_result UsbDevice::result() const
 
 const dtv_usb_io *UsbDevice::io() const
 {
-    return state_ && state_->handle != nullptr && state_->interface_number >= 0
+    return state_ && state_->handle != nullptr && !state_->claimed_interfaces.empty()
                ? &state_->io
                : nullptr;
 }
@@ -377,13 +380,26 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
                                              int interface_number,
                                              const dtv_runtime_clock *clock) const
 {
+    if (interface_number < 0 || interface_number > 255) {
+        auto device_state = std::make_unique<UsbDevice::State>();
+        device_state->open_result = invalid();
+        return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
+    }
+    const std::array claims{UsbInterfaceClaim{static_cast<std::uint8_t>(interface_number), 0}};
+    return open(snapshot, claims, clock);
+}
+
+std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
+                                             std::span<const UsbInterfaceClaim> claims,
+                                             const dtv_runtime_clock *clock) const
+{
     auto device_state = std::make_unique<UsbDevice::State>();
     if (clock != nullptr) {
         device_state->clock = *clock;
     }
     device_state->context = state_;
     if (!state_ || state_->context == nullptr || !snapshot.state_ ||
-        snapshot.state_->context != state_ || interface_number < 0 || interface_number > 255) {
+        snapshot.state_->context != state_ || claims.empty()) {
         device_state->open_result = invalid();
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
@@ -417,30 +433,48 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
         device_state->open_result = usb_result(status);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    bool interface_found = false;
-    for (std::uint8_t i = 0; i < configuration->bNumInterfaces; ++i) {
-        const auto &interface = configuration->interface[i];
-        for (int alternate = 0; alternate < interface.num_altsetting; ++alternate) {
-            if (interface.altsetting[alternate].bInterfaceNumber == interface_number) {
-                interface_found = true;
+    std::unique_ptr<libusb_config_descriptor, decltype(&libusb_free_config_descriptor)>
+        configuration_guard(configuration, &libusb_free_config_descriptor);
+    device_state->claimed_interfaces.reserve(claims.size());
+    std::vector<int> seen_interfaces;
+    seen_interfaces.reserve(claims.size());
+    for (const auto &claim : claims) {
+        if (std::find(seen_interfaces.begin(), seen_interfaces.end(), claim.interface_number) !=
+            seen_interfaces.end()) {
+            device_state->open_result = invalid();
+            return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
+        }
+        seen_interfaces.push_back(claim.interface_number);
+        bool alternate_found = false;
+        for (std::uint8_t i = 0; i < configuration->bNumInterfaces; ++i) {
+            const auto &interface = configuration->interface[i];
+            for (int alternate = 0; alternate < interface.num_altsetting; ++alternate) {
+                if (interface.altsetting[alternate].bInterfaceNumber == claim.interface_number &&
+                    interface.altsetting[alternate].bAlternateSetting == claim.alternate_setting) {
+                    alternate_found = true;
+                }
             }
         }
+        if (!alternate_found) {
+            device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
+        }
     }
-    libusb_free_config_descriptor(configuration);
-    if (!interface_found) {
-        device_state->open_result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
-        return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
-    }
-
     status = libusb_open(snapshot.state_->device, &device_state->handle);
-    if (status == LIBUSB_SUCCESS) {
-        status = libusb_claim_interface(device_state->handle, interface_number);
+    for (const auto &claim : claims) {
+        if (status != LIBUSB_SUCCESS) break;
+        status = libusb_claim_interface(device_state->handle, claim.interface_number);
+        if (status != LIBUSB_SUCCESS) break;
+        device_state->claimed_interfaces.push_back(claim.interface_number);
+        if (claim.alternate_setting != 0) {
+            status = libusb_set_interface_alt_setting(device_state->handle, claim.interface_number,
+                                                       claim.alternate_setting);
+        }
     }
     if (status != LIBUSB_SUCCESS) {
         device_state->open_result = usb_result(status);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    device_state->interface_number = interface_number;
     device_state->io = make_io(device_state.get(), clock != nullptr ? &device_state->clock : nullptr);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 }
@@ -509,13 +543,14 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
+    device_state->claimed_interfaces.reserve(1);
     const int claim_result = libusb_claim_interface(device_state->handle, interface_number);
     if (claim_result != LIBUSB_SUCCESS) {
         device_state->open_result = usb_result(claim_result);
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    device_state->interface_number = interface_number;
+    device_state->claimed_interfaces.push_back(interface_number);
     device_state->io = make_io(device_state.get(), nullptr);
     *result = make_result(DTV_INTERNAL_RESULT_OK);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));

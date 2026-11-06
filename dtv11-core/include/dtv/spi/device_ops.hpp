@@ -3,6 +3,7 @@
 #define DTV_SPI_DEVICE_OPS_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 
 #include <dtv/cli.h>
@@ -36,6 +37,39 @@ struct FirmwareEntry {
     const DeviceOps *ops;
 };
 
+struct FirmwareManifestImage {
+    std::uint64_t offset;
+    std::uint64_t size;
+    const char *sha256;
+};
+
+struct FunctionFirmwareStage {
+    std::uint32_t stage;
+    std::size_t image_index;
+    std::uint32_t required_state = DTV_IDENTIFY_LOADER;
+    std::uint32_t result_state = DTV_IDENTIFY_LOADER;
+};
+
+struct FunctionEntry {
+    dtv_function function;
+    const DeviceOps *bootstrap_ops;
+    const FirmwareEntry *firmware;
+    std::size_t firmware_count;
+    const FirmwareManifestImage *images;
+    std::size_t image_count;
+    const FunctionFirmwareStage *stages;
+    std::size_t stage_count;
+    dtv_internal_result (*create_state)(dtv_device_id, dtv_context **);
+    void (*destroy_state)(dtv_context *);
+};
+
+struct OperationRequirement {
+    dtv_spi_receiver_id receiver;
+    std::uint32_t operation;
+    const dtv_function *functions;
+    std::size_t function_count;
+};
+
 struct ModelEntry {
     dtv_model_info model;
     const FirmwareEntry *firmware;
@@ -48,6 +82,10 @@ struct ModelEntry {
     const dtv_usb_identity *cold_identities = nullptr;
     std::size_t cold_identity_count = 0;
     dtv_select_usb_group_fn select_usb_group = nullptr;
+    const FunctionEntry *functions = nullptr;
+    std::size_t function_count = 0;
+    const OperationRequirement *operation_requirements = nullptr;
+    std::size_t operation_requirement_count = 0;
 };
 
 struct ProductEntry {

@@ -13,6 +13,7 @@ typedef struct dtv_identify_info dtv_identify_info;
 typedef struct dtv_firmware_result dtv_firmware_result;
 typedef struct dtv_spi_tune_result dtv_spi_tune_result;
 typedef struct dtv_signal_result dtv_signal_result;
+struct dtv_usb_candidate_info;
 
 typedef uint64_t dtv_device_id;
 typedef uint64_t dtv_stream_id;
@@ -36,6 +37,10 @@ struct dtv_open_args {
     const struct dtv_model_info *model;
     dtv_function function;
     dtv_timeout timeout;
+    /* Borrowed snapshot observation; valid for this open callback. */
+    const struct dtv_usb_candidate_info *usb_observation;
+    uint8_t interface_number;
+    uint8_t alternate_setting;
 };
 
 typedef struct dtv_internal_result {
@@ -45,7 +50,7 @@ typedef struct dtv_internal_result {
     uint32_t detail;
 } dtv_internal_result;
 
-/* Descriptor fields are fixed-width observations borrowed for selector invocation only. */
+/* Descriptor fields are fixed-width observations borrowed for callback duration only. */
 typedef struct dtv_usb_endpoint_info {
     uint8_t address;
     uint8_t attributes;
@@ -87,7 +92,8 @@ typedef struct dtv_usb_function_selection {
 typedef enum dtv_usb_group_match {
     DTV_USB_GROUP_NO_MATCH = 0,
     DTV_USB_GROUP_COMPLETE = 1,
-    DTV_USB_GROUP_AMBIGUOUS = 2
+    DTV_USB_GROUP_AMBIGUOUS = 2,
+    DTV_USB_GROUP_INCOMPLETE = 3
 } dtv_usb_group_match;
 
 typedef struct dtv_usb_identity {
@@ -108,7 +114,8 @@ enum dtv_internal_result_code {
     DTV_INTERNAL_RESULT_TIMEOUT = 10, /* 期限切れ、または即時確認時に未完了。 */
     DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED = 11, /* Coreまたは製品の資源不足。 */
     DTV_INTERNAL_RESULT_INTERNAL = 12, /* その他の予期しない例外。 */
-    DTV_INTERNAL_RESULT_BUSY = 13 /* 機器controller使用中。候補曖昧さには使わない。 */
+    DTV_INTERNAL_RESULT_BUSY = 13, /* 機器controller使用中。候補曖昧さには使わない。 */
+    DTV_INTERNAL_RESULT_NOT_READY = 14 /* operationに必要なfunctionがまだ見えない。 */
 };
 
 typedef struct dtv_runtime_clock {

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <dtv/spi/types.h>
@@ -13,6 +14,11 @@ namespace dtv::internal {
 struct UsbInterfaceSnapshot {
     dtv_usb_interface_info info{};
     std::vector<dtv_usb_endpoint_info> endpoints;
+};
+
+struct UsbInterfaceClaim {
+    std::uint8_t interface_number;
+    std::uint8_t alternate_setting;
 };
 
 struct UsbDeviceSnapshot {
@@ -51,6 +57,9 @@ public:
     dtv_internal_result result() const;
     std::vector<UsbDeviceSnapshot> enumerate(dtv_internal_result *result = nullptr) const;
     std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &, int interface_number,
+                                    const dtv_runtime_clock *clock = nullptr) const;
+    std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &,
+                                    std::span<const UsbInterfaceClaim>,
                                     const dtv_runtime_clock *clock = nullptr) const;
 
 private:

@@ -177,6 +177,14 @@ std::span<const uint8_t> VerifiedFirmwareBundle::image(std::size_t index) const
     return images_[index];
 }
 
+std::span<const uint8_t> VerifiedFirmwarePackage::image(std::size_t index) const
+{
+    if (index >= images_.size()) {
+        return {};
+    }
+    return images_[index];
+}
+
 FirmwarePreflightResult load_firmware_bundle(
     std::span<const FirmwareImageSpec> images, VerifiedFirmwareBundle *out_bundle)
 {
@@ -248,6 +256,42 @@ FirmwarePreflightResult load_firmware_bundle(
     }
 
     out_bundle->images_ = std::move(bundle.images_);
+    return {};
+}
+
+FirmwarePreflightResult load_firmware_package(
+    std::span<const uint8_t> package, std::span<const FirmwarePackageImageSpec> images,
+    VerifiedFirmwarePackage *out_package)
+{
+    if (out_package) out_package->images_.clear();
+    if (!out_package || images.empty()) return fail(FirmwarePreflightError::InvalidArgument, 0);
+    VerifiedFirmwarePackage verified;
+    try {
+        verified.images_.reserve(images.size());
+        for (std::size_t index = 0; index < images.size(); ++index) {
+            const auto &spec = images[index];
+            std::array<uint8_t, 32> expected_hash{};
+            if (spec.size == 0) return fail(FirmwarePreflightError::InvalidArgument, index);
+            if (!parse_sha256(spec.expected_sha256, &expected_hash)) {
+                return fail(FirmwarePreflightError::InvalidHash, index);
+            }
+            if (spec.offset > package.size() || spec.size > package.size() - spec.offset ||
+                spec.size > std::numeric_limits<std::size_t>::max()) {
+                return fail(FirmwarePreflightError::SizeMismatch, index);
+            }
+            const auto first = package.begin() + static_cast<std::size_t>(spec.offset);
+            const auto last = first + static_cast<std::size_t>(spec.size);
+            Sha256 sha256;
+            sha256.update(std::span<const uint8_t>(first, last));
+            if (sha256.finish() != expected_hash) {
+                return fail(FirmwarePreflightError::HashMismatch, index);
+            }
+            verified.images_.emplace_back(first, last);
+        }
+    } catch (const std::bad_alloc &) {
+        return fail(FirmwarePreflightError::ResourceExhausted, verified.images_.size());
+    }
+    out_package->images_ = std::move(verified.images_);
     return {};
 }
 

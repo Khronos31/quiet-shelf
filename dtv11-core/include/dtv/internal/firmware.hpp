@@ -17,6 +17,12 @@ struct FirmwareImageSpec {
     std::string_view expected_sha256;
 };
 
+struct FirmwarePackageImageSpec {
+    std::uint64_t offset;
+    std::uint64_t size;
+    std::string_view expected_sha256;
+};
+
 enum class FirmwarePreflightError {
     None,
     InvalidArgument,
@@ -46,9 +52,24 @@ private:
     std::vector<std::vector<uint8_t>> images_;
 };
 
+class VerifiedFirmwarePackage {
+public:
+    std::size_t size() const { return images_.size(); }
+    std::span<const uint8_t> image(std::size_t index) const;
+
+private:
+    friend FirmwarePreflightResult load_firmware_package(
+        std::span<const uint8_t>, std::span<const FirmwarePackageImageSpec>,
+        VerifiedFirmwarePackage *);
+    std::vector<std::vector<uint8_t>> images_;
+};
+
 // image() のviewはbundleが所有し、bundleの破棄またはmove後に無効となる。
 FirmwarePreflightResult load_firmware_bundle(
     std::span<const FirmwareImageSpec> images, VerifiedFirmwareBundle *out_bundle);
+FirmwarePreflightResult load_firmware_package(
+    std::span<const uint8_t> package, std::span<const FirmwarePackageImageSpec> images,
+    VerifiedFirmwarePackage *out_package);
 
 }
 
