@@ -80,6 +80,7 @@ private:
     explicit UsbDevice(std::unique_ptr<State>);
     std::unique_ptr<State> state_;
     friend class UsbContext;
+    friend struct UsbTestDeviceFactory;
     friend std::unique_ptr<UsbDevice> open_usb_fd(int, int, dtv_internal_result *);
 };
 

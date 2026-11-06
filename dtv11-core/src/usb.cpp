@@ -4,14 +4,20 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
 #include <climits>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include <libusb.h>
 
 #include <dtv/internal/result.hpp>
+
+#include "usb-transfer-backend.hpp"
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -20,13 +26,70 @@
 
 namespace dtv::internal {
 
+namespace {
+
+class LibusbTransferBackend final : public UsbTransferBackend {
+public:
+    libusb_transfer *allocate_transfer() override { return libusb_alloc_transfer(0); }
+    void free_transfer(libusb_transfer *transfer) override { libusb_free_transfer(transfer); }
+    int submit_transfer(libusb_transfer *transfer) override { return libusb_submit_transfer(transfer); }
+    int handle_events(libusb_context *context, timeval *timeout) override
+    {
+        return libusb_handle_events_timeout(context, timeout);
+    }
+    int release_interface(libusb_device_handle *handle, int interface_number) override
+    {
+        return libusb_release_interface(handle, interface_number);
+    }
+    void close_handle(libusb_device_handle *handle) override { libusb_close(handle); }
+    void exit_context(libusb_context *context) override { libusb_exit(context); }
+};
+
+}
+
+std::shared_ptr<UsbTransferBackend> make_libusb_transfer_backend()
+{
+    return std::make_shared<LibusbTransferBackend>();
+}
+
+struct UsbTransferRequest;
+
 struct UsbContext::State {
     libusb_context *context = nullptr;
+    std::shared_ptr<UsbTransferBackend> backend = make_libusb_transfer_backend();
     dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    std::mutex requests_mutex;
+    std::unordered_map<libusb_transfer *, std::shared_ptr<UsbTransferRequest>> requests;
+    std::thread event_thread;
+    bool stop_event_thread = false;
+    void mark_callbacks_returned();
+
+    void start_event_thread()
+    {
+        event_thread = std::thread([this] {
+            while (true) {
+                {
+                    std::lock_guard lock(requests_mutex);
+                    if (stop_event_thread) return;
+                }
+                timeval timeout{0, 100000};
+                backend->handle_events(context, &timeout);
+                mark_callbacks_returned();
+            }
+        });
+    }
+
     ~State()
     {
+        if (event_thread.joinable()) {
+            {
+                std::lock_guard lock(requests_mutex);
+                stop_event_thread = true;
+            }
+            event_thread.join();
+        }
         if (context != nullptr) {
-            libusb_exit(context);
+            backend->exit_context(context);
         }
     }
 };
@@ -42,22 +105,20 @@ struct UsbDeviceSnapshot::State {
     }
 };
 
-struct UsbDevice::State {
+struct UsbHandleLease {
     std::shared_ptr<UsbContext::State> context;
     libusb_device_handle *handle = nullptr;
     std::vector<int> claimed_interfaces;
     int owned_descriptor = -1;
-    dtv_internal_result open_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    dtv_runtime_clock clock{};
-    dtv_usb_io io{};
-    ~State()
+
+    ~UsbHandleLease()
     {
         if (handle != nullptr) {
             for (auto interface = claimed_interfaces.rbegin();
                  interface != claimed_interfaces.rend(); ++interface) {
-                libusb_release_interface(handle, *interface);
+                context->backend->release_interface(handle, *interface);
             }
-            libusb_close(handle);
+            context->backend->close_handle(handle);
         }
 #if defined(__linux__)
         if (owned_descriptor >= 0) {
@@ -66,6 +127,56 @@ struct UsbDevice::State {
 #endif
     }
 };
+
+struct UsbDevice::State {
+    struct IoBinding {
+        std::shared_ptr<UsbHandleLease> handle;
+        const dtv_runtime_clock *clock = nullptr;
+    } binding;
+    dtv_internal_result open_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    dtv_runtime_clock clock{};
+    dtv_usb_io io{};
+};
+
+struct UsbTransferRequest {
+    std::shared_ptr<UsbHandleLease> handle;
+    libusb_transfer *transfer = nullptr;
+    std::vector<unsigned char> buffer;
+    unsigned char *input_target = nullptr;
+    std::size_t input_capacity = 0;
+    std::size_t input_offset = 0;
+    std::size_t input_length = 0;
+    bool input = false;
+    bool output = false;
+    bool report_length = false;
+    std::mutex mutex;
+    std::condition_variable completed_condition;
+    bool completed = false;
+    bool callback_returned = false;
+    libusb_transfer_status status = LIBUSB_TRANSFER_ERROR;
+    int actual_length = 0;
+
+    ~UsbTransferRequest()
+    {
+        if (transfer != nullptr) {
+            handle->context->backend->free_transfer(transfer);
+        }
+    }
+};
+
+void UsbContext::State::mark_callbacks_returned()
+{
+    std::lock_guard lock(requests_mutex);
+    for (const auto &[transfer, request] : requests) {
+        (void)transfer;
+        {
+            std::lock_guard request_lock(request->mutex);
+            if (!request->completed) continue;
+            request->callback_returned = true;
+        }
+        request->completed_condition.notify_one();
+    }
+}
 
 namespace {
 
@@ -134,21 +245,118 @@ dtv_internal_result no_context()
                        static_cast<std::uint32_t>(-LIBUSB_ERROR_OTHER));
 }
 
+void transfer_completed(libusb_transfer *transfer)
+{
+    auto *request = static_cast<UsbTransferRequest *>(transfer->user_data);
+    {
+        std::lock_guard lock(request->mutex);
+        request->status = transfer->status;
+        request->actual_length = transfer->actual_length;
+        request->completed = true;
+    }
+    request->completed_condition.notify_one();
+}
+
+int transfer_error(libusb_transfer_status status)
+{
+    switch (status) {
+    case LIBUSB_TRANSFER_TIMED_OUT:
+        return LIBUSB_ERROR_TIMEOUT;
+    case LIBUSB_TRANSFER_CANCELLED:
+        return LIBUSB_ERROR_INTERRUPTED;
+    case LIBUSB_TRANSFER_STALL:
+        return LIBUSB_ERROR_PIPE;
+    case LIBUSB_TRANSFER_NO_DEVICE:
+        return LIBUSB_ERROR_NO_DEVICE;
+    case LIBUSB_TRANSFER_OVERFLOW:
+        return LIBUSB_ERROR_OVERFLOW;
+    case LIBUSB_TRANSFER_ERROR:
+    default:
+        return LIBUSB_ERROR_OTHER;
+    }
+}
+
+dtv_internal_result wait_for_transfer(const std::shared_ptr<UsbTransferRequest> &request,
+                                     std::size_t *out_actual_length)
+{
+    auto &context = *request->handle->context;
+    {
+        std::lock_guard lock(context.requests_mutex);
+        context.requests.emplace(request->transfer, request);
+    }
+    const int submit_result = context.backend->submit_transfer(request->transfer);
+    if (submit_result != LIBUSB_SUCCESS) {
+        {
+            std::lock_guard lock(context.requests_mutex);
+            context.requests.erase(request->transfer);
+        }
+        return usb_result(submit_result);
+    }
+
+    libusb_transfer_status status;
+    int actual_length;
+    {
+        std::unique_lock lock(request->mutex);
+        request->completed_condition.wait(lock, [&] {
+            return request->completed && request->callback_returned;
+        });
+        status = request->status;
+        actual_length = request->actual_length;
+    }
+    {
+        std::lock_guard lock(context.requests_mutex);
+        context.requests.erase(request->transfer);
+    }
+
+    const auto transferred = (std::max)(actual_length, 0);
+    if (out_actual_length != nullptr) {
+        *out_actual_length = static_cast<std::size_t>(transferred);
+    }
+    if (request->input && request->input_target != nullptr) {
+        const auto copied = (std::min)(static_cast<std::size_t>(transferred),
+                                       request->input_capacity);
+        std::copy_n(request->buffer.data() + request->input_offset, copied,
+                    request->input_target);
+    }
+    if (status != LIBUSB_TRANSFER_COMPLETED) {
+        return usb_result(transfer_error(status));
+    }
+    if (request->output && static_cast<std::size_t>(transferred) != request->input_length) {
+        return make_result(DTV_INTERNAL_RESULT_USB_IO,
+                           static_cast<std::uint32_t>(transferred));
+    }
+    return make_result(DTV_INTERNAL_RESULT_OK,
+                       request->report_length ? static_cast<std::uint32_t>(transferred) : 0);
+}
+
+std::shared_ptr<UsbTransferRequest> make_transfer_request(
+    const std::shared_ptr<UsbHandleLease> &handle, std::size_t buffer_size)
+{
+    auto request = std::make_shared<UsbTransferRequest>();
+    request->handle = handle;
+    request->buffer.resize(buffer_size);
+    request->transfer = handle->context->backend->allocate_transfer();
+    if (request->transfer == nullptr) {
+        throw std::bad_alloc();
+    }
+    return request;
+}
+
 dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
                             std::uint8_t request, std::uint16_t value,
                             std::uint16_t index, dtv_buffer *data,
                             dtv_timeout timeout)
 {
-    auto *state = static_cast<UsbDevice::State *>(user);
+    auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
-    if (state == nullptr || state->handle == nullptr || data == nullptr ||
+    if (binding == nullptr || !binding->handle || binding->handle->handle == nullptr || data == nullptr ||
         data->capacity > UINT16_MAX ||
         data->size > data->capacity ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, state->io.clock,
+    const auto timeout_conversion = transfer_timeout(timeout, binding->clock,
                                                      &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
         return failure;
@@ -159,30 +367,46 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
     }
     const bool input = (request_type & LIBUSB_ENDPOINT_IN) != 0;
     const auto length = input ? data->capacity : data->size;
-    const int transferred = libusb_control_transfer(
-        state->handle, request_type, request, value, index, data->data,
-        static_cast<std::uint16_t>(length), milliseconds);
-    if (transferred < 0) {
-        return usb_result(transferred);
+    try {
+        auto request_state = make_transfer_request(binding->handle,
+            LIBUSB_CONTROL_SETUP_SIZE + static_cast<std::size_t>(length));
+        request_state->input = input;
+        request_state->output = !input;
+        request_state->input_length = length;
+        request_state->input_target = input ? data->data : nullptr;
+        request_state->input_capacity = input ? data->capacity : 0;
+        request_state->input_offset = LIBUSB_CONTROL_SETUP_SIZE;
+        libusb_fill_control_setup(request_state->buffer.data(), request_type, request,
+                                  value, index, static_cast<std::uint16_t>(length));
+        if (!input && length != 0) {
+            std::copy_n(data->data, static_cast<std::size_t>(length),
+                        request_state->buffer.data() + LIBUSB_CONTROL_SETUP_SIZE);
+        }
+        libusb_fill_control_transfer(request_state->transfer, binding->handle->handle,
+                                     request_state->buffer.data(), transfer_completed,
+                                     request_state.get(), milliseconds);
+        std::size_t transferred = 0;
+        auto result = wait_for_transfer(request_state, &transferred);
+        if (request_state->status == LIBUSB_TRANSFER_COMPLETED) {
+            data->size = transferred;
+        }
+        return result;
+    } catch (...) {
+        return exception_result();
     }
-    data->size = static_cast<std::uint64_t>(transferred);
-    if (!input && data->size != length) {
-        return make_result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(transferred));
-    }
-    return make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
                              dtv_bytes data, dtv_timeout timeout)
 {
-    auto *state = static_cast<UsbDevice::State *>(user);
+    auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
-    if (state == nullptr || state->handle == nullptr || data.size > INT_MAX ||
+    if (binding == nullptr || !binding->handle || binding->handle->handle == nullptr || data.size > INT_MAX ||
         (data.size != 0 && data.data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, state->io.clock,
+    const auto timeout_conversion = transfer_timeout(timeout, binding->clock,
                                                      &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
         return failure;
@@ -190,31 +414,42 @@ dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
     if (timeout_conversion == TimeoutConversion::no_wait) {
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
-    int transferred = 0;
-    const int result = libusb_bulk_transfer(
-        state->handle, endpoint, const_cast<unsigned char *>(data.data),
-        static_cast<int>(data.size), &transferred, milliseconds);
-    if (result != LIBUSB_SUCCESS) {
-        return usb_result(result);
+    try {
+        auto request_state = make_transfer_request(binding->handle, data.size);
+        if (data.size != 0) {
+            std::copy_n(data.data, static_cast<std::size_t>(data.size),
+                        request_state->buffer.data());
+        }
+        request_state->output = true;
+        request_state->report_length = true;
+        request_state->input_length = static_cast<std::size_t>(data.size);
+        libusb_fill_bulk_transfer(request_state->transfer, binding->handle->handle,
+                                  endpoint, request_state->buffer.data(),
+                                  static_cast<int>(data.size), transfer_completed,
+                                  request_state.get(), milliseconds);
+        auto result = wait_for_transfer(request_state, nullptr);
+        if (result.code == DTV_INTERNAL_RESULT_OK && result.detail != data.size) {
+            return make_result(DTV_INTERNAL_RESULT_USB_IO, result.detail);
+        }
+        return result;
+    } catch (...) {
+        return exception_result();
     }
-    return static_cast<std::uint64_t>(transferred) == data.size
-        ? make_result(DTV_INTERNAL_RESULT_OK, static_cast<std::uint32_t>(transferred))
-        : make_result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(transferred));
 }
 
 dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
                           dtv_buffer *data, dtv_timeout timeout,
                           bool interrupt)
 {
-    auto *state = static_cast<UsbDevice::State *>(user);
+    auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
-    if (state == nullptr || state->handle == nullptr || data == nullptr ||
+    if (binding == nullptr || !binding->handle || binding->handle->handle == nullptr || data == nullptr ||
         data->capacity > INT_MAX ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, state->io.clock,
+    const auto timeout_conversion = transfer_timeout(timeout, binding->clock,
                                                      &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
         return failure;
@@ -223,20 +458,30 @@ dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
         data->size = 0;
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
-    int transferred = 0;
-    const int result = interrupt
-        ? libusb_interrupt_transfer(state->handle, endpoint, data->data,
-                                    static_cast<int>(data->capacity), &transferred,
-                                    milliseconds)
-        : libusb_bulk_transfer(state->handle, endpoint, data->data,
-                               static_cast<int>(data->capacity), &transferred,
-                               milliseconds);
-    if (result != LIBUSB_SUCCESS) {
-        data->size = transferred < 0 ? 0 : static_cast<std::uint64_t>(transferred);
-        return usb_result(result);
+    try {
+        auto request_state = make_transfer_request(binding->handle, data->capacity);
+        request_state->input = true;
+        request_state->input_target = data->data;
+        request_state->input_capacity = data->capacity;
+        request_state->input_length = data->capacity;
+        if (interrupt) {
+            libusb_fill_interrupt_transfer(request_state->transfer, binding->handle->handle,
+                                           endpoint, request_state->buffer.data(),
+                                           static_cast<int>(data->capacity), transfer_completed,
+                                           request_state.get(), milliseconds);
+        } else {
+            libusb_fill_bulk_transfer(request_state->transfer, binding->handle->handle,
+                                      endpoint, request_state->buffer.data(),
+                                      static_cast<int>(data->capacity), transfer_completed,
+                                      request_state.get(), milliseconds);
+        }
+        std::size_t transferred = 0;
+        auto result = wait_for_transfer(request_state, &transferred);
+        data->size = transferred;
+        return result;
+    } catch (...) {
+        return exception_result();
     }
-    data->size = static_cast<std::uint64_t>(transferred);
-    return make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result bulk_in_transfer(void *user, std::uint8_t endpoint,
@@ -264,6 +509,12 @@ UsbContext::UsbContext() : state_(std::make_shared<State>())
     const int result = libusb_init(&state_->context);
     if (result != LIBUSB_SUCCESS) {
         state_->result = usb_result(result);
+        return;
+    }
+    try {
+        state_->start_event_thread();
+    } catch (...) {
+        state_->result = exception_result();
     }
 }
 
@@ -371,7 +622,8 @@ dtv_internal_result UsbDevice::result() const
 
 const dtv_usb_io *UsbDevice::io() const
 {
-    return state_ && state_->handle != nullptr && !state_->claimed_interfaces.empty()
+    return state_ && state_->binding.handle && state_->binding.handle->handle != nullptr &&
+                   !state_->binding.handle->claimed_interfaces.empty()
                ? &state_->io
                : nullptr;
 }
@@ -396,9 +648,14 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
     auto device_state = std::make_unique<UsbDevice::State>();
     if (clock != nullptr) {
         device_state->clock = *clock;
+        device_state->binding.clock = &device_state->clock;
     }
-    device_state->context = state_;
-    if (!state_ || state_->context == nullptr || !snapshot.state_ ||
+    if (state_) {
+        device_state->binding.handle = std::make_shared<UsbHandleLease>();
+        device_state->binding.handle->context = state_;
+    }
+    if (!state_ || state_->context == nullptr || !state_->event_thread.joinable() ||
+        state_->result.code != DTV_INTERNAL_RESULT_OK || !snapshot.state_ ||
         snapshot.state_->context != state_ || claims.empty()) {
         device_state->open_result = invalid();
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
@@ -435,7 +692,7 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
     }
     std::unique_ptr<libusb_config_descriptor, decltype(&libusb_free_config_descriptor)>
         configuration_guard(configuration, &libusb_free_config_descriptor);
-    device_state->claimed_interfaces.reserve(claims.size());
+    device_state->binding.handle->claimed_interfaces.reserve(claims.size());
     std::vector<int> seen_interfaces;
     seen_interfaces.reserve(claims.size());
     for (const auto &claim : claims) {
@@ -460,14 +717,16 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
             return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
         }
     }
-    status = libusb_open(snapshot.state_->device, &device_state->handle);
+    status = libusb_open(snapshot.state_->device, &device_state->binding.handle->handle);
     for (const auto &claim : claims) {
         if (status != LIBUSB_SUCCESS) break;
-        status = libusb_claim_interface(device_state->handle, claim.interface_number);
+        status = libusb_claim_interface(device_state->binding.handle->handle,
+                                        claim.interface_number);
         if (status != LIBUSB_SUCCESS) break;
-        device_state->claimed_interfaces.push_back(claim.interface_number);
+        device_state->binding.handle->claimed_interfaces.push_back(claim.interface_number);
         if (claim.alternate_setting != 0) {
-            status = libusb_set_interface_alt_setting(device_state->handle, claim.interface_number,
+            status = libusb_set_interface_alt_setting(device_state->binding.handle->handle,
+                                                       claim.interface_number,
                                                        claim.alternate_setting);
         }
     }
@@ -475,7 +734,7 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
         device_state->open_result = usb_result(status);
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    device_state->io = make_io(device_state.get(), clock != nullptr ? &device_state->clock : nullptr);
+    device_state->io = make_io(&device_state->binding, device_state->binding.clock);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 }
 
@@ -495,23 +754,32 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
         *result = invalid();
         return nullptr;
     }
-    device_state->context = std::make_shared<UsbContext::State>();
-    const int init_result = libusb_init(&device_state->context->context);
+    device_state->binding.handle = std::make_shared<UsbHandleLease>();
+    device_state->binding.handle->context = std::make_shared<UsbContext::State>();
+    auto &context = *device_state->binding.handle->context;
+    const int init_result = libusb_init(&context.context);
     if (init_result != LIBUSB_SUCCESS) {
         close(owned_descriptor);
         *result = usb_result(init_result);
         return nullptr;
     }
-    const int wrap_result = libusb_wrap_sys_device(device_state->context->context,
+    try {
+        context.start_event_thread();
+    } catch (...) {
+        close(owned_descriptor);
+        *result = exception_result();
+        return nullptr;
+    }
+    const int wrap_result = libusb_wrap_sys_device(context.context,
                                                    owned_descriptor,
-                                                   &device_state->handle);
+                                                   &device_state->binding.handle->handle);
     if (wrap_result != LIBUSB_SUCCESS) {
         close(owned_descriptor);
         *result = usb_result(wrap_result);
         return nullptr;
     }
-    device_state->owned_descriptor = owned_descriptor;
-    auto *wrapped_device = libusb_get_device(device_state->handle);
+    device_state->binding.handle->owned_descriptor = owned_descriptor;
+    auto *wrapped_device = libusb_get_device(device_state->binding.handle->handle);
     libusb_device_descriptor descriptor_info{};
     libusb_config_descriptor *configuration = nullptr;
     int descriptor_result = wrapped_device == nullptr
@@ -543,15 +811,16 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    device_state->claimed_interfaces.reserve(1);
-    const int claim_result = libusb_claim_interface(device_state->handle, interface_number);
+    device_state->binding.handle->claimed_interfaces.reserve(1);
+    const int claim_result = libusb_claim_interface(device_state->binding.handle->handle,
+                                                    interface_number);
     if (claim_result != LIBUSB_SUCCESS) {
         device_state->open_result = usb_result(claim_result);
         *result = device_state->open_result;
         return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
     }
-    device_state->claimed_interfaces.push_back(interface_number);
-    device_state->io = make_io(device_state.get(), nullptr);
+    device_state->binding.handle->claimed_interfaces.push_back(interface_number);
+    device_state->io = make_io(&device_state->binding, nullptr);
     *result = make_result(DTV_INTERNAL_RESULT_OK);
     return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(device_state)));
 #else
@@ -560,6 +829,24 @@ std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
     *result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
     return nullptr;
 #endif
+}
+
+std::unique_ptr<UsbDevice> UsbTestDeviceFactory::create(
+    std::shared_ptr<UsbTransferBackend> backend, libusb_device_handle *handle,
+    std::vector<int> claimed_interfaces, int owned_descriptor)
+{
+    auto context = std::make_shared<UsbContext::State>();
+    context->backend = std::move(backend);
+    context->context = reinterpret_cast<libusb_context *>(1);
+    context->start_event_thread();
+    auto state = std::make_unique<UsbDevice::State>();
+    state->binding.handle = std::make_shared<UsbHandleLease>();
+    state->binding.handle->context = std::move(context);
+    state->binding.handle->handle = handle;
+    state->binding.handle->claimed_interfaces = std::move(claimed_interfaces);
+    state->binding.handle->owned_descriptor = owned_descriptor;
+    state->io = make_io(&state->binding, nullptr);
+    return std::unique_ptr<UsbDevice>(new UsbDevice(std::move(state)));
 }
 
 }

@@ -151,7 +151,7 @@ extern const dtv::spi::FunctionEntry sample_functions[]{
 #### 最小の使い方
 
 ```c
-dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_IO_ERROR, 0);
+dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
 dtv_internal_result_set_diagnostic(&result, "bulk transfer timeout", 21);
 return result;
 ```
@@ -165,6 +165,30 @@ return result;
 本内部 SPI の診断欄は内部での生成・保持・値伝播を対象としたものであり、公開 L3 の `dtv_error.message` アダプターへの接続は未接続である。
 
 成功時や診断なし時の公開バッファ消去規則、文字エンコーディングおよびマルチバイト文字境界での切詰め処理、ならびに主たる失敗（primary failure）とクリーンアップ失敗（cleanup failure）の個別報告仕様は未決事項として扱われる。本内部 SPI の定義によってこれらに関する公開保証を新たに追加するものではなく、既存のクリーンアップ失敗破棄の動作（主たる失敗がクリーンアップ結果で上書きされない挙動）もそのまま維持される。
+
+## 内部 USB 転送所有と同期 I/O シム（dtv_usb_io）
+
+製品コールバックが使用する `dtv_usb_io`（`include/dtv/spi/types.h`）の同期関数シグネチャ、戻り値（`dtv_internal_result`）、および転送長（actual length）の意味は維持されている。Core 内部では、直接の同期 libusb 呼び出しに代わり、非同期 libusb transfer と呼び出し元スレッド上の同期待機（waiter）を組み合わせた内部シム経由で処理される。
+
+### 内部イベントサービスとデータ転送
+
+- **イベントサービスとレジストリ**: `UsbContext::State` ごとに 1 つのイベントサービススレッドが起動され、transfer request registry を所有・管理する。
+- **バッファのステージングとコピー**: OUT 転送および control 転送の送信データは submit 前にリクエスト専用バッファへコピーされる。IN 転送は Core 内部のステージングバッファで受信され、リクエスト完了後に呼び出し側のバッファへコピーバックされる。
+- **スレッド分離**: libusb の completion コールバックは転送状態と受信長を記録して waiter を起床させる処理のみを行い、製品コールバックをイベントスレッドから呼び出すことはない。waiter は completion コールバックがイベントハンドラから復帰したことを確認した上で結果を読み出す。
+
+### RAII 所有権とリースのライフサイクル
+
+各リクエストは完了してレジストリから外れるまで handle lease を保持する。この lease は context、デバイスハンドル、インターフェース、および Core が複製・所有する FD（owned FD lease）の有効性を保護する。すべてのリクエストが完了して最後の lease が解放された時点で、インターフェースが逆順に解放（reverse release）され、ハンドルおよび FD がクローズされる。通常オープンと `open_usb_fd` は同一の lease / runtime 型を使用する。
+
+### タイムアウトの扱い
+
+内部 USB I/O における `timeout = 0` は即時返却（no-wait）を、`UINT64_MAX` は無期限待機を意味する。これは公開 L3 API における `timeout_ms = 0`（無期限）という契約とは区別される。
+
+### テスト治具と未接続事項
+
+内部 fake transfer backend は、実機に依存せず Core の I/O バインディング、lease、FD 所有状態を検証するためのテスト用 seam である。通常環境での `libusb_open` や claim、`libusb_wrap_sys_device` の実行、実機 USB での転送、ならびに Android や Chrome（WebUSB）環境での動作を証明するものではない。
+
+また、後続段階で扱われる cancel / close ライフサイクル、公開 PENDING / CLOSED 状態、ファームウェア再列挙、FD / token 供給、TS 処理、attachment latch は未接続であり、本実装をもって B2 全体が完了したわけではない。
 
 ## ライセンスと由来
 
