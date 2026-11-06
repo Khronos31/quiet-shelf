@@ -18,7 +18,7 @@ int main()
         return 2;
     }
 
-    dtv_result result{};
+    dtv_internal_result result{};
     if (dtv::internal::open_usb_fd(-1, 0, &result) || result.code != 2) {
         return 3;
     }

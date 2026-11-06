@@ -17,9 +17,9 @@ int print_help(const dtv_cli_config *config)
     return 0;
 }
 
-int print_models(dtv_model_provider model_at, size_t model_count)
+int print_models(dtv_model_at_fn model_at, uint32_t model_count)
 {
-    for (size_t i = 0; i < model_count; ++i) {
+    for (uint32_t i = 0; i < model_count; ++i) {
         const dtv_model_info *model = nullptr;
         try {
             model = model_at(i);
@@ -55,16 +55,17 @@ bool has_argument(int argc, const char *const argv[], const char *argument)
 
 extern "C" uint32_t dtv_api_version(void)
 {
-    return 1;
+    return UINT32_C(0x00020000);
 }
 
-extern "C" int dtv_cli_main(int argc,
-                            const char *const argv[],
-                            const dtv_cli_config *config,
-                            dtv_model_provider model_at,
-                            size_t model_count)
+extern "C" int32_t dtv_cli_main(int32_t argc,
+                                const char *const argv[],
+                                const dtv_cli_config *config,
+                                dtv_model_at_fn model_at,
+                                uint32_t model_count)
 {
     if (argc < 1 || argv == nullptr || config == nullptr ||
+        config->struct_size < sizeof(dtv_cli_config) ||
         config->product_name == nullptr || config->command_name == nullptr ||
         config->version == nullptr || config->default_model == nullptr ||
         (model_count != 0 && model_at == nullptr)) {

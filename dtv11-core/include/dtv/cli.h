@@ -2,43 +2,39 @@
 #ifndef DTV_CLI_H
 #define DTV_CLI_H
 
-#include <stddef.h>
 #include <stdint.h>
+
+#include <dtv/types.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct dtv_model_info {
-    /* Borrowed product-owned model name. */
-    const char *name;
-    uint16_t vendor_id;
-    uint16_t product_id;
-} dtv_model_info;
-
 typedef struct dtv_cli_config {
-    /* All strings are borrowed for the duration of dtv_cli_main. */
+    uint32_t struct_size;
+    /* 文字列はdtv_cli_mainの呼出し中だけ借用する。 */
     const char *product_name;
     const char *command_name;
     const char *version;
     const char *default_model;
 } dtv_cli_config;
 
-typedef const dtv_model_info *(*dtv_model_provider)(size_t index);
+typedef const dtv_model_info *(*dtv_model_at_fn)(uint32_t index);
 
-/* Returns the source API version. */
+/* モデル名は製品moduleの寿命中有効な借用文字列。 */
+dtv_result dtv_model_count(uint32_t *out_count);
+dtv_result dtv_model_get(uint32_t index, dtv_model_info *out_model);
+
 uint32_t dtv_api_version(void);
 
 /*
- * Reads but does not modify argv, config, or model data. It retains no caller memory.
- * model_at returns a borrowed descriptor whose name remains valid during this call.
- * Output is written to stdout/stderr. No C++ exception crosses this C ABI.
+ * model_atが返すdescriptorは呼出し中だけ借用する。
  */
-int dtv_cli_main(int argc,
+int32_t dtv_cli_main(int32_t argc,
                  const char *const argv[],
                  const dtv_cli_config *config,
-                 dtv_model_provider model_at,
-                 size_t model_count);
+                 dtv_model_at_fn model_at,
+                 uint32_t model_count);
 
 #ifdef __cplusplus
 }

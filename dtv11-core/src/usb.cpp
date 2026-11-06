@@ -17,7 +17,7 @@ namespace dtv::internal {
 
 struct UsbContext::State {
     libusb_context *context = nullptr;
-    dtv_result result = {0, 0};
+    dtv_internal_result result = {0, 0};
     ~State()
     {
         if (context != nullptr) {
@@ -42,7 +42,7 @@ struct UsbDevice::State {
     libusb_device_handle *handle = nullptr;
     int interface_number = -1;
     int owned_descriptor = -1;
-    dtv_result open_result = {0, 0};
+    dtv_internal_result open_result = {0, 0};
     dtv_usb_io io{};
     ~State()
     {
@@ -67,12 +67,12 @@ constexpr std::int32_t unsupported = 3;
 constexpr std::int32_t usb_error = 7;
 constexpr std::int32_t timeout_error = 10;
 
-dtv_result make_result(std::int32_t code, std::uint32_t detail = 0)
+dtv_internal_result make_result(std::int32_t code, std::uint32_t detail = 0)
 {
     return {code, detail};
 }
 
-dtv_result usb_result(int code)
+dtv_internal_result usb_result(int code)
 {
     if (code == LIBUSB_ERROR_TIMEOUT) {
         return make_result(timeout_error, static_cast<std::uint32_t>(-code));
@@ -102,17 +102,17 @@ TimeoutConversion transfer_timeout(dtv_timeout timeout, unsigned int *millisecon
     return TimeoutConversion::ready;
 }
 
-dtv_result invalid()
+dtv_internal_result invalid()
 {
     return make_result(invalid_argument);
 }
 
-dtv_result no_context()
+dtv_internal_result no_context()
 {
     return make_result(usb_error, static_cast<std::uint32_t>(-LIBUSB_ERROR_OTHER));
 }
 
-dtv_result control_transfer(void *user, std::uint8_t request_type,
+dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
                             std::uint8_t request, std::uint16_t value,
                             std::uint16_t index, dtv_buffer *data,
                             dtv_timeout timeout)
@@ -148,7 +148,7 @@ dtv_result control_transfer(void *user, std::uint8_t request_type,
     return make_result(0);
 }
 
-dtv_result bulk_out_transfer(void *user, std::uint8_t endpoint,
+dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
                              dtv_bytes data, dtv_timeout timeout)
 {
     auto *state = static_cast<UsbDevice::State *>(user);
@@ -176,7 +176,7 @@ dtv_result bulk_out_transfer(void *user, std::uint8_t endpoint,
         : make_result(usb_error, static_cast<std::uint32_t>(transferred));
 }
 
-dtv_result input_transfer(void *user, std::uint8_t endpoint,
+dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
                           dtv_buffer *data, dtv_timeout timeout,
                           bool interrupt)
 {
@@ -211,13 +211,13 @@ dtv_result input_transfer(void *user, std::uint8_t endpoint,
     return make_result(0);
 }
 
-dtv_result bulk_in_transfer(void *user, std::uint8_t endpoint,
+dtv_internal_result bulk_in_transfer(void *user, std::uint8_t endpoint,
                             dtv_buffer *data, dtv_timeout timeout)
 {
     return input_transfer(user, endpoint, data, timeout, false);
 }
 
-dtv_result interrupt_in_transfer(void *user, std::uint8_t endpoint,
+dtv_internal_result interrupt_in_transfer(void *user, std::uint8_t endpoint,
                                  dtv_buffer *data, dtv_timeout timeout)
 {
     return input_transfer(user, endpoint, data, timeout, true);
@@ -243,12 +243,12 @@ UsbContext::~UsbContext() = default;
 UsbContext::UsbContext(UsbContext &&) noexcept = default;
 UsbContext &UsbContext::operator=(UsbContext &&) noexcept = default;
 
-dtv_result UsbContext::result() const
+dtv_internal_result UsbContext::result() const
 {
     return state_ ? state_->result : no_context();
 }
 
-std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_result *result) const
+std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result) const
 {
     std::vector<UsbDeviceSnapshot> snapshots;
     if (!state_ || state_->context == nullptr) {
@@ -300,7 +300,7 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_result *result) const
 UsbDevice::UsbDevice(std::unique_ptr<State> state) : state_(std::move(state)) {}
 UsbDevice::~UsbDevice() = default;
 
-dtv_result UsbDevice::result() const
+dtv_internal_result UsbDevice::result() const
 {
     return state_ ? state_->open_result : no_context();
 }
@@ -381,7 +381,7 @@ std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
 }
 
 std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
-                                       dtv_result *result)
+                                       dtv_internal_result *result)
 {
     auto device_state = std::make_unique<UsbDevice::State>();
     if (result == nullptr || descriptor < 0 || interface_number < 0 || interface_number > 255) {

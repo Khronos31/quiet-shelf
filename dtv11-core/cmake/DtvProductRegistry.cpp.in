@@ -18,13 +18,21 @@ std::span<const ModelEntry *const> product_models()
 
 }
 
-extern "C" size_t dtv_product_model_count(void)
+extern "C" dtv_result dtv_model_count(uint32_t *out_count)
 {
-    return dtv::spi::product_models().size();
+    if (out_count == nullptr) {
+        return {DTV_ERROR_INVALID_ARGUMENT, 0};
+    }
+    *out_count = static_cast<uint32_t>(dtv::spi::product_models().size());
+    return {DTV_ERROR_OK, 0};
 }
 
-extern "C" const dtv_model_info *dtv_product_model_at(size_t index)
+extern "C" dtv_result dtv_model_get(uint32_t index, dtv_model_info *out_model)
 {
     const auto models = dtv::spi::product_models();
-    return index < models.size() ? &models[index]->model : nullptr;
+    if (out_model == nullptr || index >= models.size()) {
+        return {DTV_ERROR_INVALID_ARGUMENT, 0};
+    }
+    *out_model = models[index]->model;
+    return {DTV_ERROR_OK, 0};
 }

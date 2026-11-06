@@ -4,31 +4,21 @@
 
 #include <stdint.h>
 
+#include <dtv/types.h>
+
 typedef void dtv_context;
 
 typedef struct dtv_open_args dtv_open_args;
 typedef struct dtv_identify_info dtv_identify_info;
 typedef struct dtv_firmware_result dtv_firmware_result;
-typedef struct dtv_tune_result dtv_tune_result;
+typedef struct dtv_spi_tune_result dtv_spi_tune_result;
 typedef struct dtv_signal_result dtv_signal_result;
-struct dtv_model_info;
 
-typedef uint64_t dtv_device;
-typedef uint64_t dtv_stream;
+typedef uint64_t dtv_device_id;
+typedef uint64_t dtv_stream_id;
 typedef uint32_t dtv_receiver;
 typedef uint32_t dtv_function;
 typedef uint64_t dtv_fw_key;
-
-typedef struct dtv_bytes {
-    const uint8_t *data;
-    uint64_t size;
-} dtv_bytes;
-
-typedef struct dtv_buffer {
-    uint8_t *data;
-    uint64_t capacity;
-    uint64_t size;
-} dtv_buffer;
 
 typedef struct dtv_timeout {
     uint64_t timeout_ms;
@@ -40,24 +30,19 @@ struct dtv_open_args {
     dtv_timeout timeout;
 };
 
-typedef struct dtv_result {
+typedef struct dtv_internal_result {
+    /* 内部SPI/USB用番号。dtv_resultの公開L3番号へ直接コピーしない。 */
     int32_t code;
     uint32_t detail;
-} dtv_result;
-
-typedef struct dtv_measurement {
-    uint64_t value;
-    uint32_t valid;
-    uint32_t unit;
-} dtv_measurement;
+} dtv_internal_result;
 
 typedef struct dtv_usb_io {
     void *user;
-    dtv_result (*control)(void *, uint8_t, uint8_t, uint16_t, uint16_t,
+    dtv_internal_result (*control)(void *, uint8_t, uint8_t, uint16_t, uint16_t,
                           dtv_buffer *, dtv_timeout);
-    dtv_result (*bulk_out)(void *, uint8_t, dtv_bytes, dtv_timeout);
-    dtv_result (*bulk_in)(void *, uint8_t, dtv_buffer *, dtv_timeout);
-    dtv_result (*interrupt_in)(void *, uint8_t, dtv_buffer *, dtv_timeout);
+    dtv_internal_result (*bulk_out)(void *, uint8_t, dtv_bytes, dtv_timeout);
+    dtv_internal_result (*bulk_in)(void *, uint8_t, dtv_buffer *, dtv_timeout);
+    dtv_internal_result (*interrupt_in)(void *, uint8_t, dtv_buffer *, dtv_timeout);
 } dtv_usb_io;
 
 typedef struct dtv_pid_route {
@@ -88,7 +73,7 @@ struct dtv_firmware_result {
     uint32_t transition;
 };
 
-struct dtv_tune_result {
+struct dtv_spi_tune_result {
     uint64_t revision;
 };
 

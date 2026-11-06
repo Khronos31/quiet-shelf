@@ -40,8 +40,8 @@ public:
     UsbContext(UsbContext &&) noexcept;
     UsbContext &operator=(UsbContext &&) noexcept;
 
-    dtv_result result() const;
-    std::vector<UsbDeviceSnapshot> enumerate(dtv_result *result = nullptr) const;
+    dtv_internal_result result() const;
+    std::vector<UsbDeviceSnapshot> enumerate(dtv_internal_result *result = nullptr) const;
     std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &, int interface_number) const;
 
 private:
@@ -55,19 +55,19 @@ public:
     UsbDevice(const UsbDevice &) = delete;
     UsbDevice &operator=(const UsbDevice &) = delete;
 
-    dtv_result result() const;
+    dtv_internal_result result() const;
     const dtv_usb_io *io() const;
 
 private:
     explicit UsbDevice(std::unique_ptr<State>);
     std::unique_ptr<State> state_;
     friend class UsbContext;
-    friend std::unique_ptr<UsbDevice> open_usb_fd(int, int, dtv_result *);
+    friend std::unique_ptr<UsbDevice> open_usb_fd(int, int, dtv_internal_result *);
 };
 
 /* The input descriptor is borrowed; the Core duplicates and owns its wrapper FD. */
 std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
-                                       dtv_result *result);
+                                       dtv_internal_result *result);
 
 }
 
