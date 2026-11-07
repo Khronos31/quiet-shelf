@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <dtv/spi/device_ops.hpp>
+
+namespace dtv::spi {
+
+@model_declarations@
+
+extern const ProductEntry @PRODUCT_ENTRY_SYMBOL@{
+    "@PRODUCT_NAME@",
+    [] {
+        static const ModelEntry *const models[] = {
+@model_values@        };
+        return models;
+    }(),
+    @PRODUCT_MODELS_COUNT@
+};
+
+}
