@@ -91,7 +91,17 @@ struct ModelEntry {
     std::size_t function_count = 0;
     const OperationRequirement *operation_requirements = nullptr;
     std::size_t operation_requirement_count = 0;
+    /* 0/0 means not reported; TS sources use 188/0 or 192/4. */
+    std::uint16_t source_stride_bytes = 0;
+    std::uint8_t source_sync_offset_bytes = 0;
 };
+
+constexpr bool valid_source_metadata(const ModelEntry &model)
+{
+    return (model.source_stride_bytes == 0 && model.source_sync_offset_bytes == 0) ||
+           (model.source_stride_bytes == 188 && model.source_sync_offset_bytes == 0) ||
+           (model.source_stride_bytes == 192 && model.source_sync_offset_bytes == 4);
+}
 
 struct ProductEntry {
     const char *product_id;

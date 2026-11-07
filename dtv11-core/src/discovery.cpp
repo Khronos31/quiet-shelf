@@ -119,7 +119,7 @@ std::vector<BootGroupCandidate> discover_boot_candidates(
         }
         for (std::size_t m = 0; m < product->model_count; ++m) {
             const auto *model = product->models[m];
-            if (model == nullptr ||
+            if (model == nullptr || !dtv::spi::valid_source_metadata(*model) ||
                 (model->cold_identity_count > 0 && model->cold_identities == nullptr)) {
                 if (out_result) *out_result = invalid();
                 return {};

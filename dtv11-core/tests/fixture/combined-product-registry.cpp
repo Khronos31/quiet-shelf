@@ -92,6 +92,18 @@ int main()
     snapshot.interfaces.assign(interfaces.begin(), interfaces.end());
     const std::array snapshots{snapshot};
     dtv_internal_result result{};
+    const dtv::spi::ModelEntry invalid_metadata_model{
+        .model = {.vendor_id = 0x1234, .product_id = 0x1003},
+        .source_stride_bytes = 188,
+        .source_sync_offset_bytes = 4};
+    const dtv::spi::ModelEntry *invalid_metadata_models[]{&invalid_metadata_model};
+    const dtv::spi::ProductEntry invalid_metadata_product{"invalid-metadata",
+                                                            invalid_metadata_models, 1};
+    const dtv::spi::ProductEntry *invalid_metadata_products[]{&invalid_metadata_product};
+    auto rejected = dtv::internal::discover_boot_candidates(
+        snapshots, invalid_metadata_products, &result);
+    if (int failed = check(rejected.empty() &&
+                           result.code == DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 12)) return failed;
     selection_case = SelectionCase::complete;
     auto candidates = dtv::internal::discover_boot_candidates(snapshots, cold_products, &result);
     if (int failed = check(result.code == DTV_INTERNAL_RESULT_OK && candidates.size() == 2, 4)) return failed;

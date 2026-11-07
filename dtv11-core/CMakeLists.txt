@@ -51,6 +51,7 @@ add_library(dtv-userland STATIC
     src/discovery.cpp
     src/firmware.cpp
     src/result.cpp
+    src/ts-framer.cpp
     src/usb.cpp)
 add_library(dtv::userland ALIAS dtv-userland)
 target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -78,4 +79,7 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(i2c1_partial_boot_contract tests/i2c1-partial-boot.cpp)
     target_link_libraries(i2c1_partial_boot_contract PRIVATE dtv::userland)
     add_test(NAME i2c1_partial_boot_contract COMMAND i2c1_partial_boot_contract)
+    add_executable(ts_framer_contract tests/ts-framer.cpp)
+    target_link_libraries(ts_framer_contract PRIVATE dtv::userland)
+    add_test(NAME ts_framer_contract COMMAND ts_framer_contract)
 endif()
