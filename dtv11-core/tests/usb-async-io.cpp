@@ -572,6 +572,12 @@ bool io_callbacks()
     return callbacks_completed && drained && opened && released;
 }
 
+bool diagnostic_check(const char *name, bool passed)
+{
+    if (!passed) std::fprintf(stderr, "condition failed: %s\n", name);
+    return passed;
+}
+
 bool request_holds_fd_owner()
 {
 #if defined(__linux__)
@@ -604,11 +610,19 @@ bool request_holds_fd_owner()
     const bool owned_fd_closed = fcntl(owned, F_GETFD) < 0 && errno == EBADF;
     close(descriptors[0]);
     close(descriptors[1]);
-    return submitted && owned >= 0 && owned != descriptors[0] &&
-           backend->wrapped_one_fd(owned) && still_owned && held_until_completion && completed &&
-           caller_fd_open && owned_fd_closed && result.code == DTV_INTERNAL_RESULT_OK &&
-           closed.code == DTV_INTERNAL_RESULT_OK &&
-           backend->drained_and_closed() && backend->released_in_order({1});
+    return diagnostic_check("submitted", submitted) &&
+           diagnostic_check("owned_fd_valid", owned >= 0) &&
+           diagnostic_check("owned_fd_is_duplicate", owned != descriptors[0]) &&
+           diagnostic_check("fd_wrapped_by_backend", backend->wrapped_one_fd(owned)) &&
+           diagnostic_check("fd_retained_while_request_pending", still_owned) &&
+           diagnostic_check("request_owner_retained", held_until_completion) &&
+           diagnostic_check("transfer_completed", completed) &&
+           diagnostic_check("caller_fd_still_open", caller_fd_open) &&
+           diagnostic_check("owned_fd_closed_after_device_release", owned_fd_closed) &&
+           diagnostic_check("transfer_result_ok", result.code == DTV_INTERNAL_RESULT_OK) &&
+           diagnostic_check("close_result_ok", closed.code == DTV_INTERNAL_RESULT_OK) &&
+           diagnostic_check("backend_drained_and_closed", backend->drained_and_closed()) &&
+           diagnostic_check("interface_released", backend->released_in_order({1}));
 #else
     return true;
 #endif
@@ -696,12 +710,6 @@ bool cancel_and_deadline_wake_waiters()
            deadline_submitted && deadline_cancel_requested && deadline_woke &&
            deadline_completed_late && deadline_double_completion && deadline_late_unchanged &&
            backend->drained_and_released();
-}
-
-bool diagnostic_check(const char *name, bool passed)
-{
-    if (!passed) std::fprintf(stderr, "condition failed: %s\n", name);
-    return passed;
 }
 
 bool submit_failure_clears_previous_terminal_reason()

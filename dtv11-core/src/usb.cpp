@@ -1033,13 +1033,15 @@ dtv_internal_result UsbDevice::run_close_callback(
                     std::unique_lock lock(owner.requests_mutex);
                     owner.requests_condition.wait(lock, [&] { return closing_requests_drained(owner); });
                 }
+                auto *closed_handle = handle.get();
+                handle.reset();
                 {
-                    std::lock_guard lock(handle->close_mutex);
-                    handle->close_result = result;
-                    handle->close_job_done = true;
-                    handle->close_status.store(UsbCloseStatus::closed);
+                    std::lock_guard lock(closed_handle->close_mutex);
+                    closed_handle->close_result = result;
+                    closed_handle->close_job_done = true;
+                    closed_handle->close_status.store(UsbCloseStatus::closed);
                 }
-                handle->close_condition.notify_all();
+                closed_handle->close_condition.notify_all();
             });
         }
         context.lifecycle_condition.notify_one();
