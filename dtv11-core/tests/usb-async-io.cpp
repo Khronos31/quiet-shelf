@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstddef>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -697,6 +698,12 @@ bool cancel_and_deadline_wake_waiters()
            backend->drained_and_released();
 }
 
+bool diagnostic_check(const char *name, bool passed)
+{
+    if (!passed) std::fprintf(stderr, "condition failed: %s\n", name);
+    return passed;
+}
+
 bool submit_failure_clears_previous_terminal_reason()
 {
     auto backend = std::make_shared<FakeBackend>();
@@ -740,9 +747,24 @@ bool submit_failure_clears_previous_terminal_reason()
     const bool late_buffer_unchanged = first_bytes[0] == 0x5a && first_bytes[1] == 0x5a;
     device.reset();
     const bool drained = backend->drained_and_released();
-    return first_submitted && cancel_requested && first_cancelled &&
+    const bool passed = first_submitted && cancel_requested && first_cancelled &&
         second_failed_without_stale_reason && first_request_retained && late_completion &&
         late_buffer_unchanged && drained;
+    if (!passed) {
+        std::fprintf(stderr, "fixture conditions failed:");
+        if (!first_submitted) std::fprintf(stderr, " first_submitted");
+        if (!cancel_requested) std::fprintf(stderr, " cancel_requested");
+        if (!first_cancelled) std::fprintf(stderr, " first_cancelled");
+        if (!second_failed_without_stale_reason) {
+            std::fprintf(stderr, " second_failed_without_stale_reason");
+        }
+        if (!first_request_retained) std::fprintf(stderr, " first_request_retained");
+        if (!late_completion) std::fprintf(stderr, " late_completion");
+        if (!late_buffer_unchanged) std::fprintf(stderr, " late_buffer_unchanged");
+        if (!drained) std::fprintf(stderr, " drained");
+        std::fprintf(stderr, "\n");
+    }
+    return passed;
 }
 
 bool close_callback_pending_and_failure()
@@ -796,10 +818,17 @@ bool close_callback_pending_and_failure()
     const bool closed_state = device->close_status() == dtv::internal::UsbCloseStatus::closed;
     const bool close_is_separate = close_thread != std::this_thread::get_id();
     device.reset();
-    return pending_state && rejected.code == DTV_INTERNAL_RESULT_NOT_READY &&
-        closed.code == DTV_INTERNAL_RESULT_USB_IO && closed.detail == 42 && closed_state &&
-        cleanup_submitted && cleanup_completed && cleanup_io_result.code == DTV_INTERNAL_RESULT_OK &&
-        close_is_separate && calls == 1 && backend->drained_and_released();
+    return diagnostic_check("pending_state", pending_state) &&
+        diagnostic_check("ordinary_io_rejected", rejected.code == DTV_INTERNAL_RESULT_NOT_READY) &&
+        diagnostic_check("close_result", closed.code == DTV_INTERNAL_RESULT_USB_IO &&
+                         closed.detail == 42) &&
+        diagnostic_check("closed_state", closed_state) &&
+        diagnostic_check("cleanup_submitted", cleanup_submitted) &&
+        diagnostic_check("cleanup_completed", cleanup_completed) &&
+        diagnostic_check("cleanup_io_result", cleanup_io_result.code == DTV_INTERNAL_RESULT_OK) &&
+        diagnostic_check("close_callback_separate_thread", close_is_separate) &&
+        diagnostic_check("close_callback_once", calls == 1) &&
+        diagnostic_check("drained_and_released", backend->drained_and_released());
 }
 
 bool endpoint_cancel_cohort_is_not_success()
@@ -840,12 +869,24 @@ bool endpoint_cancel_cohort_is_not_success()
         second_result.code != DTV_INTERNAL_RESULT_OK && backend->drained_and_released();
 }
 
+bool run_fixture(const char *name, bool (*fixture)())
+{
+    const bool passed = fixture();
+    if (!passed) std::fprintf(stderr, "fixture failed: %s\n", name);
+    return passed;
+}
+
 }
 
 int main()
 {
-    return io_callbacks() && request_holds_fd_owner() && cancel_and_deadline_wake_waiters() &&
-           submit_failure_clears_previous_terminal_reason() &&
-           close_callback_pending_and_failure() && endpoint_cancel_cohort_is_not_success()
+    return run_fixture("io_callbacks", io_callbacks) &&
+           run_fixture("request_holds_fd_owner", request_holds_fd_owner) &&
+           run_fixture("cancel_and_deadline_wake_waiters", cancel_and_deadline_wake_waiters) &&
+           run_fixture("submit_failure_clears_previous_terminal_reason",
+                       submit_failure_clears_previous_terminal_reason) &&
+           run_fixture("close_callback_pending_and_failure", close_callback_pending_and_failure) &&
+           run_fixture("endpoint_cancel_cohort_is_not_success",
+                       endpoint_cancel_cohort_is_not_success)
         ? 0 : 1;
 }
