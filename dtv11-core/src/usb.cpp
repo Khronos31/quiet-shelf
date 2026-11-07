@@ -209,18 +209,22 @@ struct UsbDeviceSnapshot::State {
     }
 };
 
+struct UsbCloseState {
+    std::atomic<UsbCloseStatus> status{UsbCloseStatus::open};
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool job_started = false;
+    bool job_done = false;
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+};
+
 struct UsbHandleLease {
     std::shared_ptr<UsbContext::State> context;
     libusb_device_handle *handle = nullptr;
     std::vector<int> claimed_interfaces;
     int owned_descriptor = -1;
     std::atomic<bool> closing{false};
-    std::atomic<UsbCloseStatus> close_status{UsbCloseStatus::open};
-    std::mutex close_mutex;
-    std::condition_variable close_condition;
-    bool close_job_started = false;
-    bool close_job_done = false;
-    dtv_internal_result close_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    std::shared_ptr<UsbCloseState> close_state = std::make_shared<UsbCloseState>();
 
     ~UsbHandleLease()
     {
@@ -612,7 +616,7 @@ void record_no_wait_reason(UsbDevice::State::IoBinding *binding, dtv_timeout tim
 void begin_handle_close(const std::shared_ptr<UsbHandleLease> &handle)
 {
     if (!handle || handle->closing.exchange(true)) return;
-    handle->close_status.store(UsbCloseStatus::closing);
+    handle->close_state->status.store(UsbCloseStatus::closing);
     auto &context = *handle->context;
     std::vector<libusb_transfer *> transfers;
     {
@@ -1003,12 +1007,13 @@ dtv_internal_result UsbDevice::run_close_callback(
         return callback ? callback() : make_result(DTV_INTERNAL_RESULT_OK);
     }
     auto handle = state_->binding.handle;
+    auto close_state = handle->close_state;
     begin_handle_close(handle);
     bool start_job = false;
     {
-        std::lock_guard lock(handle->close_mutex);
-        if (!handle->close_job_started) {
-            handle->close_job_started = true;
+        std::lock_guard lock(close_state->mutex);
+        if (!close_state->job_started) {
+            close_state->job_started = true;
             start_job = true;
         }
     }
@@ -1016,7 +1021,8 @@ dtv_internal_result UsbDevice::run_close_callback(
         auto &context = *handle->context;
         {
             std::lock_guard lock(context.lifecycle_mutex);
-            context.lifecycle_jobs.emplace_back([handle, callback = std::move(callback)]() mutable {
+            context.lifecycle_jobs.emplace_back(
+                [handle, close_state, callback = std::move(callback)]() mutable {
                 auto &owner = *handle->context;
                 {
                     std::unique_lock lock(owner.requests_mutex);
@@ -1033,40 +1039,39 @@ dtv_internal_result UsbDevice::run_close_callback(
                     std::unique_lock lock(owner.requests_mutex);
                     owner.requests_condition.wait(lock, [&] { return closing_requests_drained(owner); });
                 }
-                auto *closed_handle = handle.get();
                 handle.reset();
                 {
-                    std::lock_guard lock(closed_handle->close_mutex);
-                    closed_handle->close_result = result;
-                    closed_handle->close_job_done = true;
-                    closed_handle->close_status.store(UsbCloseStatus::closed);
+                    std::lock_guard lock(close_state->mutex);
+                    close_state->result = result;
+                    close_state->job_done = true;
+                    close_state->status.store(UsbCloseStatus::closed);
                 }
-                closed_handle->close_condition.notify_all();
+                close_state->condition.notify_all();
             });
         }
         context.lifecycle_condition.notify_one();
     }
 
     const auto started = std::chrono::steady_clock::now();
-    std::unique_lock lock(handle->close_mutex);
-    while (!handle->close_job_done) {
+    std::unique_lock lock(close_state->mutex);
+    while (!close_state->job_done) {
         if (timeout.timeout_ms != UINT64_MAX &&
             std::chrono::steady_clock::now() - started >=
                 std::chrono::milliseconds(timeout.timeout_ms)) {
-            handle->close_status.store(UsbCloseStatus::pending);
+            close_state->status.store(UsbCloseStatus::pending);
             return make_result(DTV_INTERNAL_RESULT_NOT_READY);
         }
-        handle->close_condition.wait_for(lock, std::chrono::milliseconds(5));
+        close_state->condition.wait_for(lock, std::chrono::milliseconds(5));
         if (timeout.operation_deadline_ns != 0 && timeout.operation_deadline_ns != UINT64_MAX &&
             state_->binding.clock != nullptr &&
             state_->binding.clock->monotonic_now_ns != nullptr &&
             state_->binding.clock->monotonic_now_ns(state_->binding.clock->user) >=
-                timeout.operation_deadline_ns && !handle->close_job_done) {
-            handle->close_status.store(UsbCloseStatus::pending);
+                timeout.operation_deadline_ns && !close_state->job_done) {
+            close_state->status.store(UsbCloseStatus::pending);
             return make_result(DTV_INTERNAL_RESULT_NOT_READY);
         }
     }
-    return handle->close_result;
+    return close_state->result;
 }
 
 void UsbDevice::begin_close()
@@ -1078,25 +1083,27 @@ void UsbDevice::finish_close(dtv_internal_result result)
 {
     if (!state_ || !state_->binding.handle) return;
     auto handle = state_->binding.handle;
-    std::lock_guard lock(handle->close_mutex);
-    handle->close_result = result;
-    handle->close_status.store(UsbCloseStatus::closed);
-    handle->close_job_done = true;
-    handle->close_condition.notify_all();
+    auto close_state = handle->close_state;
+    std::lock_guard lock(close_state->mutex);
+    close_state->result = result;
+    close_state->status.store(UsbCloseStatus::closed);
+    close_state->job_done = true;
+    close_state->condition.notify_all();
 }
 
 UsbCloseStatus UsbDevice::close_status() const
 {
     return state_ && state_->binding.handle
-        ? state_->binding.handle->close_status.load()
+        ? state_->binding.handle->close_state->status.load()
         : UsbCloseStatus::closed;
 }
 
 dtv_internal_result UsbDevice::close_result() const
 {
     if (!state_ || !state_->binding.handle) return make_result(DTV_INTERNAL_RESULT_OK);
-    std::lock_guard lock(state_->binding.handle->close_mutex);
-    return state_->binding.handle->close_result;
+    auto close_state = state_->binding.handle->close_state;
+    std::lock_guard lock(close_state->mutex);
+    return close_state->result;
 }
 
 std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
