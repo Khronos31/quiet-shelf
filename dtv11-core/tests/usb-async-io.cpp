@@ -70,6 +70,12 @@ public:
     int submit_transfer(libusb_transfer *transfer) override
     {
         std::lock_guard lock(mutex_);
+        if (next_submit_result_ != LIBUSB_SUCCESS) {
+            const int result = next_submit_result_;
+            next_submit_result_ = LIBUSB_SUCCESS;
+            condition_.notify_all();
+            return result;
+        }
         pending_.push_back(transfer);
         ++outstanding_;
         if (transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL) {
@@ -109,6 +115,12 @@ public:
     {
         std::lock_guard lock(mutex_);
         cancel_endpoint_cohort_ = enabled;
+    }
+
+    void fail_next_submit(int result)
+    {
+        std::lock_guard lock(mutex_);
+        next_submit_result_ = result;
     }
 
     int handle_events(libusb_context *, timeval *timeout) override
@@ -366,6 +378,7 @@ private:
     std::size_t exited_ = 0;
     std::size_t cancelled_ = 0;
     bool cancel_endpoint_cohort_ = false;
+    int next_submit_result_ = LIBUSB_SUCCESS;
     std::size_t opened_ = 0;
     std::size_t wrapped_ = 0;
     int wrapped_descriptor_ = -1;
@@ -684,6 +697,54 @@ bool cancel_and_deadline_wake_waiters()
            backend->drained_and_released();
 }
 
+bool submit_failure_clears_previous_terminal_reason()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    auto usb = dtv::internal::UsbTestDeviceFactory::context(backend);
+    auto snapshot = dtv::internal::UsbTestDeviceFactory::snapshot(usb);
+    auto device = usb.open(snapshot, 1);
+    if (!device || !device->io()) return false;
+    const auto io = *device->io();
+    std::atomic<bool> cancelled{false};
+    dtv_runtime_clock clock{&cancelled, steady_now_ns, nullptr, test_is_cancelled};
+    auto *token = reinterpret_cast<const dtv_cancel *>(static_cast<std::uintptr_t>(1));
+    unsigned char first_bytes[4]{0x5a, 0x5a, 0x5a, 0x5a};
+    unsigned char second_bytes[4]{};
+    dtv_buffer first_buffer{first_bytes, sizeof(first_bytes), sizeof(first_bytes)};
+    dtv_buffer second_buffer{second_bytes, sizeof(second_bytes), sizeof(second_bytes)};
+    dtv_internal_result first_result{};
+    dtv_internal_result second_result{};
+    dtv::internal::UsbOperationTerminalReason first_terminal{};
+    dtv::internal::UsbOperationTerminalReason second_terminal{};
+    std::thread operation_thread([&] {
+        dtv::internal::UsbOperationScope operation(&clock, token, UINT64_MAX);
+        first_result = io.bulk_in(io.user, 0x09, &first_buffer, {UINT64_MAX, UINT64_MAX});
+        first_terminal = dtv::internal::current_usb_terminal_reason();
+        second_result = io.bulk_in(io.user, 0x0a, &second_buffer, {UINT64_MAX, UINT64_MAX});
+        second_terminal = dtv::internal::current_usb_terminal_reason();
+    });
+    const bool first_submitted = backend->wait_for_submissions(1);
+    backend->fail_next_submit(LIBUSB_ERROR_NO_MEM);
+    cancelled.store(true);
+    const bool cancel_requested = backend->wait_for_cancel(1);
+    operation_thread.join();
+    const bool first_cancelled = first_result.code == DTV_INTERNAL_RESULT_TIMEOUT &&
+        first_terminal == dtv::internal::UsbOperationTerminalReason::cancelled &&
+        first_buffer.size == 0 && first_bytes[0] == 0x5a;
+    const bool second_failed_without_stale_reason =
+        second_result.code == DTV_INTERNAL_RESULT_USB_IO && second_result.detail == 11 &&
+        second_terminal == dtv::internal::UsbOperationTerminalReason::none;
+    const bool first_request_retained = backend->resources_held_for_completion();
+    const bool late_completion = backend->complete(
+        0x09, LIBUSB_TRANSFER_CANCELLED, 2, {'x', 'y'});
+    const bool late_buffer_unchanged = first_bytes[0] == 0x5a && first_bytes[1] == 0x5a;
+    device.reset();
+    const bool drained = backend->drained_and_released();
+    return first_submitted && cancel_requested && first_cancelled &&
+        second_failed_without_stale_reason && first_request_retained && late_completion &&
+        late_buffer_unchanged && drained;
+}
+
 bool close_callback_pending_and_failure()
 {
     auto backend = std::make_shared<FakeBackend>();
@@ -784,6 +845,7 @@ bool endpoint_cancel_cohort_is_not_success()
 int main()
 {
     return io_callbacks() && request_holds_fd_owner() && cancel_and_deadline_wake_waiters() &&
+           submit_failure_clears_previous_terminal_reason() &&
            close_callback_pending_and_failure() && endpoint_cancel_cohort_is_not_success()
         ? 0 : 1;
 }

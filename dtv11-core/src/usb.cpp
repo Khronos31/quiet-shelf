@@ -651,6 +651,7 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
                             std::uint16_t index, dtv_buffer *data,
                             dtv_timeout timeout)
 {
+    last_operation_terminal_reason = UsbOperationTerminalReason::none;
     auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
@@ -715,6 +716,7 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
 dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
                              dtv_bytes data, dtv_timeout timeout)
 {
+    last_operation_terminal_reason = UsbOperationTerminalReason::none;
     auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
@@ -765,6 +767,7 @@ dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
                           dtv_buffer *data, dtv_timeout timeout,
                           bool interrupt)
 {
+    last_operation_terminal_reason = UsbOperationTerminalReason::none;
     auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
