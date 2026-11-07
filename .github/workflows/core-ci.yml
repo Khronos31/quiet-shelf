@@ -20,8 +20,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
+      - name: Install libusb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libusb-1.0-0-dev
+      - name: Install libusb (Windows)
+        if: runner.os == 'Windows'
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install libusb:x64-windows'
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
         run: cmake -S dtv11-core -B build-core -DBUILD_TESTING=ON
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cmake -S dtv11-core -B build-core -DBUILD_TESTING=ON
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
       - name: Build
         run: cmake --build build-core --config Release
       - name: CLI contract
