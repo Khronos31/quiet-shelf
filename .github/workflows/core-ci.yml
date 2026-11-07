@@ -20,46 +20,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install libusb (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libusb-1.0-0-dev
-          pkg-config --modversion libusb-1.0
-          pkg-config --variable=pcfiledir libusb-1.0
-      - name: Install libusb (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = '1.0.29'
-          $url = "https://github.com/libusb/libusb/releases/download/v$version/libusb-$version.7z"
-          $archive = Join-Path $env:RUNNER_TEMP "libusb-$version.7z"
-          $extract = Join-Path $env:RUNNER_TEMP "libusb-$version-vs2022-x64-dll"
-          Invoke-WebRequest -Uri $url -OutFile $archive
-          $expectedHash = '964a38152ca9a104cd00ec8d2f0617b89cd814f9b635e29763c68563d951521d'
-          if ((Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash) {
-            throw "libusb $version archive SHA-256 mismatch"
-          }
-          New-Item -ItemType Directory -Force -Path $extract | Out-Null
-          & 7z x -y "-o$extract" $archive 'VS2022/MS64/dll/libusb-1.0.lib' 'VS2022/MS64/dll/libusb-1.0.dll' 'include/libusb.h'
-          if ($LASTEXITCODE -ne 0) { throw 'Could not extract the libusb VS2022 x64 import library, DLL, and header' }
-          $includeDir = Join-Path $extract 'include'
-          $runtimeDir = Join-Path $extract 'VS2022/MS64/dll'
-          $library = Join-Path $runtimeDir 'libusb-1.0.lib'
-          if (-not (Test-Path (Join-Path $includeDir 'libusb.h')) -or -not (Test-Path $library) -or -not (Test-Path (Join-Path $runtimeDir 'libusb-1.0.dll'))) {
-            throw 'The expected libusb include, import library, or DLL path is missing'
-          }
-          "LIBUSB_INCLUDE_DIR=$includeDir" >> $env:GITHUB_ENV
-          "LIBUSB_LIBRARY=$library" >> $env:GITHUB_ENV
-          $runtimeDir >> $env:GITHUB_PATH
-          "libusb $version from $url (SHA-256 $expectedHash); CMake include=$includeDir; import library=$library; runtime PATH=$runtimeDir" >> $env:GITHUB_STEP_SUMMARY
-      - name: Configure (Linux)
-        if: runner.os == 'Linux'
+      - name: Configure
         run: cmake -S dtv11-core -B build-core -DBUILD_TESTING=ON
-      - name: Configure (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: cmake -S dtv11-core -B build-core -DBUILD_TESTING=ON "-DLIBUSB_INCLUDE_DIR=$env:LIBUSB_INCLUDE_DIR" "-DLIBUSB_LIBRARY=$env:LIBUSB_LIBRARY"
       - name: Build
         run: cmake --build build-core --config Release
       - name: CLI contract

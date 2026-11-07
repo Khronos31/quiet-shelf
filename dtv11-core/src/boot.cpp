@@ -21,6 +21,26 @@ class UsbBootOwner final : public BootUsbOwner {
 public:
     explicit UsbBootOwner(std::unique_ptr<UsbDevice> device) : device_(std::move(device)) {}
     const dtv_usb_io *io() const override { return device_ ? device_->io() : nullptr; }
+    void begin_close() override { if (device_) device_->begin_close(); }
+    dtv_internal_result run_close_callback(
+        std::function<dtv_internal_result()> callback, dtv_timeout timeout) override
+    {
+        return device_ ? device_->run_close_callback(std::move(callback), timeout)
+                       : callback();
+    }
+    void finish_close(dtv_internal_result result) override
+    {
+        if (device_) device_->finish_close(result);
+    }
+    UsbCloseStatus close_status() const override
+    {
+        return device_ ? device_->close_status() : UsbCloseStatus::closed;
+    }
+    dtv_internal_result close_result() const override
+    {
+        return device_ ? device_->close_result()
+                       : dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
 
 private:
     std::unique_ptr<UsbDevice> device_;
@@ -189,7 +209,7 @@ dtv_internal_result checkpoint(const dtv_runtime_clock &clock, std::uint64_t dea
 
 dtv_internal_result identify(const spi::DeviceOps &ops, dtv_context *context,
                              const dtv_runtime_clock &clock, uint64_t deadline,
-                             dtv_identify_info *info)
+                             const dtv_cancel *cancel, dtv_identify_info *info)
 {
     if (ops.identify == nullptr || info == nullptr) {
         return make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
@@ -201,6 +221,7 @@ dtv_internal_result identify(const spi::DeviceOps &ops, dtv_context *context,
     }
     info->firmware_key = 0;
     info->state = DTV_IDENTIFY_UNKNOWN;
+    UsbOperationScope operation_scope(&clock, cancel, deadline);
     result = call_callback([&] { return ops.identify(context, info, timeout); });
     if (!succeeded(result)) {
         return result;
@@ -256,9 +277,18 @@ void BootSession::cleanup() noexcept
 {
     const auto *close_ops = ops_ != nullptr && ops_->close != nullptr ? ops_ : opened_ops_;
     if (open_attempted_ && close_ops != nullptr && close_ops->close != nullptr && instance_) {
-        call_callback([&] {
-            return close_ops->close(instance_->context(), {0, 0});
-        });
+        if (usb_) {
+            usb_->run_close_callback([&] {
+                UsbOperationScope operation(&clock_, nullptr, UINT64_MAX);
+                return call_callback([&] {
+                    return close_ops->close(instance_->context(), {UINT64_MAX, UINT64_MAX});
+                });
+            }, {UINT64_MAX, UINT64_MAX});
+        } else {
+            call_callback([&] {
+                return close_ops->close(instance_->context(), {UINT64_MAX, UINT64_MAX});
+            });
+        }
     }
     open_attempted_ = false;
     instance_.reset();
@@ -390,6 +420,8 @@ std::unique_ptr<BootSession> boot_selected_candidate(
         dtv_open_args args{&request.model->model, request.function, open_timeout};
         session->opened_ops_ = &bootstrap;
         session->open_attempted_ = true;
+        UsbOperationScope open_scope(&session->clock_, request.cancel,
+                                     open_timeout.operation_deadline_ns);
         operation_result = call_callback([&] {
             return bootstrap.open(session->instance_->context(), session->usb_->io(), &args);
         });
@@ -399,7 +431,7 @@ std::unique_ptr<BootSession> boot_selected_candidate(
         }
         dtv_identify_info info{};
         operation_result = identify(bootstrap, session->instance_->context(),
-                                    session->clock_, deadline, &info);
+                                    session->clock_, deadline, request.cancel, &info);
         if (!succeeded(operation_result)) {
             *result = operation_result;
             return nullptr;
@@ -425,6 +457,7 @@ std::unique_ptr<BootSession> boot_selected_candidate(
                 dtv_bytes bytes{image.data(), image.size()};
                 dtv_firmware_result firmware_result{};
                 firmware_result.transition = UINT32_MAX;
+                UsbOperationScope operation_scope(&session->clock_, request.cancel, deadline);
                 operation_result = call_callback([&] {
                     return bootstrap.firmware(session->instance_->context(), stage.stage,
                                               bytes, &firmware_result, timeout);
@@ -439,7 +472,7 @@ std::unique_ptr<BootSession> boot_selected_candidate(
                 }
             }
             operation_result = identify(bootstrap, session->instance_->context(),
-                                        session->clock_, deadline, &info);
+                                        session->clock_, deadline, request.cancel, &info);
             if (!succeeded(operation_result)) {
                 *result = operation_result;
                 return nullptr;
@@ -499,29 +532,145 @@ BootGroupSession::~BootGroupSession()
 
 void BootGroupSession::close() noexcept
 {
-    if (closed_) return;
+    (void)close({UINT64_MAX, UINT64_MAX});
+    (void)release();
+}
+
+dtv_internal_result BootGroupSession::close(dtv_timeout timeout) noexcept
+{
+    BootUsbOwner *primary = nullptr;
+    bool start_close = false;
+    std::uint64_t close_deadline = 0;
+    std::function<dtv_internal_result()> cleanup_callback;
+    {
+        std::lock_guard close_lock(close_mutex_);
+        if (closed_) return close_result_;
+        start_close = !close_started_.exchange(true);
+        if (start_close) {
+            close_status_.store(UsbCloseStatus::closing);
+            for (auto &owner : owners_) owner->owner->begin_close();
+            std::uint64_t close_start = 0;
+            if (clock_.monotonic_now_ns != nullptr) {
+                try { close_start = clock_.monotonic_now_ns(clock_.user); } catch (...) {}
+            }
+            close_deadline_ns_ = timeout.operation_deadline_ns != 0
+                ? timeout.operation_deadline_ns : deadline_after(close_start, timeout.timeout_ms);
+            close_deadline = close_deadline_ns_;
+            cleanup_callback = [this, close_deadline] {
+                dtv_internal_result result = make_result(DTV_INTERNAL_RESULT_OK);
+                for (auto function = functions_.rbegin(); function != functions_.rend(); ++function) {
+                    auto &state = **function;
+                    const auto *ops = state.entry->bootstrap_ops;
+                    if (state.open_attempted && ops != nullptr && ops->close != nullptr) {
+                        dtv_timeout remaining{};
+                        auto timeout_result = remaining_timeout(clock_, close_deadline, &remaining);
+                        if (!succeeded(timeout_result)) remaining = {0, close_deadline};
+                        UsbOperationScope operation(&clock_, nullptr, close_deadline);
+                        auto close_result = call_callback([&] {
+                            return ops->close(state.context, remaining);
+                        });
+                        if (succeeded(result) && !succeeded(close_result)) result = close_result;
+                    }
+                    if (state.context != nullptr) {
+                        const auto destroy = state.destroy_state;
+                        if (destroy != nullptr) {
+                            try { destroy(state.context); } catch (...) {
+                                if (succeeded(result)) result = exception_result();
+                            }
+                        }
+                        state.context = nullptr;
+                    }
+                }
+                return result;
+            };
+        }
+        if (owners_.empty()) {
+            const auto result = cleanup_callback ? cleanup_callback()
+                                                 : make_result(DTV_INTERNAL_RESULT_OK);
+            close_result_ = result;
+            closed_ = true;
+            close_status_.store(UsbCloseStatus::closed);
+            return result;
+        }
+        primary = owners_.front()->owner.get();
+        close_deadline = close_deadline_ns_;
+        if (start_close) {
+            const auto scheduled = primary->run_close_callback(
+                cleanup_callback, {0, close_deadline});
+            if (scheduled.code != DTV_INTERNAL_RESULT_NOT_READY) {
+                close_result_ = scheduled;
+                closed_ = true;
+                close_status_.store(UsbCloseStatus::closed);
+                for (auto &owner : owners_) owner->owner->finish_close(scheduled);
+                return scheduled;
+            }
+            close_status_.store(UsbCloseStatus::pending);
+            close_result_ = scheduled;
+        }
+        ++close_waiters_;
+    }
+
+    dtv_internal_result result{};
+    dtv_timeout remaining{};
+    if (!succeeded(remaining_timeout(clock_, close_deadline, &remaining))) {
+        remaining = {0, close_deadline};
+    }
+    try { result = primary->run_close_callback({}, remaining); }
+    catch (...) { result = exception_result(); }
+    std::lock_guard close_lock(close_mutex_);
+    --close_waiters_;
+    if (result.code == DTV_INTERNAL_RESULT_NOT_READY &&
+        primary->close_status() != UsbCloseStatus::closed) {
+        close_status_.store(UsbCloseStatus::pending);
+        close_result_ = result;
+        return result;
+    }
+    close_result_ = result;
     closed_ = true;
-    cleanup();
+    close_status_.store(UsbCloseStatus::closed);
+    for (auto &owner : owners_) owner->owner->finish_close(result);
+    return result;
+}
+
+UsbCloseStatus BootGroupSession::close_status() const
+{
+    std::lock_guard close_lock(close_mutex_);
+    if (closed_) return UsbCloseStatus::closed;
+    if (!owners_.empty() && owners_.front()->owner->close_status() == UsbCloseStatus::closed) {
+        return UsbCloseStatus::closed;
+    }
+    return close_status_.load();
+}
+
+dtv_internal_result BootGroupSession::close_result() const
+{
+    std::lock_guard close_lock(close_mutex_);
+    if (!owners_.empty()) return owners_.front()->owner->close_result();
+    return close_result_;
+}
+
+dtv_internal_result BootGroupSession::release() noexcept
+{
+    std::lock_guard close_lock(close_mutex_);
+    if (close_waiters_ != 0) return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+    if (closed_) {
+        functions_.clear();
+        while (!owners_.empty()) owners_.pop_back();
+        return make_result(DTV_INTERNAL_RESULT_OK);
+    }
+    if (owners_.empty() || owners_.front()->owner->close_status() != UsbCloseStatus::closed) {
+        return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+    }
+    close_result_ = owners_.front()->owner->close_result();
+    functions_.clear();
+    while (!owners_.empty()) owners_.pop_back();
+    closed_ = true;
+    return make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 void BootGroupSession::cleanup() noexcept
 {
-    for (auto function = functions_.rbegin(); function != functions_.rend(); ++function) {
-        auto &state = **function;
-        const auto *ops = state.entry->bootstrap_ops;
-        if (state.open_attempted && ops != nullptr && ops->close != nullptr) {
-            call_callback([&] { return ops->close(state.context, {0, 0}); });
-        }
-        if (state.context != nullptr) {
-            const auto destroy = state.destroy_state;
-            if (destroy != nullptr) {
-                try { destroy(state.context); } catch (...) {}
-            }
-            state.context = nullptr;
-        }
-    }
-    functions_.clear();
-    while (!owners_.empty()) owners_.pop_back();
+    close();
 }
 
 dtv_context *BootGroupSession::context(dtv_function function) const
@@ -686,6 +835,7 @@ std::unique_ptr<BootGroupSession> open_boot_group(
             operation_result = cancelled(clock, cancel);
             if (!succeeded(operation_result)) return retain_failure(operation_result);
             stored.open_attempted = true;
+            UsbOperationScope open_scope(&clock, cancel, deadline);
             operation_result = call_callback([&] {
                 return bootstrap->open(stored.context, stored.io, &args);
             });
@@ -711,7 +861,7 @@ dtv_internal_result BootGroupSession::send_firmware(
     const dtv_cancel *cancel)
 {
     try {
-        if (closed_) return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        if (close_started_) return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
         if (!succeeded(open_result_)) return open_result_;
         if ((package.size != 0 && package.data == nullptr) || timeout.timeout_ms == 0) {
             return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
@@ -807,7 +957,7 @@ dtv_internal_result BootGroupSession::send_firmware(
             }
             status = cancelled(clock_, cancel);
             if (!succeeded(status)) return status;
-            status = identify(*bootstrap, state.context, clock_, deadline,
+            status = identify(*bootstrap, state.context, clock_, deadline, cancel,
                               &initial_states[target_index]);
             if (!succeeded(status)) return status;
             status = checkpoint(clock_, deadline, cancel);
@@ -839,6 +989,7 @@ dtv_internal_result BootGroupSession::send_firmware(
                                                       state.entry->stages[stage_index].image_index);
                     dtv_firmware_result firmware_result{};
                     firmware_result.transition = UINT32_MAX;
+                    UsbOperationScope operation_scope(&clock_, cancel, deadline);
                     status = call_callback([&] {
                         return bootstrap->firmware(state.context,
                             state.entry->stages[stage_index].stage,
@@ -854,7 +1005,8 @@ dtv_internal_result BootGroupSession::send_firmware(
                         return make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
                     }
                     dtv_identify_info stage_state{};
-                    status = identify(*bootstrap, state.context, clock_, deadline, &stage_state);
+                    status = identify(*bootstrap, state.context, clock_, deadline, cancel,
+                                      &stage_state);
                     if (!succeeded(status)) return status;
                     status = checkpoint(clock_, deadline, cancel);
                     if (!succeeded(status)) return status;
@@ -865,7 +1017,7 @@ dtv_internal_result BootGroupSession::send_firmware(
                 status = cancelled(clock_, cancel);
                 if (!succeeded(status)) return status;
                 dtv_identify_info info{};
-                status = identify(*bootstrap, state.context, clock_, deadline, &info);
+                status = identify(*bootstrap, state.context, clock_, deadline, cancel, &info);
                 if (!succeeded(status)) return status;
                 status = checkpoint(clock_, deadline, cancel);
                 if (!succeeded(status)) return status;

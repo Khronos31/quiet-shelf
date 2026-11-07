@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -24,6 +26,19 @@ class BootUsbOwner {
 public:
     virtual ~BootUsbOwner() = default;
     virtual const dtv_usb_io *io() const = 0;
+    virtual void begin_close() {}
+    virtual dtv_internal_result run_close_callback(
+        std::function<dtv_internal_result()> callback, dtv_timeout timeout)
+    {
+        (void)timeout;
+        return callback ? callback() : dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    virtual void finish_close(dtv_internal_result) {}
+    virtual UsbCloseStatus close_status() const { return UsbCloseStatus::open; }
+    virtual dtv_internal_result close_result() const
+    {
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
 };
 
 class BootUsbProvider {
@@ -85,6 +100,10 @@ public:
                                       dtv_timeout timeout, const dtv_cancel *cancel = nullptr);
     dtv_internal_result open_result() const { return open_result_; }
     void close() noexcept;
+    dtv_internal_result close(dtv_timeout timeout) noexcept;
+    UsbCloseStatus close_status() const;
+    dtv_internal_result close_result() const;
+    dtv_internal_result release() noexcept;
     dtv_context *context(dtv_function function) const;
     const dtv_usb_io *io(dtv_function function) const;
     const spi::DeviceOps *ops(dtv_function function) const;
@@ -101,7 +120,13 @@ private:
     std::vector<std::unique_ptr<FunctionContext>> functions_;
     dtv_runtime_clock clock_{};
     dtv_internal_result open_result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    bool closed_ = false;
+    std::atomic<bool> close_started_{false};
+    std::atomic<bool> closed_{false};
+    std::atomic<UsbCloseStatus> close_status_{UsbCloseStatus::open};
+    mutable std::mutex close_mutex_;
+    std::size_t close_waiters_ = 0;
+    std::uint64_t close_deadline_ns_ = 0;
+    dtv_internal_result close_result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 };
 
 const spi::FirmwareEntry *find_firmware_entry(const spi::ModelEntry &model,

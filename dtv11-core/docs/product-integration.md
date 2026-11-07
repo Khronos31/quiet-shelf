@@ -172,7 +172,7 @@ return result;
 
 ### 内部イベントサービスとデータ転送
 
-- **イベントサービスとレジストリ**: `UsbContext::State` ごとに 1 つのイベントサービススレッドが起動され、transfer request registry を所有・管理する。
+- **イベントサービスとレジストリ**: `UsbContext::State` ごとに 1 つのイベントサービススレッド（event pump）が起動され、transfer request registry を所有・管理する。操作ごとのスレッド生成は行わない。
 - **バッファのステージングとコピー**: OUT 転送および control 転送の送信データは submit 前にリクエスト専用バッファへコピーされる。IN 転送は Core 内部のステージングバッファで受信され、リクエスト完了後に呼び出し側のバッファへコピーバックされる。
 - **スレッド分離**: libusb の completion コールバックは転送状態と受信長を記録して waiter を起床させる処理のみを行い、製品コールバックをイベントスレッドから呼び出すことはない。waiter は completion コールバックがイベントハンドラから復帰したことを確認した上で結果を読み出す。
 
@@ -180,15 +180,23 @@ return result;
 
 各リクエストは完了してレジストリから外れるまで handle lease を保持する。この lease は context、デバイスハンドル、インターフェース、および Core が複製・所有する FD（owned FD lease）の有効性を保護する。すべてのリクエストが完了して最後の lease が解放された時点で、インターフェースが逆順に解放（reverse release）され、ハンドルおよび FD がクローズされる。通常オープンと `open_usb_fd` は同一の lease / runtime 型を使用する。
 
-### タイムアウトの扱い
+### 操作スコープとキャンセル・タイムアウト
 
-内部 USB I/O における `timeout = 0` は即時返却（no-wait）を、`UINT64_MAX` は無期限待機を意味する。これは公開 L3 API における `timeout_ms = 0`（無期限）という契約とは区別される。
+- **内部操作スコープ（UsbOperationScope）**: `include/dtv/internal/usb.hpp` で定義される `UsbOperationScope` は、呼び出し元スレッドの thread-local な clock、cancel token、operation deadline を設定・復帰する。transfer 固有の `timeout_ms` と operation deadline の残り時間を比較し、より早い期限を採用する。内部 USB I/O における `timeout = 0`（即時返却 / no-wait）と `UINT64_MAX`（無期限待機）の契約は維持され、公開 L3 API の `timeout_ms = 0`（無期限待機）とは区別される。
+- **キャンセルと終端理由（UsbOperationTerminalReason）**: キャンセルや期限切れが発生した場合、同期 waiter は直ちに復帰するが、戻り値としては従来の `DTV_INTERNAL_RESULT_TIMEOUT` を返す（内部 enum に CANCELLED は追加せず、公開 `CANCELLED = 21` への対応は後続 L3 アダプターの境界）。詳細な終端理由は同一スレッド上のアクセサ `current_usb_terminal_reason()` により取得できる（`cancelled`, `deadline`, `transfer_timeout`, `closing` 等）。これは thread-local な値であり、共有エラー文字列や公開 API 保証とは混同しない。
+- **late completion とバッファ保護**: 同期 waiter がキャンセルや期限切れで復帰しても、libusb 側の completion コールバックが戻るまで request、バッファ、handle / context / FD lease は保持される。キャンセル、期限切れ、クローズ、または同エンドポイントの巻き込みキャンセル後に遅れて到着した IN データ（late completion）が呼び出し側バッファへ書き込まれることはない。
+- **同エンドポイント巻き込みキャンセルの扱い**: libusb バックエンドが同エンドポイントの転送群を一括キャンセルした場合、キャンセル対象自身は内部キャンセル理由で TIMEOUT を返し、巻き込まれた peer 転送は `USB_IO`（終端理由 `endpoint_cancelled`）を返す。peer 転送を誤って成功扱いすることはない。
+
+### クローズライフサイクルと状態管理
+
+- **スレッドモデルとクローズ順序**: `UsbContext::State` ごとに 1 本の逐次 lifecycle worker スレッドが動作する。クローズ処理は、新規通常 I/O 受付（admission）の停止 → 実行中リクエストのキャンセルと completion drain → lifecycle worker 上での製品 close コールバック逐次実行および cleanup I/O（`lifecycle_cleanup_io`）の完了・drain → CLOSED 状態通知の順で実行される。製品 close コールバックは lifecycle worker 上で実行され、event pump スレッドとは分離される。既存の引数なし同期クローズ（`BootGroupSession::close()`）もブロッキング入口として残されている。
+- **状態（UsbCloseStatus）とエラーの分離**: `UsbCloseStatus`（`open`, `closing`, `pending`, `closed`）によりクローズ進行状態を管理する。製品 close コールバックの CPU 処理が停滞した場合、期限付きクローズ（`close(timeout)`）は `DTV_INTERNAL_RESULT_NOT_READY` を返し、状態は `pending` となる。この間、`ProductInstance` や `BootGroupSession` の所有権は保持され、`release()` は no-op（`DTV_INTERNAL_RESULT_NOT_READY`）として解放を拒否する。CPU 停滞に対して強制終了を行って不正状態に遷移させることはない。CLOSED 状態への到達とクローズ処理結果（`close_result`）は独立して照会可能であり、クローズ処理自体のエラー（close error）と CLOSED 状態は分離されている。
 
 ### テスト治具と未接続事項
 
-内部 fake transfer backend は、実機に依存せず Core の I/O バインディング、lease、FD 所有状態を検証するためのテスト用 seam である。通常環境での `libusb_open` や claim、`libusb_wrap_sys_device` の実行、実機 USB での転送、ならびに Android や Chrome（WebUSB）環境での動作を証明するものではない。
+内部 fake transfer backend は、Core の I/O バインディング、所有権、lease、キャンセル・クローズライフサイクルを検証するためのテスト用 seam である。通常環境での `libusb_open` や claim、`libusb_wrap_sys_device` の実行、実機 USB での転送、ならびに Android や Chrome（WebUSB）環境での動作を証明するものではない。
 
-また、後続段階で扱われる cancel / close ライフサイクル、公開 PENDING / CLOSED 状態、ファームウェア再列挙、FD / token 供給、TS 処理、attachment latch は未接続であり、本実装をもって B2 全体が完了したわけではない。
+公開 L3 ABI / PENDING・CLOSED シンボル適合、公開 cancel・timeout mapping、ファームウェア再列挙、FD / token 供給、TS 処理、および Android・Chrome（WebUSB）実環境は後段で扱われる。また、PIX 案 2 採用により attachment 保持基盤は追加していない。本実装をもって B2 全体が完了したわけではない。
 
 ## ライセンスと由来
 

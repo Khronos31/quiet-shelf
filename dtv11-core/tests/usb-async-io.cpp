@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -63,6 +64,7 @@ public:
         std::lock_guard lock(mutex_);
         ++freed_;
         std::free(transfer);
+        condition_.notify_all();
     }
 
     int submit_transfer(libusb_transfer *transfer) override
@@ -81,6 +83,32 @@ public:
         }
         condition_.notify_all();
         return LIBUSB_SUCCESS;
+    }
+
+    int cancel_transfer(libusb_transfer *transfer) override
+    {
+        std::lock_guard lock(mutex_);
+        ++cancelled_;
+        if (cancel_endpoint_cohort_) {
+            for (auto it = pending_.begin(); it != pending_.end();) {
+                if ((*it)->type != LIBUSB_TRANSFER_TYPE_CONTROL &&
+                    (*it)->endpoint == transfer->endpoint) {
+                    completions_.push_back({*it, LIBUSB_TRANSFER_CANCELLED, 0, {}});
+                    it = pending_.erase(it);
+                    ++active_;
+                } else {
+                    ++it;
+                }
+            }
+        }
+        condition_.notify_all();
+        return LIBUSB_SUCCESS;
+    }
+
+    void cancel_endpoint_cohort(bool enabled)
+    {
+        std::lock_guard lock(mutex_);
+        cancel_endpoint_cohort_ = enabled;
     }
 
     int handle_events(libusb_context *, timeval *timeout) override
@@ -244,10 +272,45 @@ public:
                released_ == expected_releases && closed_ == 1 && exited_ == 1;
     }
 
+    bool drained_and_released()
+    {
+        std::lock_guard lock(mutex_);
+        return active_ == 0 && pending_.empty() && allocated_ == freed_ &&
+               released_ == 1 && closed_ == 1;
+    }
+
     bool resources_held_for_completion()
     {
         std::lock_guard lock(mutex_);
         return outstanding_ != 0 && allocated_ > freed_ && released_ == 0 && closed_ == 0;
+    }
+
+    bool owner_retained()
+    {
+        std::lock_guard lock(mutex_);
+        return released_ == 0 && closed_ == 0 && exited_ == 0;
+    }
+
+    bool wait_for_freed(std::size_t count)
+    {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(1), [&] {
+            return freed_ >= count;
+        });
+    }
+
+    bool wait_for_cancel(std::size_t count)
+    {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(1), [&] {
+            return cancelled_ >= count;
+        });
+    }
+
+    std::size_t cancel_count()
+    {
+        std::lock_guard lock(mutex_);
+        return cancelled_;
     }
 
     bool opened_one_device_with_claims(std::vector<int> claims)
@@ -301,6 +364,8 @@ private:
     std::size_t released_ = 0;
     std::size_t closed_ = 0;
     std::size_t exited_ = 0;
+    std::size_t cancelled_ = 0;
+    bool cancel_endpoint_cohort_ = false;
     std::size_t opened_ = 0;
     std::size_t wrapped_ = 0;
     int wrapped_descriptor_ = -1;
@@ -515,27 +580,210 @@ bool request_holds_fd_owner()
         result = io.bulk_out(io.user, 0x05, {bytes, sizeof(bytes)}, {1000, 0});
     });
     const bool submitted = backend->wait_for_submissions(1);
-    device.reset();
     const bool still_owned = fcntl(owned, F_GETFD) >= 0;
     const bool held_until_completion = backend->resources_held_for_completion();
     const bool completed = backend->complete(0x05, LIBUSB_TRANSFER_COMPLETED, 2);
     worker.join();
     const bool caller_fd_open = fcntl(descriptors[0], F_GETFD) >= 0;
+    const auto closed = device->run_close_callback({}, {UINT64_MAX, UINT64_MAX});
+    device.reset();
     const bool owned_fd_closed = fcntl(owned, F_GETFD) < 0 && errno == EBADF;
     close(descriptors[0]);
     close(descriptors[1]);
     return submitted && owned >= 0 && owned != descriptors[0] &&
            backend->wrapped_one_fd(owned) && still_owned && held_until_completion && completed &&
            caller_fd_open && owned_fd_closed && result.code == DTV_INTERNAL_RESULT_OK &&
+           closed.code == DTV_INTERNAL_RESULT_OK &&
            backend->drained_and_closed() && backend->released_in_order({1});
 #else
     return true;
 #endif
 }
 
+std::uint64_t steady_now_ns(void *)
+{
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+dtv_internal_result test_is_cancelled(void *user, const dtv_cancel *, std::uint32_t *cancelled)
+{
+    if (user == nullptr || cancelled == nullptr) {
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    }
+    *cancelled = static_cast<std::atomic<bool> *>(user)->load() ? 1u : 0u;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+bool cancel_and_deadline_wake_waiters()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    auto usb = dtv::internal::UsbTestDeviceFactory::context(backend);
+    auto snapshot = dtv::internal::UsbTestDeviceFactory::snapshot(usb);
+    auto device = usb.open(snapshot, 1);
+    if (!device || !device->io()) return false;
+    const auto io = *device->io();
+    std::atomic<bool> cancelled{false};
+    dtv_runtime_clock clock{&cancelled, steady_now_ns, nullptr, test_is_cancelled};
+    auto *token = reinterpret_cast<const dtv_cancel *>(static_cast<std::uintptr_t>(1));
+
+    unsigned char cancel_bytes[4]{0x5a, 0x5a, 0x5a, 0x5a};
+    dtv_buffer cancel_buffer{cancel_bytes, sizeof(cancel_bytes), sizeof(cancel_bytes)};
+    dtv_internal_result cancel_result{};
+    dtv::internal::UsbOperationTerminalReason cancel_terminal{};
+    std::thread cancel_thread([&] {
+        dtv::internal::UsbOperationScope operation(&clock, token, UINT64_MAX);
+        cancel_result = io.bulk_in(io.user, 0x09, &cancel_buffer, {UINT64_MAX, UINT64_MAX});
+        cancel_terminal = dtv::internal::current_usb_terminal_reason();
+    });
+    if (!backend->wait_for_submissions(1)) {
+        cancelled.store(true);
+        cancel_thread.join();
+        return false;
+    }
+    cancelled.store(true);
+    const bool cancel_requested = backend->wait_for_cancel(1);
+    cancel_thread.join();
+    const bool cancel_woke = cancel_result.code == DTV_INTERNAL_RESULT_TIMEOUT &&
+        cancel_terminal == dtv::internal::UsbOperationTerminalReason::cancelled &&
+        cancel_buffer.size == 0 && cancel_bytes[0] == 0x5a && cancel_requested &&
+        backend->resources_held_for_completion();
+    const bool cancel_completed_late = backend->complete(
+        0x09, LIBUSB_TRANSFER_CANCELLED, 2, {'x', 'y'});
+    const bool cancel_double_completion = !backend->complete(
+        0x09, LIBUSB_TRANSFER_CANCELLED, 2, {'x', 'y'});
+    const bool cancel_late_unchanged = cancel_bytes[0] == 0x5a && cancel_bytes[1] == 0x5a;
+
+    unsigned char deadline_bytes[4]{0x6b, 0x6b, 0x6b, 0x6b};
+    dtv_buffer deadline_buffer{deadline_bytes, sizeof(deadline_bytes), sizeof(deadline_bytes)};
+    dtv_internal_result deadline_result{};
+    dtv::internal::UsbOperationTerminalReason deadline_terminal{};
+    const auto deadline = steady_now_ns(nullptr) + 30000000;
+    std::thread deadline_thread([&] {
+        dtv::internal::UsbOperationScope operation(&clock, nullptr, deadline);
+        deadline_result = io.bulk_in(io.user, 0x0a, &deadline_buffer,
+                                     {UINT64_MAX, deadline});
+        deadline_terminal = dtv::internal::current_usb_terminal_reason();
+    });
+    const bool deadline_submitted = backend->wait_for_submissions(1);
+    const bool deadline_cancel_requested = backend->wait_for_cancel(2);
+    deadline_thread.join();
+    const bool deadline_woke = deadline_result.code == DTV_INTERNAL_RESULT_TIMEOUT &&
+        deadline_terminal == dtv::internal::UsbOperationTerminalReason::deadline &&
+        deadline_buffer.size == 0 && deadline_bytes[0] == 0x6b &&
+        backend->resources_held_for_completion();
+    const bool deadline_completed_late = backend->complete(
+        0x0a, LIBUSB_TRANSFER_CANCELLED, 2, {'p', 'q'});
+    const bool deadline_double_completion = !backend->complete(
+        0x0a, LIBUSB_TRANSFER_CANCELLED, 2, {'p', 'q'});
+    const bool deadline_late_unchanged = deadline_bytes[0] == 0x6b && deadline_bytes[1] == 0x6b;
+    device.reset();
+    return cancel_woke && cancel_completed_late && cancel_double_completion && cancel_late_unchanged &&
+           deadline_submitted && deadline_cancel_requested && deadline_woke &&
+           deadline_completed_late && deadline_double_completion && deadline_late_unchanged &&
+           backend->drained_and_released();
+}
+
+bool close_callback_pending_and_failure()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    auto usb = dtv::internal::UsbTestDeviceFactory::context(backend);
+    auto snapshot = dtv::internal::UsbTestDeviceFactory::snapshot(usb);
+    auto device = usb.open(snapshot, 1);
+    if (!device || !device->io()) return false;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool finish = false;
+    std::size_t calls = 0;
+    std::thread::id close_thread;
+    dtv_internal_result cleanup_io_result{};
+    const auto io = *device->io();
+    auto callback = [&] {
+        const unsigned char bytes[]{'c'};
+        cleanup_io_result = io.bulk_out(io.user, 0x0c, {bytes, sizeof(bytes)}, {1000, 0});
+        std::unique_lock lock(mutex);
+        ++calls;
+        close_thread = std::this_thread::get_id();
+        entered = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return finish; });
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 42);
+    };
+    const auto pending = device->run_close_callback(callback, {0, 0});
+    const bool cleanup_submitted = backend->wait_for_submissions(1);
+    const bool cleanup_completed = backend->complete(0x0c, LIBUSB_TRANSFER_COMPLETED, 1);
+    {
+        std::unique_lock lock(mutex);
+        if (!condition.wait_for(lock, std::chrono::seconds(1), [&] { return entered; })) {
+            finish = true;
+            condition.notify_all();
+            return false;
+        }
+    }
+    const auto rejected = device->io()->bulk_out(
+        device->io()->user, 0x01, {nullptr, 0}, {100, 0});
+    const bool pending_state = pending.code == DTV_INTERNAL_RESULT_NOT_READY &&
+        device->close_status() == dtv::internal::UsbCloseStatus::pending &&
+        backend->owner_retained();
+    {
+        std::lock_guard lock(mutex);
+        finish = true;
+    }
+    condition.notify_all();
+    const auto closed = device->run_close_callback({}, {UINT64_MAX, UINT64_MAX});
+    const bool closed_state = device->close_status() == dtv::internal::UsbCloseStatus::closed;
+    const bool close_is_separate = close_thread != std::this_thread::get_id();
+    device.reset();
+    return pending_state && rejected.code == DTV_INTERNAL_RESULT_NOT_READY &&
+        closed.code == DTV_INTERNAL_RESULT_USB_IO && closed.detail == 42 && closed_state &&
+        cleanup_submitted && cleanup_completed && cleanup_io_result.code == DTV_INTERNAL_RESULT_OK &&
+        close_is_separate && calls == 1 && backend->drained_and_released();
+}
+
+bool endpoint_cancel_cohort_is_not_success()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->cancel_endpoint_cohort(true);
+    auto usb = dtv::internal::UsbTestDeviceFactory::context(backend);
+    auto snapshot = dtv::internal::UsbTestDeviceFactory::snapshot(usb);
+    auto device = usb.open(snapshot, 1);
+    if (!device || !device->io()) return false;
+    const auto io = *device->io();
+    std::atomic<bool> cancelled{false};
+    dtv_runtime_clock clock{&cancelled, steady_now_ns, nullptr, test_is_cancelled};
+    auto *token = reinterpret_cast<const dtv_cancel *>(static_cast<std::uintptr_t>(1));
+    unsigned char first_bytes[2]{};
+    unsigned char second_bytes[2]{};
+    dtv_buffer first_buffer{first_bytes, sizeof(first_bytes), 0};
+    dtv_buffer second_buffer{second_bytes, sizeof(second_bytes), 0};
+    dtv_internal_result first_result{};
+    dtv_internal_result second_result{};
+    std::thread first([&] {
+        dtv::internal::UsbOperationScope operation(&clock, token, UINT64_MAX);
+        first_result = io.bulk_in(io.user, 0x0b, &first_buffer, {UINT64_MAX, UINT64_MAX});
+    });
+    std::thread second([&] {
+        second_result = io.bulk_in(io.user, 0x0b, &second_buffer, {UINT64_MAX, UINT64_MAX});
+    });
+    const bool submitted = backend->wait_for_submissions(2);
+    cancelled.store(true);
+    const bool cancel_requested = backend->wait_for_cancel(1);
+    first.join();
+    second.join();
+    const bool released = backend->wait_for_freed(2);
+    device.reset();
+    return submitted && cancel_requested && released &&
+        first_result.code == DTV_INTERNAL_RESULT_TIMEOUT &&
+        second_result.code == DTV_INTERNAL_RESULT_USB_IO &&
+        second_result.code != DTV_INTERNAL_RESULT_OK && backend->drained_and_released();
+}
+
 }
 
 int main()
 {
-    return io_callbacks() && request_holds_fd_owner() ? 0 : 1;
+    return io_callbacks() && request_holds_fd_owner() && cancel_and_deadline_wake_waiters() &&
+           close_callback_pending_and_failure() && endpoint_cancel_cohort_is_not_success()
+        ? 0 : 1;
 }

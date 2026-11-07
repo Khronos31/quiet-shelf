@@ -3,7 +3,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -46,6 +51,11 @@ bool force_complete = false;
 bool visible_one = false;
 bool include_other_device = false;
 dtv_function force_unknown_role = 0;
+std::mutex close_mutex;
+std::condition_variable close_condition;
+bool block_close_callback = false;
+bool close_callback_entered = false;
+bool allow_close_callback = false;
 
 std::uint64_t fake_now(void *user)
 {
@@ -66,14 +76,49 @@ struct FakeProvider final : dtv::internal::BootUsbProvider {
     std::vector<std::uint64_t> released_candidates;
     std::uint64_t fail_candidate = 0;
     int fail_interface = -1;
+    bool asynchronous_close = false;
 
     struct Owner final : dtv::internal::BootUsbOwner {
         Owner(FakeProvider &provider, std::uint64_t id) : provider(provider), candidate_id(id) {}
-        ~Owner() override { provider.released_candidates.push_back(candidate_id); }
+        ~Owner() override
+        {
+            if (worker.joinable()) worker.join();
+            provider.released_candidates.push_back(candidate_id);
+        }
         FakeProvider &provider;
         std::uint64_t candidate_id;
         dtv_usb_io usb_io{};
         const dtv_usb_io *io() const override { return &usb_io; }
+        void begin_close() override { status.store(dtv::internal::UsbCloseStatus::closing); }
+        dtv_internal_result run_close_callback(
+            std::function<dtv_internal_result()> callback, dtv_timeout) override
+        {
+            if (!provider.asynchronous_close) return callback();
+            if (worker.joinable()) {
+                if (status.load() != dtv::internal::UsbCloseStatus::closed) {
+                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+                }
+                worker.join();
+                return close_result_;
+            }
+            status.store(dtv::internal::UsbCloseStatus::pending);
+            worker = std::thread([this, callback = std::move(callback)]() mutable {
+                close_result_ = callback();
+                status.store(dtv::internal::UsbCloseStatus::closed);
+                close_condition.notify_all();
+            });
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        }
+        void finish_close(dtv_internal_result result) override
+        {
+            close_result_ = result;
+            status.store(dtv::internal::UsbCloseStatus::closed);
+        }
+        dtv::internal::UsbCloseStatus close_status() const override { return status.load(); }
+        dtv_internal_result close_result() const override { return close_result_; }
+        std::atomic<dtv::internal::UsbCloseStatus> status{dtv::internal::UsbCloseStatus::open};
+        dtv_internal_result close_result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        std::thread worker;
     };
 
     std::unique_ptr<dtv::internal::BootUsbOwner> open(
@@ -139,6 +184,14 @@ dtv_internal_result open_function(dtv_context *context, const dtv_usb_io *io,
 
 dtv_internal_result close_function(dtv_context *context, dtv_timeout)
 {
+    {
+        std::unique_lock lock(close_mutex);
+        if (block_close_callback) {
+            close_callback_entered = true;
+            close_condition.notify_all();
+            close_condition.wait(lock, [] { return allow_close_callback; });
+        }
+    }
     closed_roles.push_back(static_cast<FunctionState *>(context)->role);
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
@@ -607,10 +660,76 @@ bool deadline_and_unknown_boundaries()
     return unknown_rejected;
 }
 
+bool pending_close_retains_product_and_usb_owner()
+{
+    reset_observations();
+    second_images[0].sha256 = kDefHash;
+    force_no_match = force_ambiguous = force_duplicate_selection = false;
+    include_other_device = false;
+    auto group = discover();
+    dtv::internal::UsbContext usb;
+    FakeProvider provider;
+    provider.asynchronous_close = true;
+    dtv_internal_result result{};
+    auto session = dtv::internal::open_boot_group(usb, group, 99, {1000, 0}, nullptr,
+                                                  nullptr, &provider, &result);
+    if (!session || result.code != DTV_INTERNAL_RESULT_OK) return false;
+    {
+        std::lock_guard lock(close_mutex);
+        block_close_callback = true;
+        close_callback_entered = false;
+        allow_close_callback = false;
+    }
+    const auto pending = session->close({0, 0});
+    {
+        std::unique_lock lock(close_mutex);
+        if (!close_condition.wait_for(lock, std::chrono::seconds(1), [] {
+                return close_callback_entered;
+            })) {
+            allow_close_callback = true;
+            close_condition.notify_all();
+            return false;
+        }
+    }
+    const auto release_pending = session->release();
+    const bool retained = pending.code == DTV_INTERNAL_RESULT_NOT_READY &&
+        release_pending.code == DTV_INTERNAL_RESULT_NOT_READY &&
+        session->close_status() == dtv::internal::UsbCloseStatus::pending &&
+        session->context(kFirst) != nullptr && session->context(kSecond) != nullptr &&
+        destroyed_roles.empty() && provider.released_candidates.empty();
+    {
+        std::lock_guard lock(close_mutex);
+        allow_close_callback = true;
+    }
+    close_condition.notify_all();
+    {
+        std::unique_lock lock(close_mutex);
+        if (!close_condition.wait_for(lock, std::chrono::seconds(1), [&] {
+                return session->close_status() == dtv::internal::UsbCloseStatus::closed;
+            })) return false;
+    }
+    const auto close_result = session->close_result();
+    const auto release_result = session->release();
+    const bool released = close_result.code == DTV_INTERNAL_RESULT_OK &&
+        release_result.code == DTV_INTERNAL_RESULT_OK && session->context(kFirst) == nullptr &&
+        closed_roles == std::vector<dtv_function>{kSecond, kFirst} &&
+        destroyed_roles == std::vector<dtv_function>{kSecond, kFirst} &&
+        provider.released_candidates == std::vector<std::uint64_t>{1};
+    session.reset();
+    {
+        std::lock_guard lock(close_mutex);
+        block_close_callback = false;
+        close_callback_entered = false;
+        allow_close_callback = false;
+    }
+    return retained && released;
+}
+
 }
 
 int main()
 {
     return partial_and_ambiguous() && same_handle_package() && failed_claim_and_open_cleanup() &&
-        failed_stage_blocks_retry_and_closes() && deadline_and_unknown_boundaries() ? 0 : 1;
+        failed_stage_blocks_retry_and_closes() && deadline_and_unknown_boundaries() &&
+        pending_close_retains_product_and_usb_owner() ? 0 : 1;
 }

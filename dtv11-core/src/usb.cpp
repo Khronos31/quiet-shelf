@@ -3,10 +3,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <condition_variable>
+#include <chrono>
 #include <climits>
+#include <deque>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -29,12 +33,23 @@ namespace dtv::internal {
 
 namespace {
 
+thread_local const dtv_runtime_clock *active_operation_clock = nullptr;
+thread_local const dtv_cancel *active_operation_cancel = nullptr;
+thread_local std::uint64_t active_operation_deadline_ns = 0;
+thread_local bool lifecycle_cleanup_io = false;
+thread_local UsbOperationTerminalReason last_operation_terminal_reason =
+    UsbOperationTerminalReason::none;
+
 class LibusbTransferBackend final : public UsbTransferBackend {
 public:
     int init_context(libusb_context **context) override { return libusb_init(context); }
     libusb_transfer *allocate_transfer() override { return libusb_alloc_transfer(0); }
     void free_transfer(libusb_transfer *transfer) override { libusb_free_transfer(transfer); }
     int submit_transfer(libusb_transfer *transfer) override { return libusb_submit_transfer(transfer); }
+    int cancel_transfer(libusb_transfer *transfer) override
+    {
+        return libusb_cancel_transfer(transfer);
+    }
     int handle_events(libusb_context *context, timeval *timeout) override
     {
         return libusb_handle_events_timeout(context, timeout);
@@ -115,9 +130,15 @@ struct UsbContext::State {
     std::shared_ptr<UsbTransferBackend> backend = make_libusb_transfer_backend();
     dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     std::mutex requests_mutex;
+    std::condition_variable requests_condition;
     std::unordered_map<libusb_transfer *, std::shared_ptr<UsbTransferRequest>> requests;
     std::thread event_thread;
+    std::mutex lifecycle_mutex;
+    std::condition_variable lifecycle_condition;
+    std::deque<std::function<void()>> lifecycle_jobs;
+    std::thread lifecycle_thread;
     bool stop_event_thread = false;
+    bool stop_lifecycle_thread = false;
     void mark_callbacks_returned();
 
     void start_event_thread()
@@ -135,8 +156,35 @@ struct UsbContext::State {
         });
     }
 
+    void start_lifecycle_thread()
+    {
+        lifecycle_thread = std::thread([this] {
+            while (true) {
+                std::function<void()> job;
+                {
+                    std::unique_lock lock(lifecycle_mutex);
+                    lifecycle_condition.wait(lock, [&] {
+                        return stop_lifecycle_thread || !lifecycle_jobs.empty();
+                    });
+                    if (lifecycle_jobs.empty() && stop_lifecycle_thread) return;
+                    job = std::move(lifecycle_jobs.front());
+                    lifecycle_jobs.pop_front();
+                }
+                try { job(); } catch (...) {}
+            }
+        });
+    }
+
     ~State()
     {
+        if (lifecycle_thread.joinable()) {
+            {
+                std::lock_guard lock(lifecycle_mutex);
+                stop_lifecycle_thread = true;
+            }
+            lifecycle_condition.notify_all();
+            lifecycle_thread.join();
+        }
         if (event_thread.joinable()) {
             {
                 std::lock_guard lock(requests_mutex);
@@ -166,6 +214,13 @@ struct UsbHandleLease {
     libusb_device_handle *handle = nullptr;
     std::vector<int> claimed_interfaces;
     int owned_descriptor = -1;
+    std::atomic<bool> closing{false};
+    std::atomic<UsbCloseStatus> close_status{UsbCloseStatus::open};
+    std::mutex close_mutex;
+    std::condition_variable close_condition;
+    bool close_job_started = false;
+    bool close_job_done = false;
+    dtv_internal_result close_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 
     ~UsbHandleLease()
     {
@@ -195,6 +250,9 @@ struct UsbDevice::State {
 };
 
 struct UsbTransferRequest {
+    enum class TerminalReason {
+        none, completed, cancelled, endpoint_cancelled, deadline, closing, disconnected
+    };
     std::shared_ptr<UsbHandleLease> handle;
     libusb_transfer *transfer = nullptr;
     std::vector<unsigned char> buffer;
@@ -211,6 +269,11 @@ struct UsbTransferRequest {
     bool callback_returned = false;
     libusb_transfer_status status = LIBUSB_TRANSFER_ERROR;
     int actual_length = 0;
+    TerminalReason terminal_reason = TerminalReason::none;
+    const dtv_runtime_clock *clock = nullptr;
+    const dtv_cancel *cancel = nullptr;
+    std::uint64_t deadline_ns = 0;
+    bool waiter_returned = false;
 
     ~UsbTransferRequest()
     {
@@ -223,14 +286,26 @@ struct UsbTransferRequest {
 void UsbContext::State::mark_callbacks_returned()
 {
     std::lock_guard lock(requests_mutex);
-    for (const auto &[transfer, request] : requests) {
-        (void)transfer;
+    for (auto it = requests.begin(); it != requests.end();) {
+        const auto &request = it->second;
         {
             std::lock_guard request_lock(request->mutex);
-            if (!request->completed) continue;
+            if (!request->completed) {
+                ++it;
+                continue;
+            }
             request->callback_returned = true;
+            if (request->terminal_reason == UsbTransferRequest::TerminalReason::none) {
+                request->terminal_reason = UsbTransferRequest::TerminalReason::completed;
+            }
+            if (request->waiter_returned) {
+                it = requests.erase(it);
+                requests_condition.notify_all();
+                continue;
+            }
         }
         request->completed_condition.notify_one();
+        ++it;
     }
 }
 
@@ -319,6 +394,7 @@ int transfer_error(libusb_transfer_status status)
     case LIBUSB_TRANSFER_TIMED_OUT:
         return LIBUSB_ERROR_TIMEOUT;
     case LIBUSB_TRANSFER_CANCELLED:
+        /* A backend may cancel the same-endpoint cohort; a peer has no own cancel reason. */
         return LIBUSB_ERROR_INTERRUPTED;
     case LIBUSB_TRANSFER_STALL:
         return LIBUSB_ERROR_PIPE;
@@ -336,39 +412,133 @@ dtv_internal_result wait_for_transfer(const std::shared_ptr<UsbTransferRequest> 
                                      std::size_t *out_actual_length)
 {
     auto &context = *request->handle->context;
+    int submit_result = LIBUSB_SUCCESS;
     {
         std::lock_guard lock(context.requests_mutex);
+        if (request->handle->closing.load() && !lifecycle_cleanup_io) {
+            return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+        }
         context.requests.emplace(request->transfer, request);
+        submit_result = context.backend->submit_transfer(request->transfer);
     }
-    const int submit_result = context.backend->submit_transfer(request->transfer);
     if (submit_result != LIBUSB_SUCCESS) {
         {
             std::lock_guard lock(context.requests_mutex);
             context.requests.erase(request->transfer);
+            context.requests_condition.notify_all();
         }
         return usb_result(submit_result);
     }
 
     libusb_transfer_status status;
     int actual_length;
+    bool cancelled = false;
+    UsbTransferRequest::TerminalReason terminal_reason =
+        UsbTransferRequest::TerminalReason::none;
     {
         std::unique_lock lock(request->mutex);
-        request->completed_condition.wait(lock, [&] {
-            return request->completed && request->callback_returned;
-        });
-        status = request->status;
-        actual_length = request->actual_length;
+        while (!request->completed || !request->callback_returned) {
+            request->completed_condition.wait_for(lock, std::chrono::milliseconds(5));
+            if (request->completed && request->callback_returned) break;
+            if (request->terminal_reason != UsbTransferRequest::TerminalReason::none) {
+                request->waiter_returned = true;
+                cancelled = true;
+                break;
+            }
+            bool is_cancelled = false;
+            if (request->cancel != nullptr && request->clock != nullptr &&
+                request->clock->is_cancelled != nullptr) {
+                try {
+                    std::uint32_t value = 0;
+                    const auto result = request->clock->is_cancelled(
+                        request->clock->user, request->cancel, &value);
+                    is_cancelled = result.code == DTV_INTERNAL_RESULT_OK && value != 0;
+                } catch (...) {}
+            }
+            bool deadline = false;
+            if (request->deadline_ns != 0 && request->deadline_ns != UINT64_MAX &&
+                request->clock != nullptr && request->clock->monotonic_now_ns != nullptr) {
+                try {
+                    deadline = request->clock->monotonic_now_ns(request->clock->user) >=
+                               request->deadline_ns;
+                } catch (...) {}
+            }
+            if (is_cancelled || deadline) {
+                request->terminal_reason = is_cancelled
+                    ? UsbTransferRequest::TerminalReason::cancelled
+                    : UsbTransferRequest::TerminalReason::deadline;
+                request->waiter_returned = true;
+                cancelled = true;
+                break;
+            }
+        }
+        if (cancelled) {
+            status = LIBUSB_TRANSFER_CANCELLED;
+            actual_length = 0;
+        } else {
+            status = request->status;
+            actual_length = request->actual_length;
+        }
+        terminal_reason = request->terminal_reason;
+    }
+    if (cancelled) {
+        last_operation_terminal_reason = terminal_reason == UsbTransferRequest::TerminalReason::cancelled
+            ? UsbOperationTerminalReason::cancelled
+            : terminal_reason == UsbTransferRequest::TerminalReason::deadline
+                ? UsbOperationTerminalReason::deadline : UsbOperationTerminalReason::closing;
+        if (terminal_reason != UsbTransferRequest::TerminalReason::closing) {
+            context.backend->cancel_transfer(request->transfer);
+        }
+        return terminal_reason == UsbTransferRequest::TerminalReason::closing
+            ? make_result(DTV_INTERNAL_RESULT_NOT_READY)
+            : make_result(DTV_INTERNAL_RESULT_TIMEOUT);
+    }
+    if (terminal_reason == UsbTransferRequest::TerminalReason::closing) {
+        last_operation_terminal_reason = UsbOperationTerminalReason::closing;
+        return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+    }
+    if (terminal_reason == UsbTransferRequest::TerminalReason::none ||
+        terminal_reason == UsbTransferRequest::TerminalReason::completed) {
+        if (status == LIBUSB_TRANSFER_TIMED_OUT) {
+            bool operation_deadline_expired = false;
+            if (request->deadline_ns != 0 && request->deadline_ns != UINT64_MAX &&
+                request->clock != nullptr && request->clock->monotonic_now_ns != nullptr) {
+                try {
+                    operation_deadline_expired = request->clock->monotonic_now_ns(
+                        request->clock->user) >= request->deadline_ns;
+                } catch (...) {}
+            }
+            terminal_reason = operation_deadline_expired
+                ? UsbTransferRequest::TerminalReason::deadline
+                : UsbTransferRequest::TerminalReason::completed;
+            last_operation_terminal_reason = operation_deadline_expired
+                ? UsbOperationTerminalReason::deadline
+                : UsbOperationTerminalReason::transfer_timeout;
+        } else if (status == LIBUSB_TRANSFER_CANCELLED) {
+            terminal_reason = UsbTransferRequest::TerminalReason::endpoint_cancelled;
+            last_operation_terminal_reason = UsbOperationTerminalReason::endpoint_cancelled;
+        } else {
+            last_operation_terminal_reason = UsbOperationTerminalReason::completed;
+        }
+    } else {
+        last_operation_terminal_reason = terminal_reason == UsbTransferRequest::TerminalReason::disconnected
+            ? UsbOperationTerminalReason::disconnected : UsbOperationTerminalReason::completed;
     }
     {
         std::lock_guard lock(context.requests_mutex);
         context.requests.erase(request->transfer);
+        context.requests_condition.notify_all();
     }
 
     const auto transferred = (std::max)(actual_length, 0);
     if (out_actual_length != nullptr) {
         *out_actual_length = static_cast<std::size_t>(transferred);
     }
-    if (request->input && request->input_target != nullptr) {
+    if (request->input && request->input_target != nullptr &&
+        terminal_reason != UsbTransferRequest::TerminalReason::cancelled &&
+        terminal_reason != UsbTransferRequest::TerminalReason::deadline &&
+        terminal_reason != UsbTransferRequest::TerminalReason::endpoint_cancelled &&
+        terminal_reason != UsbTransferRequest::TerminalReason::closing) {
         const auto copied = (std::min)(static_cast<std::size_t>(transferred),
                                        request->input_capacity);
         std::copy_n(request->buffer.data() + request->input_offset, copied,
@@ -398,6 +568,84 @@ std::shared_ptr<UsbTransferRequest> make_transfer_request(
     return request;
 }
 
+void configure_operation(UsbTransferRequest &request, UsbDevice::State::IoBinding *binding,
+                         dtv_timeout timeout)
+{
+    request.clock = active_operation_clock != nullptr ? active_operation_clock : binding->clock;
+    request.cancel = active_operation_cancel;
+    request.deadline_ns = timeout.operation_deadline_ns;
+    if (active_operation_deadline_ns != 0 &&
+        (request.deadline_ns == 0 || active_operation_deadline_ns < request.deadline_ns)) {
+        request.deadline_ns = active_operation_deadline_ns;
+    }
+}
+
+bool regular_io_allowed(const UsbDevice::State::IoBinding *binding)
+{
+    return binding != nullptr && binding->handle && binding->handle->handle != nullptr &&
+           (!binding->handle->closing.load() || lifecycle_cleanup_io);
+}
+
+void record_no_wait_reason(UsbDevice::State::IoBinding *binding, dtv_timeout timeout)
+{
+    last_operation_terminal_reason = UsbOperationTerminalReason::none;
+    const auto *clock = active_operation_clock != nullptr
+        ? active_operation_clock : binding->clock;
+    const auto deadline = active_operation_deadline_ns != 0
+        ? (timeout.operation_deadline_ns == 0
+               ? active_operation_deadline_ns
+               : (std::min)(timeout.operation_deadline_ns, active_operation_deadline_ns))
+        : timeout.operation_deadline_ns;
+    if (deadline != 0 && deadline != UINT64_MAX && clock != nullptr &&
+        clock->monotonic_now_ns != nullptr) {
+        try {
+            if (clock->monotonic_now_ns(clock->user) >= deadline) {
+                last_operation_terminal_reason = UsbOperationTerminalReason::deadline;
+            }
+        } catch (...) {}
+    }
+    if (last_operation_terminal_reason != UsbOperationTerminalReason::deadline) {
+        last_operation_terminal_reason = UsbOperationTerminalReason::none;
+    }
+}
+
+void begin_handle_close(const std::shared_ptr<UsbHandleLease> &handle)
+{
+    if (!handle || handle->closing.exchange(true)) return;
+    handle->close_status.store(UsbCloseStatus::closing);
+    auto &context = *handle->context;
+    std::vector<libusb_transfer *> transfers;
+    {
+        std::lock_guard lock(context.requests_mutex);
+        for (const auto &[transfer, request] : context.requests) {
+            if (request->handle != handle) continue;
+            std::lock_guard request_lock(request->mutex);
+            if (request->terminal_reason == UsbTransferRequest::TerminalReason::none) {
+                request->terminal_reason = UsbTransferRequest::TerminalReason::closing;
+                request->waiter_returned = true;
+                request->completed_condition.notify_one();
+                transfers.push_back(transfer);
+            }
+        }
+    }
+    for (auto *transfer : transfers) context.backend->cancel_transfer(transfer);
+}
+
+bool handle_drained(const std::shared_ptr<UsbHandleLease> &handle)
+{
+    const auto &context = *handle->context;
+    return std::none_of(context.requests.begin(), context.requests.end(), [&](const auto &entry) {
+        return entry.second->handle == handle;
+    });
+}
+
+bool closing_requests_drained(const UsbContext::State &context)
+{
+    return std::none_of(context.requests.begin(), context.requests.end(), [](const auto &entry) {
+        return entry.second->handle->closing.load();
+    });
+}
+
 dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
                             std::uint8_t request, std::uint16_t value,
                             std::uint16_t index, dtv_buffer *data,
@@ -406,18 +654,25 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
     auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
-    if (binding == nullptr || !binding->handle || binding->handle->handle == nullptr || data == nullptr ||
+    if (binding != nullptr && binding->handle && binding->handle->closing.load() &&
+        !lifecycle_cleanup_io) {
+        return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+    }
+    if (!regular_io_allowed(binding) || data == nullptr ||
         data->capacity > UINT16_MAX ||
         data->size > data->capacity ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, binding->clock,
+    const auto timeout_conversion = transfer_timeout(timeout,
+                                                     active_operation_clock != nullptr
+                                                         ? active_operation_clock : binding->clock,
                                                      &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
         return failure;
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
+        record_no_wait_reason(binding, timeout);
         data->size = 0;
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
@@ -426,6 +681,7 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
     try {
         auto request_state = make_transfer_request(binding->handle,
             LIBUSB_CONTROL_SETUP_SIZE + static_cast<std::size_t>(length));
+        configure_operation(*request_state, binding, timeout);
         request_state->input = input;
         request_state->output = !input;
         request_state->input_length = length;
@@ -445,6 +701,10 @@ dtv_internal_result control_transfer(void *user, std::uint8_t request_type,
         auto result = wait_for_transfer(request_state, &transferred);
         if (request_state->status == LIBUSB_TRANSFER_COMPLETED) {
             data->size = transferred;
+        } else if (current_usb_terminal_reason() == UsbOperationTerminalReason::cancelled ||
+                   current_usb_terminal_reason() == UsbOperationTerminalReason::deadline ||
+                   current_usb_terminal_reason() == UsbOperationTerminalReason::closing) {
+            data->size = 0;
         }
         return result;
     } catch (...) {
@@ -458,20 +718,28 @@ dtv_internal_result bulk_out_transfer(void *user, std::uint8_t endpoint,
     auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
-    if (binding == nullptr || !binding->handle || binding->handle->handle == nullptr || data.size > INT_MAX ||
+    if (binding != nullptr && binding->handle && binding->handle->closing.load() &&
+        !lifecycle_cleanup_io) {
+        return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+    }
+    if (!regular_io_allowed(binding) || data.size > INT_MAX ||
         (data.size != 0 && data.data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, binding->clock,
+    const auto timeout_conversion = transfer_timeout(timeout,
+                                                     active_operation_clock != nullptr
+                                                         ? active_operation_clock : binding->clock,
                                                      &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
         return failure;
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
+        record_no_wait_reason(binding, timeout);
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
     try {
         auto request_state = make_transfer_request(binding->handle, data.size);
+        configure_operation(*request_state, binding, timeout);
         if (data.size != 0) {
             std::copy_n(data.data, static_cast<std::size_t>(data.size),
                         request_state->buffer.data());
@@ -500,22 +768,30 @@ dtv_internal_result input_transfer(void *user, std::uint8_t endpoint,
     auto *binding = static_cast<UsbDevice::State::IoBinding *>(user);
     unsigned int milliseconds;
     dtv_internal_result failure = invalid();
-    if (binding == nullptr || !binding->handle || binding->handle->handle == nullptr || data == nullptr ||
+    if (binding != nullptr && binding->handle && binding->handle->closing.load() &&
+        !lifecycle_cleanup_io) {
+        return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+    }
+    if (!regular_io_allowed(binding) || data == nullptr ||
         data->capacity > INT_MAX ||
         (data->capacity != 0 && data->data == nullptr)) {
         return invalid();
     }
-    const auto timeout_conversion = transfer_timeout(timeout, binding->clock,
+    const auto timeout_conversion = transfer_timeout(timeout,
+                                                     active_operation_clock != nullptr
+                                                         ? active_operation_clock : binding->clock,
                                                      &milliseconds, &failure);
     if (timeout_conversion == TimeoutConversion::invalid) {
         return failure;
     }
     if (timeout_conversion == TimeoutConversion::no_wait) {
+        record_no_wait_reason(binding, timeout);
         data->size = 0;
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
     }
     try {
         auto request_state = make_transfer_request(binding->handle, data->capacity);
+        configure_operation(*request_state, binding, timeout);
         request_state->input = true;
         request_state->input_target = data->data;
         request_state->input_capacity = data->capacity;
@@ -560,6 +836,28 @@ dtv_usb_io make_io(void *user, const dtv_runtime_clock *clock)
 
 }
 
+UsbOperationTerminalReason current_usb_terminal_reason()
+{
+    return last_operation_terminal_reason;
+}
+
+UsbOperationScope::UsbOperationScope(const dtv_runtime_clock *clock, const dtv_cancel *cancel,
+                                     std::uint64_t deadline_ns)
+    : previous_clock_(active_operation_clock), previous_cancel_(active_operation_cancel),
+      previous_deadline_ns_(active_operation_deadline_ns)
+{
+    active_operation_clock = clock;
+    active_operation_cancel = cancel;
+    active_operation_deadline_ns = deadline_ns;
+}
+
+UsbOperationScope::~UsbOperationScope()
+{
+    active_operation_clock = previous_clock_;
+    active_operation_cancel = previous_cancel_;
+    active_operation_deadline_ns = previous_deadline_ns_;
+}
+
 UsbContext::UsbContext() : state_(std::make_shared<State>())
 {
     const int result = state_->backend->init_context(&state_->context);
@@ -569,6 +867,7 @@ UsbContext::UsbContext() : state_(std::make_shared<State>())
     }
     try {
         state_->start_event_thread();
+        state_->start_lifecycle_thread();
     } catch (...) {
         state_->result = exception_result();
     }
@@ -674,7 +973,12 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
 }
 
 UsbDevice::UsbDevice(std::unique_ptr<State> state) : state_(std::move(state)) {}
-UsbDevice::~UsbDevice() = default;
+UsbDevice::~UsbDevice()
+{
+    if (state_ && state_->binding.handle && close_status() != UsbCloseStatus::closed) {
+        run_close_callback({}, {UINT64_MAX, UINT64_MAX});
+    }
+}
 
 dtv_internal_result UsbDevice::result() const
 {
@@ -687,6 +991,107 @@ const dtv_usb_io *UsbDevice::io() const
                    !state_->binding.handle->claimed_interfaces.empty()
                ? &state_->io
                : nullptr;
+}
+
+dtv_internal_result UsbDevice::run_close_callback(
+    std::function<dtv_internal_result()> callback, dtv_timeout timeout)
+{
+    if (!state_ || !state_->binding.handle) {
+        return callback ? callback() : make_result(DTV_INTERNAL_RESULT_OK);
+    }
+    auto handle = state_->binding.handle;
+    begin_handle_close(handle);
+    bool start_job = false;
+    {
+        std::lock_guard lock(handle->close_mutex);
+        if (!handle->close_job_started) {
+            handle->close_job_started = true;
+            start_job = true;
+        }
+    }
+    if (start_job) {
+        auto &context = *handle->context;
+        {
+            std::lock_guard lock(context.lifecycle_mutex);
+            context.lifecycle_jobs.emplace_back([handle, callback = std::move(callback)]() mutable {
+                auto &owner = *handle->context;
+                {
+                    std::unique_lock lock(owner.requests_mutex);
+                    owner.requests_condition.wait(lock, [&] { return closing_requests_drained(owner); });
+                }
+                lifecycle_cleanup_io = true;
+                dtv_internal_result result = make_result(DTV_INTERNAL_RESULT_OK);
+                if (callback) {
+                    try { result = callback(); }
+                    catch (...) { result = exception_result(); }
+                }
+                lifecycle_cleanup_io = false;
+                {
+                    std::unique_lock lock(owner.requests_mutex);
+                    owner.requests_condition.wait(lock, [&] { return closing_requests_drained(owner); });
+                }
+                {
+                    std::lock_guard lock(handle->close_mutex);
+                    handle->close_result = result;
+                    handle->close_job_done = true;
+                    handle->close_status.store(UsbCloseStatus::closed);
+                }
+                handle->close_condition.notify_all();
+            });
+        }
+        context.lifecycle_condition.notify_one();
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    std::unique_lock lock(handle->close_mutex);
+    while (!handle->close_job_done) {
+        if (timeout.timeout_ms != UINT64_MAX &&
+            std::chrono::steady_clock::now() - started >=
+                std::chrono::milliseconds(timeout.timeout_ms)) {
+            handle->close_status.store(UsbCloseStatus::pending);
+            return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+        }
+        handle->close_condition.wait_for(lock, std::chrono::milliseconds(5));
+        if (timeout.operation_deadline_ns != 0 && timeout.operation_deadline_ns != UINT64_MAX &&
+            state_->binding.clock != nullptr &&
+            state_->binding.clock->monotonic_now_ns != nullptr &&
+            state_->binding.clock->monotonic_now_ns(state_->binding.clock->user) >=
+                timeout.operation_deadline_ns && !handle->close_job_done) {
+            handle->close_status.store(UsbCloseStatus::pending);
+            return make_result(DTV_INTERNAL_RESULT_NOT_READY);
+        }
+    }
+    return handle->close_result;
+}
+
+void UsbDevice::begin_close()
+{
+    if (state_) begin_handle_close(state_->binding.handle);
+}
+
+void UsbDevice::finish_close(dtv_internal_result result)
+{
+    if (!state_ || !state_->binding.handle) return;
+    auto handle = state_->binding.handle;
+    std::lock_guard lock(handle->close_mutex);
+    handle->close_result = result;
+    handle->close_status.store(UsbCloseStatus::closed);
+    handle->close_job_done = true;
+    handle->close_condition.notify_all();
+}
+
+UsbCloseStatus UsbDevice::close_status() const
+{
+    return state_ && state_->binding.handle
+        ? state_->binding.handle->close_status.load()
+        : UsbCloseStatus::closed;
+}
+
+dtv_internal_result UsbDevice::close_result() const
+{
+    if (!state_ || !state_->binding.handle) return make_result(DTV_INTERNAL_RESULT_OK);
+    std::lock_guard lock(state_->binding.handle->close_mutex);
+    return state_->binding.handle->close_result;
 }
 
 std::unique_ptr<UsbDevice> UsbContext::open(const UsbDeviceSnapshot &snapshot,
@@ -833,6 +1238,7 @@ std::unique_ptr<UsbDevice> UsbTestDeviceFactory::open_usb_fd_impl(
     }
     try {
         context.start_event_thread();
+        context.start_lifecycle_thread();
     } catch (...) {
         close(owned_descriptor);
         *result = exception_result();
@@ -911,6 +1317,7 @@ UsbContext UsbTestDeviceFactory::context(std::shared_ptr<UsbTransferBackend> bac
     context->backend = std::move(backend);
     context->context = reinterpret_cast<libusb_context *>(1);
     context->start_event_thread();
+    context->start_lifecycle_thread();
     return UsbContext(std::move(context));
 }
 

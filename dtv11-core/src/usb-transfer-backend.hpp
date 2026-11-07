@@ -19,6 +19,7 @@ public:
     virtual libusb_transfer *allocate_transfer() = 0;
     virtual void free_transfer(libusb_transfer *) = 0;
     virtual int submit_transfer(libusb_transfer *) = 0;
+    virtual int cancel_transfer(libusb_transfer *) = 0;
     virtual int handle_events(libusb_context *, timeval *) = 0;
     virtual int get_device_descriptor(libusb_device *, libusb_device_descriptor *) = 0;
     virtual std::uint8_t get_bus_number(libusb_device *) = 0;

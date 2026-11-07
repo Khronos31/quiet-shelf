@@ -3,6 +3,7 @@
 #define DTV_INTERNAL_USB_HPP
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -10,6 +11,25 @@
 #include <dtv/spi/types.h>
 
 namespace dtv::internal {
+
+class UsbOperationScope {
+public:
+    UsbOperationScope(const dtv_runtime_clock *, const dtv_cancel *, std::uint64_t deadline_ns);
+    ~UsbOperationScope();
+    UsbOperationScope(const UsbOperationScope &) = delete;
+    UsbOperationScope &operator=(const UsbOperationScope &) = delete;
+
+private:
+    const dtv_runtime_clock *previous_clock_ = nullptr;
+    const dtv_cancel *previous_cancel_ = nullptr;
+    std::uint64_t previous_deadline_ns_ = 0;
+};
+
+enum class UsbCloseStatus { open, closing, pending, closed };
+enum class UsbOperationTerminalReason {
+    none, completed, cancelled, endpoint_cancelled, deadline, transfer_timeout, closing, disconnected
+};
+UsbOperationTerminalReason current_usb_terminal_reason();
 
 struct UsbTestDeviceFactory;
 
@@ -80,6 +100,12 @@ public:
 
     dtv_internal_result result() const;
     const dtv_usb_io *io() const;
+    dtv_internal_result run_close_callback(
+        std::function<dtv_internal_result()> callback, dtv_timeout timeout);
+    void begin_close();
+    void finish_close(dtv_internal_result);
+    UsbCloseStatus close_status() const;
+    dtv_internal_result close_result() const;
 
 private:
     explicit UsbDevice(std::unique_ptr<State>);
