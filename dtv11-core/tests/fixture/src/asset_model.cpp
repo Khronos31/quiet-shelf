@@ -3,9 +3,9 @@
 #include <dtv/spi/feature.hpp>
 #include "assetfixture_firmware.hpp"
 
-DTV_PRODUCT(assetfixture, DTV_FEATURES(::dtv::spi::Feature::Firmware));
+DTV_PRODUCT(assetfixture, DTV_FEATURES());
 DTV_MODEL(assetfixture, asset_model,
-          DTV_FEATURES(::dtv::spi::Feature::Firmware),
+          DTV_FEATURES(),
           DTV_FIRMWARE(fixture_blob),
           (::dtv::spi::model_information{"Firmware Fixture", 0x1234, 0x5678}));
 DTV_DEFINE_MODEL(assetfixture, asset_model);

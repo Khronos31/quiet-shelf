@@ -20,7 +20,6 @@ enum class Feature : std::uint32_t {
     SelectTsid,
     Signal,
     Lna,
-    Firmware,
 };
 
 enum class PublicModelOperation : std::uint32_t {
@@ -147,7 +146,7 @@ int32_t call_default_firmware(dtv_device *device, const dtv_call_options *option
 }
 
 template <PublicModelOperation Operation, typename ModelFeatures, typename Firmware,
-          Feature Required, typename Function>
+          typename RequiredFeatures, typename Function>
 int32_t call_model_operation(Function function, dtv_error *error)
 {
     if constexpr (Operation == PublicModelOperation::SendFirmware) {
@@ -163,7 +162,7 @@ int32_t call_model_operation(Function function, dtv_error *error)
         }
         return DTV_ERROR_UNSUPPORTED;
     }
-    return call_if_supported<ModelFeatures, feature_set<Required>>(function, error);
+    return call_if_supported<ModelFeatures, RequiredFeatures>(function, error);
 }
 
 }
@@ -188,27 +187,27 @@ int32_t call_model_operation(Function function, dtv_error *error)
         model_info_##product##_##model.vendor_id, model_info_##product##_##model.product_id }
 
 #define DTV_PUBLIC_MODEL_OPS(X, product, model) \
-    X(product, model, lnb_on, LnbOn, ::dtv::spi::Feature::LnbPower, \
+    X(product, model, lnb_on, LnbOn, ::dtv::spi::feature_set<::dtv::spi::Feature::LnbPower>, \
       (dtv_enclosure *enclosure, const dtv_call_options *options, dtv_error *err), \
       (enclosure, options, err)) \
-    X(product, model, lnb_off, LnbOff, ::dtv::spi::Feature::LnbPower, \
+    X(product, model, lnb_off, LnbOff, ::dtv::spi::feature_set<::dtv::spi::Feature::LnbPower>, \
       (dtv_enclosure *enclosure, const dtv_call_options *options, dtv_error *err), \
       (enclosure, options, err)) \
-    X(product, model, tune_by_frequency, TuneByFrequency, ::dtv::spi::Feature::TuneIsdbT, \
+    X(product, model, tune_by_frequency, TuneByFrequency, ::dtv::spi::feature_set<::dtv::spi::Feature::TuneIsdbT>, \
       (dtv_receiver *receiver, uint32_t system, uint64_t frequency_hz, const dtv_tune_options *tune, \
        const dtv_call_options *options, dtv_error *err), \
       (receiver, system, frequency_hz, tune, options, err)) \
-    X(product, model, get_signal, GetSignal, ::dtv::spi::Feature::Signal, \
+    X(product, model, get_signal, GetSignal, ::dtv::spi::feature_set<::dtv::spi::Feature::Signal>, \
       (dtv_receiver *receiver, const dtv_call_options *options, dtv_signal *out, dtv_error *err), \
       (receiver, options, out, err)) \
-    X(product, model, set_pid_filter, SetPidFilter, ::dtv::spi::Feature::OutputPidFilter, \
+    X(product, model, set_pid_filter, SetPidFilter, ::dtv::spi::feature_set<::dtv::spi::Feature::OutputPidFilter>, \
       (dtv_stream *stream, const uint16_t *pids, uint32_t count, dtv_error *err), \
       (stream, pids, count, err)) \
-    X(product, model, send_firmware, SendFirmware, ::dtv::spi::Feature::Firmware, \
+    X(product, model, send_firmware, SendFirmware, ::dtv::spi::feature_set<>, \
       (dtv_device *device, const uint8_t *firmware, uint64_t size, const dtv_call_options *options, \
        dtv_error *err), \
       (device, firmware, size, options, err)) \
-    X(product, model, send_default_firmware, SendDefaultFirmware, ::dtv::spi::Feature::Firmware, \
+    X(product, model, send_default_firmware, SendDefaultFirmware, ::dtv::spi::feature_set<>, \
       (dtv_device *device, const dtv_call_options *options, dtv_error *err), \
       (device, options, err))
 
@@ -224,14 +223,14 @@ int32_t call_model_operation(Function function, dtv_error *error)
     DTV_DETAIL_DEFINE_MODEL_OP_GENERIC(product, model, name, operation, feature, signature, arguments)
 #define DTV_DETAIL_DEFINE_MODEL_OP_SetPidFilter(product, model, name, operation, feature, signature, arguments) \
     DTV_DETAIL_DEFINE_MODEL_OP_GENERIC(product, model, name, operation, feature, signature, arguments)
-#define DTV_DETAIL_DEFINE_MODEL_OP_GENERIC(product, model, name, operation, feature, signature, arguments) \
+#define DTV_DETAIL_DEFINE_MODEL_OP_GENERIC(product, model, name, operation, required_features, signature, arguments) \
     extern "C" int32_t dtv_model_impl_##name##_##product##_##model signature; \
     extern "C" int32_t dtv_##name##_##product##_##model signature \
     { \
         using model_features = model_features_##product##_##model; \
         return ::dtv::spi::call_model_operation< \
             ::dtv::spi::PublicModelOperation::operation, model_features, \
-            model_firmware_##product##_##model, feature>( \
+            model_firmware_##product##_##model, required_features>( \
             [&] { return dtv_model_impl_##name##_##product##_##model arguments; }, err); \
     }
 #define DTV_DETAIL_DEFINE_MODEL_OP_SendFirmware(product, model, name, operation, feature, signature, arguments) \

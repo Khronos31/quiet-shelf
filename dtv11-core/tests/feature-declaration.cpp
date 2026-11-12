@@ -3,8 +3,7 @@
 #include <dtv/spi/feature.hpp>
 #include <dtv/spi/device_ops.hpp>
 
-DTV_PRODUCT(fixture, DTV_FEATURES(::dtv::spi::Feature::LnbPower,
-                                  ::dtv::spi::Feature::Firmware));
+DTV_PRODUCT(fixture, DTV_FEATURES(::dtv::spi::Feature::LnbPower));
 DTV_MODEL(fixture, test_model,
           DTV_FEATURES(::dtv::spi::Feature::LnbPower),
           DTV_NO_FIRMWARE,
@@ -14,8 +13,8 @@ DTV_DEFINE_MODEL(fixture, test_model);
 static_assert(model_info_fixture_test_model.vendor_id == 0x1234);
 static_assert(DTV_MAX_ENCLOSURES == 128);
 
-#define CHECK_OPERATION(product, model, name, operation, feature, signature, arguments) \
-    static_assert(std::is_same_v<decltype(feature), ::dtv::spi::Feature>);
+#define CHECK_OPERATION(product, model, name, operation, required_features, signature, arguments) \
+    static_assert(::dtv::spi::is_feature_set_v<required_features>);
 DTV_PUBLIC_MODEL_OPS(CHECK_OPERATION, fixture, test_model)
 #undef CHECK_OPERATION
 
