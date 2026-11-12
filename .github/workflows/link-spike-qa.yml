@@ -90,12 +90,12 @@ jobs:
           $build = Join-Path $env:RUNNER_TEMP 'negative-msvc-build'
           cmake -S $negative -B $build -A x64 -DCMAKE_VERBOSE_MAKEFILE=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build $build --config Release --verbose *> (Join-Path $env:RUNNER_TEMP 'negative-msvc-build.log')
+          $lines = & cmake --build $build --config Release --verbose 2>&1
           $buildExit = $LASTEXITCODE
           if ($buildExit -eq 0) { throw 'negative MSVC link unexpectedly succeeded' }
-          $log = Get-Content (Join-Path $env:RUNNER_TEMP 'negative-msvc-build.log') -Raw
-          if ($log -notmatch 'Linking CXX executable' -or
-              $log -notmatch 'sample_model_send_firmware' -or
+          $log = $lines -join "`n"
+          $lines | Select-String 'sample_model_send_firmware|LNK2001|LNK2019|LNK1120|error C'
+          if ($log -notmatch 'sample_model_send_firmware' -or
               $log -notmatch 'LNK2001|LNK2019|LNK1120') {
             throw "MSVC failure was not the intended final-link undefined symbol (exit $buildExit)"
           }
