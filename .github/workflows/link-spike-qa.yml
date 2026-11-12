@@ -43,6 +43,12 @@ jobs:
         run: |
           emcmake cmake -S dtv11-core/spikes/link -B build-wasm -DCMAKE_VERBOSE_MAKEFILE=ON
           cmake --build build-wasm --parallel 2 --verbose
+          echo '--- emitted wasm link command ---'
+          cat build-wasm/CMakeFiles/samplectl.dir/link.txt
+          echo '--- wasm link libraries response file ---'
+          cat build-wasm/CMakeFiles/samplectl.dir/linkLibs.rsp
+          echo '--- Emscripten archive symbols ---'
+          llvm-nm-19 -A -C build-wasm/libdtv_spike_product.a build-wasm/libdtv_spike_core.a | grep -E 'dtv_load_sample|sample_model_send_firmware|cli_main|register_product|unsupported'
           node build-wasm/samplectl.js --models
           node build-wasm/samplectl.js --link-spike
       - name: wasm-ld missing definition must fail at final link
