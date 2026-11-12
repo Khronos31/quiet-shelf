@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "sample_decl.hpp"
+
+namespace dtv::link_spike {
+namespace {
+
+constexpr std::uint8_t default_firmware[] = {0x44, 0x54, 0x56};
+
+Result unsupported_send_firmware(const std::uint8_t *, std::size_t)
+{
+    return Result::unsupported;
+}
+
+template<class Features>
+constexpr SendFirmware bind_send_firmware()
+{
+    if constexpr (Features::template contains<Feature::send_firmware>) {
+        return sample_model_send_firmware;
+    }
+    return unsupported_send_firmware;
+}
+
+template<class Features>
+constexpr GetSignal bind_get_signal()
+{
+    if constexpr (Features::template contains<Feature::get_signal>) {
+        return sample_model_get_signal;
+    }
+    return unsupported;
+}
+
+Result send_default_firmware()
+{
+    return sample_model_send_firmware(default_firmware, sizeof(default_firmware));
+}
+
+constexpr ModelEntry model_entry{
+    "@DTV_SPIKE_MODEL@",
+    "@DTV_SPIKE_FIRMWARE@",
+    bind_send_firmware<sample_model_model_features>(),
+    bind_get_signal<sample_model_model_features>(),
+    send_default_firmware,
+};
+
+constexpr ProductEntry product_entry{
+    "@DTV_SPIKE_PRODUCT@",
+    "@DTV_SPIKE_COMMAND@",
+    "@DTV_SPIKE_VERSION@",
+    &model_entry,
+};
+
+}
+
+}
+
+extern "C" void dtv_load_@DTV_SPIKE_PRODUCT@()
+{
+    dtv::link_spike::register_product(&dtv::link_spike::product_entry);
+}

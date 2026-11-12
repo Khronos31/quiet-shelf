@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "link_spike.hpp"
+
+extern "C" void dtv_load_@DTV_SPIKE_PRODUCT@();
+
+int main(int argc, char **argv)
+{
+    dtv_load_@DTV_SPIKE_PRODUCT@();
+    const dtv::link_spike::CliConfig config{
+        "@DTV_SPIKE_PRODUCT@",
+        "@DTV_SPIKE_COMMAND@",
+        "@DTV_SPIKE_VERSION@",
+    };
+    return dtv::link_spike::cli_main(argc, argv, &config);
+}

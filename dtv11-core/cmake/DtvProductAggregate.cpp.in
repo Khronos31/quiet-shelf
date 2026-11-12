@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <array>
+#include <cstddef>
+#include <span>
+
+#include <dtv/spi/device_ops.hpp>
+
+namespace dtv::spi {
+
+@declarations@
+
+std::span<const ProductEntry *const> product_registry()
+{
+    static const std::array<const ProductEntry *, @aggregate_count@> products{{
+@entries@    }};
+    return {products.data(), products.size()};
+}
+
+}
+
+extern "C" dtv_result dtv_model_count(uint32_t *out_count)
+{
+    if (out_count == nullptr) {
+        return {DTV_ERROR_INVALID_ARGUMENT, 0};
+    }
+    uint32_t count = 0;
+    for (const auto *product : dtv::spi::product_registry()) {
+        if (product->model_count > UINT32_MAX - count) {
+            return {DTV_ERROR_INVALID_ARGUMENT, 0};
+        }
+        count += static_cast<uint32_t>(product->model_count);
+    }
+    *out_count = count;
+    return {DTV_ERROR_OK, 0};
+}
+
+extern "C" dtv_result dtv_model_get(uint32_t index, dtv_model_info *out_model)
+{
+    if (out_model == nullptr) {
+        return {DTV_ERROR_INVALID_ARGUMENT, 0};
+    }
+    for (const auto *product : dtv::spi::product_registry()) {
+        if (product->model_count > UINT32_MAX) {
+            return {DTV_ERROR_INVALID_ARGUMENT, 0};
+        }
+        if (index < product->model_count) {
+            *out_model = product->models[index]->model;
+            return {DTV_ERROR_OK, 0};
+        }
+        index -= static_cast<uint32_t>(product->model_count);
+    }
+    return {DTV_ERROR_INVALID_ARGUMENT, 0};
+}

@@ -1,0 +1,98 @@
+name: dtv11 link spike QA
+
+on:
+  push:
+    branches: [dtv11-core-link-spike-20261112]
+    paths:
+      - 'dtv11-core/**'
+      - '.github/workflows/link-spike-qa.yml'
+
+jobs:
+  gnu-and-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain versions
+        run: |
+          cmake --version
+          g++ --version
+          node --version
+          sudo apt-get update
+          sudo apt-get install -y emscripten
+          emcc --version
+          wasm-ld-19 --version
+      - name: GNU positive link and CLI
+        run: |
+          cmake -S dtv11-core/spikes/link -B build-gnu -DCMAKE_VERBOSE_MAKEFILE=ON
+          cmake --build build-gnu --parallel 2 --verbose
+          ./build-gnu/samplectl --models
+          ./build-gnu/samplectl --link-spike
+      - name: GNU missing definition must fail at final link
+        run: |
+          mkdir -p "$RUNNER_TEMP/negative-gnu"
+          cp -a dtv11-core/spikes/link/. "$RUNNER_TEMP/negative-gnu/"
+          printf '%s\n' '#include "sample_decl.hpp"' > "$RUNNER_TEMP/negative-gnu/src/model.cpp"
+          cmake -S "$RUNNER_TEMP/negative-gnu" -B "$RUNNER_TEMP/negative-gnu-build" -DCMAKE_VERBOSE_MAKEFILE=ON
+          if cmake --build "$RUNNER_TEMP/negative-gnu-build" --parallel 2 --verbose > "$RUNNER_TEMP/negative-gnu-build.log" 2>&1; then
+            echo 'negative GNU link unexpectedly succeeded'
+            exit 1
+          fi
+          grep -E 'Linking CXX executable|sample_model_send_firmware|undefined reference' "$RUNNER_TEMP/negative-gnu-build.log"
+          grep -q 'undefined reference.*sample_model_send_firmware' "$RUNNER_TEMP/negative-gnu-build.log"
+      - name: wasm-ld positive link and generated JavaScript CLI
+        run: |
+          emcmake cmake -S dtv11-core/spikes/link -B build-wasm -DCMAKE_VERBOSE_MAKEFILE=ON
+          cmake --build build-wasm --parallel 2 --verbose
+          node build-wasm/samplectl.js --models
+          node build-wasm/samplectl.js --link-spike
+      - name: wasm-ld missing definition must fail at final link
+        run: |
+          mkdir -p "$RUNNER_TEMP/negative-wasm"
+          cp -a dtv11-core/spikes/link/. "$RUNNER_TEMP/negative-wasm/"
+          printf '%s\n' '#include "sample_decl.hpp"' > "$RUNNER_TEMP/negative-wasm/src/model.cpp"
+          emcmake cmake -S "$RUNNER_TEMP/negative-wasm" -B "$RUNNER_TEMP/negative-wasm-build" -DCMAKE_VERBOSE_MAKEFILE=ON
+          if cmake --build "$RUNNER_TEMP/negative-wasm-build" --parallel 2 --verbose > "$RUNNER_TEMP/negative-wasm-build.log" 2>&1; then
+            echo 'negative wasm link unexpectedly succeeded'
+            exit 1
+          fi
+          grep -E 'Linking CXX executable|sample_model_send_firmware|undefined symbol' "$RUNNER_TEMP/negative-wasm-build.log"
+          grep -q 'undefined symbol.*sample_model_send_firmware' "$RUNNER_TEMP/negative-wasm-build.log"
+
+  msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: MSVC and CMake versions
+        run: |
+          cl /Bv
+          cmake --version
+      - name: MSVC positive link and CLI
+        shell: pwsh
+        run: |
+          cmake -S dtv11-core/spikes/link -B build-msvc -A x64 -DCMAKE_VERBOSE_MAKEFILE=ON
+          cmake --build build-msvc --config Release --verbose
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'build-msvc\Release\samplectl.exe'
+          & $exe --models
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exe --link-spike
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: MSVC missing definition must fail at final link
+        shell: pwsh
+        run: |
+          $negative = Join-Path $env:RUNNER_TEMP 'negative-msvc'
+          Copy-Item -Recurse dtv11-core/spikes/link $negative
+          Set-Content -Encoding ascii -Path (Join-Path $negative 'src\model.cpp') -Value '#include "sample_decl.hpp"'
+          $build = Join-Path $env:RUNNER_TEMP 'negative-msvc-build'
+          cmake -S $negative -B $build -A x64 -DCMAKE_VERBOSE_MAKEFILE=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build $build --config Release --verbose *> (Join-Path $env:RUNNER_TEMP 'negative-msvc-build.log')
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -eq 0) { throw 'negative MSVC link unexpectedly succeeded' }
+          $log = Get-Content (Join-Path $env:RUNNER_TEMP 'negative-msvc-build.log') -Raw
+          if ($log -notmatch 'Linking CXX executable' -or
+              $log -notmatch 'sample_model_send_firmware' -or
+              $log -notmatch 'LNK2001|LNK2019|LNK1120') {
+            throw "MSVC failure was not the intended final-link undefined symbol (exit $buildExit)"
+          }
+          Write-Output "expected MSVC final-link failure exit=$buildExit"
+          $log -split "`n" | Select-String 'sample_model_send_firmware|LNK2001|LNK2019|LNK1120'
