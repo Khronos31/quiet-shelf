@@ -101,3 +101,4 @@ jobs:
           }
           Write-Output "expected MSVC final-link failure exit=$buildExit"
           $log -split "`n" | Select-String 'sample_model_send_firmware|LNK2001|LNK2019|LNK1120'
+          $global:LASTEXITCODE = 0
