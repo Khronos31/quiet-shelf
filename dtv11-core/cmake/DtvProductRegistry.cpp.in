@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <dtv/spi/device_ops.hpp>
+#include <dtv/spi/feature.hpp>
+#include "@PRODUCT_NAME@_firmware.hpp"
 
 namespace dtv::spi {
 
@@ -15,4 +17,39 @@ extern const ProductEntry @PRODUCT_ENTRY_SYMBOL@{
     @PRODUCT_MODELS_COUNT@
 };
 
+}
+
+extern "C" int32_t @PRODUCT_TO_ALL_SYMBOL@(const dtv_call_options *, dtv_error *);
+@l3_model_declarations@
+
+extern "C" void dtv_l3_register_product(
+    const char *, const dtv::spi::l3_model_record *const *, std::size_t,
+    int32_t (*)(const dtv_call_options *, dtv_error *));
+
+extern "C" void @PRODUCT_LOAD_SYMBOL@(void)
+{
+    static const dtv::spi::l3_model_record *const models[] = {
+@l3_model_values@    };
+    dtv_l3_register_product("@PRODUCT_NAME@", models, @PRODUCT_MODELS_COUNT@,
+                            &@PRODUCT_TO_ALL_SYMBOL@);
+}
+
+extern "C" const dtv_model *const *@PRODUCT_LIST_MODELS_SYMBOL@(void)
+{
+    static const dtv_model *const models[] = {
+@l3_model_list_values@        nullptr
+    };
+    return models;
+}
+
+extern "C" int32_t @PRODUCT_SUPPORT_SYMBOL@(
+    uint32_t operation, uint32_t *out_tribool, dtv_error *error)
+{
+    return dtv_get_product_support("@PRODUCT_NAME@", operation, out_tribool, error);
+}
+
+extern "C" int32_t @MODEL_SUPPORT_SYMBOL@(
+    const char *model, uint32_t operation, uint32_t *out_tribool, dtv_error *error)
+{
+    return dtv_get_model_support(model, operation, out_tribool, error);
 }

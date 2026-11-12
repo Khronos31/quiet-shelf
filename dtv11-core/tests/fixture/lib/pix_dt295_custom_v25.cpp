@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <dtv/spi/device_ops.hpp>
+#include <dtv/spi/feature.hpp>
 
 namespace dtv::spi {
 
@@ -12,3 +13,8 @@ extern const ModelEntry pix_dt295_custom_v25_model{
 };
 
 }
+
+DTV_PRODUCT(i0_pix_fixture, DTV_FEATURES());
+DTV_MODEL(i0_pix_fixture, pix_dt295_custom_v25, DTV_FEATURES(), DTV_NO_FIRMWARE,
+          (::dtv::spi::model_information{"PIX-DT295", 0x06b8, 0x103b}));
+DTV_DEFINE_MODEL(i0_pix_fixture, pix_dt295_custom_v25);

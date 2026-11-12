@@ -1,6 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # 製品への組み込み
 
+> [!NOTE]
+> 本文書に記載されている `ModelEntry` や `dtv_add_product_aggregate` による登録は初期SPI経路の説明です。新設計に基づく宣言基盤、C ABI、型検査機能、およびCMake製品登録（`dtv_product`）の使い方と到達範囲については [declaration-foundation.md](declaration-foundation.md) を参照してください。
+
+
 `tests/fixture` 配下の fixture は、`add_subdirectory` で Core を追加し、`MODELS` から製品ライブラリとモデル登録を生成して、Core のテンプレートからコマンドをビルドする最小構成の製品ディレクトリである。Core リポジトリのルートからは、次のコマンドを実行する。
 
 ```sh
