@@ -2157,6 +2157,15 @@ int public_reset_card()
     opening.join();
     if (open_result.load(std::memory_order_acquire) != DTV_ERROR_OK ||
         dtv_get_card_generation(root) != 0) return 5;
+    const std::uint8_t *unread_atr = reinterpret_cast<const std::uint8_t *>(std::uintptr_t{1});
+    std::uint64_t unread_size = 1;
+    dtv_error unread_error{};
+    unread_error.struct_size = sizeof(unread_error);
+    const auto unread_submissions = backend->endpoint_submission_count(0x02);
+    if (dtv_get_card_atr(root, nullptr, &unread_atr, &unread_size, &unread_error) !=
+            DTV_ERROR_NOT_READY || unread_error.code != DTV_ERROR_NOT_READY ||
+        unread_atr != nullptr || unread_size != 0 ||
+        backend->endpoint_submission_count(0x02) != unread_submissions) return 6;
 
     const auto reset = [&](unsigned mode, std::int32_t expected) {
         set_scan_card_reply_mode(mode);
@@ -2192,15 +2201,35 @@ int public_reset_card()
         if (result.load(std::memory_order_acquire) != expected || reset_error.code != expected) {
             return false;
         }
-        if (expected != DTV_ERROR_OK)
+        if (expected != DTV_ERROR_OK) {
+            const std::uint8_t *unavailable_atr = reinterpret_cast<const std::uint8_t *>(
+                std::uintptr_t{1});
+            std::uint64_t unavailable_size = 1;
+            dtv_error getter_error{};
+            getter_error.struct_size = sizeof(getter_error);
             return atr.load(std::memory_order_acquire) == nullptr &&
                 size.load(std::memory_order_acquire) == 0 &&
-                dtv_get_card_state(root) == DTV_CARD_UNKNOWN;
+                dtv_get_card_state(root) == DTV_CARD_UNKNOWN &&
+                dtv_get_card_atr(root, nullptr, &unavailable_atr, &unavailable_size,
+                    &getter_error) == DTV_ERROR_NOT_READY &&
+                getter_error.code == DTV_ERROR_NOT_READY && unavailable_atr == nullptr &&
+                unavailable_size == 0;
+        }
         const auto *data = atr.load(std::memory_order_acquire);
         if (data == nullptr || size.load(std::memory_order_acquire) != 4 ||
             data[0] != 0x3b || data[1] != 0x80 || data[2] != 0x01 || data[3] != 0x81 ||
             dtv_get_card_state(root) != DTV_CARD_READY || dtv_get_card_generation(root) != 0)
             return false;
+        const auto getter_submissions = backend->endpoint_submission_count(0x02);
+        const std::uint8_t *got_atr = nullptr;
+        std::uint64_t got_size = 0;
+        dtv_error getter_error{};
+        getter_error.struct_size = sizeof(getter_error);
+        if (dtv_get_card_atr(root, nullptr, &got_atr, &got_size, &getter_error) != DTV_ERROR_OK ||
+            getter_error.code != DTV_ERROR_OK || got_atr != data || got_size != 4 ||
+            got_atr[0] != data[0] || got_atr[1] != data[1] || got_atr[2] != data[2] ||
+            got_atr[3] != data[3] ||
+            backend->endpoint_submission_count(0x02) != getter_submissions) return false;
         auto *const *devices = dtv_get_devices(root);
         auto *const *receivers = devices == nullptr ? nullptr : dtv_get_receivers(devices[0]);
         dtv_signal signal{};
@@ -2482,9 +2511,15 @@ int public_reset_card()
     root = unsupported_enclosures[0];
     const std::uint8_t *unsupported_atr = nullptr;
     std::uint64_t unsupported_size = 0;
+    const std::uint8_t *unsupported_getter_atr = reinterpret_cast<const std::uint8_t *>(
+        std::uintptr_t{1});
+    std::uint64_t unsupported_getter_size = 1;
     if (dtv_reset_card(root, nullptr, &unsupported_atr, &unsupported_size, &error) !=
             DTV_ERROR_UNSUPPORTED || error.code != DTV_ERROR_UNSUPPORTED ||
         unsupported_atr != nullptr || unsupported_size != 0 ||
+        dtv_get_card_atr(root, nullptr, &unsupported_getter_atr, &unsupported_getter_size,
+            &error) != DTV_ERROR_UNSUPPORTED || error.code != DTV_ERROR_UNSUPPORTED ||
+        unsupported_getter_atr != nullptr || unsupported_getter_size != 0 ||
         unsupported_backend->output_snapshot().size() != output_count) return 13;
     dtv::internal::set_public_discovery_batch_for_test({});
     set_scan_public_open_case(0);

@@ -728,16 +728,38 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - 本PR（PR44）で接続されたのは、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream` 等）、有限188/192バイトTS変換配送、決定56に基づく合成連続ソースの受信部別有界キュー満杯・保存済み順序配送・`SLOW_CONSUMER` 終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、共有IN継続動作、リソースチケット・共有リソース調停・世代フェンス、親子閉鎖寿命連携、およびストリーム独立ライフサイクルである。
   - 実機5製品固有のPID機器設定コマンド、TSストリーム転送・DMA/USBエンドポイント・start/stopコマンド/ハードウェア通知フェンス、カードAPDU送受信API、daemon IPC、CLI TSコマンド統合は本PRの対象外であり後続工程である。
 
-## 公開カードリセットとCore共通ATR検査・返却接続（PR45、合成reset・決定51・寿命・直列化接続）
+## 公開カードリセットと公開ATR getter接続（PR45/PR47、合成reset・取得済みATR・決定51・寿命・直列化接続）
 
-開いた筐体（`DTV_OP_CARD` 対応）に対してカードリセットを実行し、合成機器から得たATR（Answer To Reset）の完全性・TCKをCore共通で検査・所有して公開ポインタと長さを返却する公開C API関数（`dtv_reset_card`）、三層の機種ディスパッチ（Core共通層→製品層→機種層 `reset_card`）、同一筐体内カード操作の直列化、二重世代フェンス（接続エポック・リクエストエポック）、決定51に基づく挿抜世代・イベント不変性、およびSharedInOwner並行動作を接続した。
+開いた筐体（`DTV_OP_CARD` 対応）に対してカードリセットを実行し、合成機器から得たATR（Answer To Reset）の完全性・TCKをCore共通で検査・所有して公開ポインタと長さを返却する公開C API関数（`dtv_reset_card`）、およびリセットで取得・保持されたATRを安全に読み出す公開C API関数（`dtv_get_card_atr`）、三層の機種ディスパッチ（Core共通層→製品層→機種層 `reset_card`）、同一筐体内カード操作の直列化、二重世代フェンス（接続エポック・リクエストエポック）、決定51に基づく挿抜世代・イベント不変性、L3 §6.2に基づくgetter-only停止回収、およびSharedInOwner並行動作を接続した。
 
 - **公開カードリセットAPIと引数・能力検証:**
   - `dtv_reset_card(dtv_enclosure *object, const dtv_call_options *options, const std::uint8_t **out_atr, std::uint64_t *out_size, dtv_error *error)`:
     - 引数検証: `object == nullptr || out_atr == nullptr || out_size == nullptr`、または `options != nullptr && options->struct_size < sizeof(*options)` の場合は即座に `DTV_ERROR_INVALID_ARGUMENT` を返す。初期化として `*out_atr = nullptr; *out_size = 0;` を設定する。
     - 能力照会: `dtv_get_enclosure_support(object, DTV_OP_CARD, ...)` を行い、対応能力が `DTV_YES` でない場合（`DTV_NO` または `DTV_UNKNOWN`）は、ハードウェア I/O や機種ディスパッチを行わず直ちに `DTV_ERROR_UNSUPPORTED` を返す。
+- **公開ATR getter API（`dtv_get_card_atr`）と引数・能力検証:**
+  - `dtv_get_card_atr(dtv_enclosure *object, const dtv_call_options *options, const std::uint8_t **out_data, std::uint64_t *out_size, dtv_error *error)`:
+    - 引数検証と初期化: `object == nullptr || out_data == nullptr || out_size == nullptr`、または `options != nullptr && options->struct_size < sizeof(*options)` の場合は即座に `DTV_ERROR_INVALID_ARGUMENT` を返す。出力ポインタが存在する場合は初期化として `*out_data = nullptr; *out_size = 0;` を設定する。
+    - 能力照会: `dtv_get_enclosure_support(object, DTV_OP_CARD, ...)` を行い、対応能力が `DTV_YES` でない場合（`DTV_NO` または `DTV_UNKNOWN`）は、ハードウェア I/O や機種ディスパッチを行わず直ちに `DTV_ERROR_UNSUPPORTED` を返す。
+    - オープン状態検証: 親スロットが存在し、`slot->phase == Phase::open` でなければ `DTV_ERROR_NOT_READY` を返す。
+  - **暗黙リセットなし・新I/Oなし・再解析なし:**
+    - `dtv_get_card_atr` は以前の `dtv_reset_card` 等によって実取得され、Core の `EnclosureRegistry` に保存されている有効な ATR を読み出す getter である。
+    - 暗黙の reset、新たな USB I/O、製品ディスパッチ、ATR 再解析は一切行わない。
+  - **内部直列化・操作チケット・キャンセル連携:**
+    - 公開操作チケット（`acquire_public_card_ticket`）によりスロットのキャンセル・クローズ（`cancel/close`）ゲートと連携。
+    - 筐体ごとの `CardFunctionLease`（`std::timed_mutex`）を非同期ループ内で `try_begin_card_function`（最大 2ms try_lock）により取得してリセット操作等と直列化。キャンセル時は `DTV_ERROR_CANCELLED`、タイムアウト時は `DTV_ERROR_TIMEOUT` を返す。
+    - 専用 worker スレッドは生成せず、待機中に `SharedInOwner` を保持しない。
+  - **現在値失効と返却 byte 領域寿命の分離（正本 §6.7）:**
+    - エポック照合（`card_atr_connection_epoch` と `card_atr_request_epoch`）により現在値の有効性を確認。
+    - カード抜き差し（挿抜通知）が発生すると内部リクエスト世代（`card_request_epoch`）が進むため、現在値としては失効し後続の getter は未取得（`DTV_ERROR_NOT_READY` / `DTV_ERROR_NO_CARD` / `CARD_REMOVED`）を返す。
+    - 一方で、すでに呼び出し側へ返却された byte 列領域（`card_atr`）自体は、挿抜通知ではクリア・破壊されない。
+    - **寿命境界**: 正本 §6.7「次にその筐体のカードの関数を呼ぶまで有効」。次の同一筐体に対するカード操作（`dtv_reset_card` 等の `begin_card_reset`）が寿命境界となる。
+    - **別 receiver との並行性**: 別 receiver の操作（選局、188バイトストリーム読取、signal等）では寿命は一切壊されず、返却ポインタの内容は完全に有効を保つ。
+  - **エラーマッピングと READY 通知の写像:**
+    - ATR 未取得時は `DTV_ERROR_NOT_READY`。
+    - カード不在（`DTV_CARD_ABSENT`）時は、挿抜世代 `card_generation == 0` なら `DTV_ERROR_NO_CARD`、`card_generation > 0` なら `DTV_ERROR_CARD_REMOVED`。
+    - ATR 実体を伴わない `READY` 通知を受信した場合、公開上 `DTV_CARD_PRESENT` へ写像される（正本「`DTV_CARD_READY` は ATR 取得済み」の定義に準拠）。ただし、この写像は Core 内部の実装材料であり、実製品での検証済み動作とは扱わない。
 - **直列化・二重世代フェンス・状態遷移:**
-  - **直列化（Lease）:** 筐体ごとに設けられた `card_function_mutex`（`CardFunctionLease`）を取得し、同一筐体に対するカード操作（`dtv_reset_card` 等）を内部で厳密に直列化する。
+  - **直列化（Lease）:** 筐体ごとに設けられた `card_function_mutex`（`CardFunctionLease`）を取得し、同一筐体に対するカード操作（`dtv_reset_card` / `dtv_get_card_atr` 等）を内部で厳密に直列化する。
   - **開始時初期化とエポック更新:** `begin_card_reset()` において、前回の ATR 保持領域（`card_atr`）をクリアし、カード状態を `DTV_CARD_UNKNOWN` に設定し、内部リクエスト世代（`card_request_epoch`）をインクリメントする。
   - **二重世代フェンス:** 機種からの応答完了時（`finish_card_reset()`）に、`card_reader_connection`（USB/リーダー接続世代）および `card_request_epoch`（リクエスト世代）の双方が開始時と一致しているかを照合する。切断や旧リクエストに対する遅延応答はフェンスにより安全に排除（`DISCONNECTED`）される。
 - **決定51との整合（挿抜世代・イベント不変性）:**
@@ -755,7 +777,7 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - 不正な ATR、途中切れ、TCK 不一致の場合は `DTV_ERROR_CARD_IO` を返却し、カード状態を `DTV_CARD_READY` へ遷移させず、`out_atr = nullptr`, `out_size = 0` を維持する。
 - **返却領域の所有権と寿命（正本 §6.7）:**
   - 検査に合格した妥当な ATR は、Core 内部の `EnclosureRegistry::State::Root::card_atr`（`std::vector<std::uint8_t>`）にコピー保存される。
-  - 公開ポインタ `*out_atr` はこの Core 所有領域のアドレスを指し、`*out_size` にそのバイト長を返す。
+  - 公開ポインタ `*out_atr`（および `dtv_get_card_atr` の `*out_data`）はこの Core 所有領域のアドレスを指し、`*out_size` にそのバイト長を返す。
   - **ポインタの寿命:** 正本 §6.7 の規定どおり「次にその筐体のカードの関数を呼ぶまで有効」である。次の同筐体カード関数が開始され `begin_card_reset()` で領域がクリアされるまで有効性を維持する。
   - **別 receiver との並行性:** 別 receiver の操作（選局、188バイトストリーム読取、signal等）では `card_function_mutex` や `card_atr` は一切参照・変更されないため、返却ポインタの内容は失効せず完全に有効を保つ。
 - **SharedInOwner との並行進行:**
@@ -768,16 +790,16 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - これを解消するため、getter 側においてスロットが `PENDING` の場合、`slot->mutex` を保持しない状態で既存の `dtv_close_enclosure` 継続処理を 1ms タイムアウトで呼び出し、中断していたクローズパイプライン（ランタイム停止・キャンセル・drain・join）を安全に再開・進行させるよう修正した。
   - 利用者は正本通りの getter-only（`dtv_get_enclosure_close_state()` のみ）を維持し、追加の worker スレッドや別状態機械、新 API を導入することなく、安全に `DTV_CLOSE_CLOSED` への回収が完了する。
 - **後続工程との境界:**
-  - 本PR（PR45）で接続されたのは、公開カードリセット（`dtv_reset_card`）、三層機種dispatch、合成reset要求・応答、Core共通ATR完全性/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、および決定51整合である。
-  - 公開 `dtv_get_card_atr` のキャッシュ/再取得経路接続、T=1 プロトコル搬送（byte/chunk および完全 block）、Core 共通 T=1 sequence / WTX / chaining、APDU 送信（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回全カード機能完成とはしない。
+  - 本PR（PR47）で接続されたのは、公開カードリセット（`dtv_reset_card`）および取得済み ATR の公開 getter（`dtv_get_card_atr`）、三層機種dispatch、合成reset要求・応答、Core共通ATR構造/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、決定51整合、および L3 §6.2 に基づく PENDING close 停止回収である。
+  - T=1 プロトコル搬送（byte/chunk および完全 block）、Core 共通 T=1 sequence / WTX / chaining、APDU 送信（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回全カード機能完成とはしない。
 
 ## CLI接続・既存レガシーとの境界・未実装範囲
 
 - **CLI接続:** 生成された main は、argc/argv を変更せずそのまま既存Coreの `dtv_cli_main` へ渡す。L1の全parserや全subcommandの実装が完了したわけではない。
 - **レガシーとの境界:** 既存のメタデータAPI（`dtv_model_count`, `dtv_model_get`）や旧内部ランタイム（USB、discovery、firmware転送）は残存しているが、本PRで導入された新L3 registryとは分離されている。正本との識別子衝突を回避するため、内部レガシー型・状態名は機械的に改名されている。また、旧来の `UsbContext` 既定コンストラクタによる2-worker常駐経路もレガシー境界として残存している。
 - **未実装・未接続範囲:**
-  - 合成機種における完全rootの公開 open / close / state / release / cancel、1-worker ランタイム、共有 IN 継続受信、有界返信配送、claim 排他予約、共通操作受付・物理scope ticket予約、合成共有INからの公開CARD状態・CARD_INSERTED/REMOVEDイベント接続、安定した公開receiver配列・getter/support・動的宣言確定接点、公開LOCK_ACQUIRED/LOCK_LOSTイベント接続、公開シグナル取得API（`dtv_get_signal` によるロック現在値照会・決定53 reason同期）、公開周波数選局API（`dtv_tune_by_frequency`、合成機種SPI、決定54選局時ロック状態遷移・世代フェンス）、公開チャンネル選局API（`dtv_tune_by_channel`、厳密ASCII文法・決定55整数Hz換算/衛星IF・セレクタ既定/排他）、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream`, `dtv_cancel_stream`, `dtv_close_stream`, `dtv_get_stream_close_state`, `dtv_release_stream`, `dtv_get_dropped_bytes`, `dtv_get_desyncs`, `dtv_set_pid_filter`）、有限188/192バイトTS変換配送（Core TsFramer・製品transform接続）、合成連続ソースにおける決定56連続TSキュー満杯・SLOW_CONSUMER終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、および公開カードリセットAPI（`dtv_reset_card`、合成reset、Core共通ATR検査・返却領域所有、直列化・二重世代フェンス、決定51整合）は本PRで実資源へ接続完了。
-  - 公開 `dtv_get_card_atr` 成功接続、カードAPDU送受信API（`dtv_transmit_apdu` 等）、T=1 プロトコル搬送（byte/chunk および完全 block）、および実機校正CNR/電力測定の実装接続。
+  - 合成機種における完全rootの公開 open / close / state / release / cancel、1-worker ランタイム、共有 IN 継続受信、有界返信配送、claim 排他予約、共通操作受付・物理scope ticket予約、合成共有INからの公開CARD状態・CARD_INSERTED/REMOVEDイベント接続、安定した公開receiver配列・getter/support・動的宣言確定接点、公開LOCK_ACQUIRED/LOCK_LOSTイベント接続、公開シグナル取得API（`dtv_get_signal` によるロック現在値照会・決定53 reason同期）、公開周波数選局API（`dtv_tune_by_frequency`、合成機種SPI、決定54選局時ロック状態遷移・世代フェンス）、公開チャンネル選局API（`dtv_tune_by_channel`、厳密ASCII文法・決定55整数Hz換算/衛星IF・セレクタ既定/排他）、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream`, `dtv_cancel_stream`, `dtv_close_stream`, `dtv_get_stream_close_state`, `dtv_release_stream`, `dtv_get_dropped_bytes`, `dtv_get_desyncs`, `dtv_set_pid_filter`）、有限188/192バイトTS変換配送（Core TsFramer・製品transform接続）、合成連続ソースにおける決定56連続TSキュー満杯・SLOW_CONSUMER終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、公開カードリセットAPI（`dtv_reset_card`、合成reset、Core共通ATR検査・返却領域所有、直列化・二重世代フェンス、決定51整合、L3 §6.2 getter-only停止回収）、および公開ATR getter API（`dtv_get_card_atr`、取得済みATR読み出し、現在値失効と返却領域寿命の分離）は本PRで実資源へ接続完了。
+  - カードAPDU送受信API（`dtv_transmit_apdu` 等）、T=1 プロトコル搬送（byte/chunk および完全 block）、および実機校正CNR/電力測定の実装接続。
   - 実機5製品（PX4, PIX, FS1等）の製品固有open計画・固有identify・初回/継続共有INの実機パラメータ・分類・実機CARD/LOCK通知値・実機受信部宣言・実機ロック判定閾値・実機tuneコマンド/機器丸め/RF変換・実機ストリーム転送/start-stopコマンド/ハードウェア通知フェンス・実機固有PID機器設定コマンド・実機固有電源/reset transport/コマンド。
   - ファームウェア転送 API。
   - daemon / wire API、各製品リポジトリの実装接続。
@@ -814,9 +836,10 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
       - 最新方針として、CI は `Khronos31/quiet-shelf`（公開リポジトリの完全一致検証ブランチ、PR 1）において同一内容を検証し、private リポジトリ側の請求設定（spending limit）を変更しない運用方針となった。
       - 公開成功 snapshot `71f248b76c4bcd68cf7cd6462781665479fbd232` は、Core head `42ab7748` と 87 path/mode/blob が完全に一致し、GitHub Actions CI の push run `43604490188` および PR run `43604494561` において Linux 24/24 pass、Windows 23/23 pass（`usb_claim_lease_contract` 含む）、CLI contract pass をすべて達成した。
       - 旧失敗 snapshot `0480927d`（push 43602290254, PR 43602294503）の失敗記録、旧課金制限による非開始 run（push 43600730239, PR 43600733981）、および旧 head `5481750` の CI 成功（push 43596896675, PR 43596903035）は過去の経緯としてそのまま記録を残す。
+  - PR47作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.37秒。reset 前の getter NOT_READY、reset 後の getter バイト列・長さ完全一致、getter 単独での追加 endpoint 出力なし、reset 失敗後の出力クリアと getter NOT_READY、unsupported 筐体での出力クリア、別 receiver signal 進行後の pointer 有効性維持等を確認）、`git diff --check` 通過。
 - **未実施事項・過去の不合格履歴:**
   - 独立QA（コミット `4520f4e927c677653c937b337056694c1f668604`）において、PR41修正前 head（`dd9220bbe6aa6f6ed68bd41cd83b539343d22877`）に対する独立プローブにより、親 close 時にブロック待機中の stream reader が解除されない不具合（failure 30 / exit 91）が検出・不合格判定された履歴がある（PR41修正により解消、不合格の事実を改ざんしない）。
-  - 今回の PR45 head（`42ab774861cb21b3376d8cbfc6b524c2ca4b2f19`）に対する独立 QA・由来確認は別担当へ委任のため未実施。
+  - 今回の PR47 head（`64a18d5f256d8ac913337133ba42f888b5ae25de`）に対する全 CTest、Android NDK r27c 静的ビルド、公開 quiet-shelf 最終 CI、および expiry / cancel / 抜去 / 旧 connection・request epoch / 188 read 寿命などの残 matrix は後続 QA に委任されており、未実施・成功済みにしない。本 PR47 は PR45 を base とするスタック PR（未 merge）である。
   - 実USB上の物理リソース衝突・物理unplug時の実機DISCONNECTED挙動、実機5製品の固有PID機器設定コマンド・実機TS転送接続・実機固有電源/reset transport/コマンド・実機カードAPDU・Androidランタイム実機動作・性能保証・全製品完成は未測定・未検証。
   - 実機5製品のlock観測source/byte/閾値・校正CNR電力測定・実機tuneコマンド・実機ストリーム転送・機器丸め/RF変換は未接続・未設定（実値・性能SLAの推測なし）。card APDU、daemon IPC、CLI channel/ts/card 実行も未接続。
   - 実機 Android 端末・USB 機器での実機動作確認、実機切断、permission 受渡し動作確認は未実施。架空の実機成功や全 OS 保証は行わない。

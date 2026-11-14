@@ -74,6 +74,7 @@ public:
     dtv_device *card_reader_device(const dtv_enclosure *) const;
     dtv_internal_result begin_card_reset(dtv_enclosure *, std::shared_ptr<void> *,
                                           std::uint64_t *, std::uint64_t *);
+    dtv_internal_result try_begin_card_function(dtv_enclosure *, std::shared_ptr<void> *);
     dtv_internal_result finish_card_reset(dtv_enclosure *, std::uint64_t, std::uint64_t,
                                           std::span<const std::uint8_t>);
     dtv_internal_result card_atr_view(const dtv_enclosure *, const std::uint8_t **,
