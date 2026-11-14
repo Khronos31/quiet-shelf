@@ -197,7 +197,13 @@ struct EnclosureRegistry::State {
         dtv_device *card_reader_device = nullptr;
         std::uint64_t card_reader_connection = 0;
         std::timed_mutex card_function_mutex;
+        std::mutex card_t1_mutex;
         std::uint64_t card_request_epoch = 0;
+        bool card_t1_session_valid = false;
+        std::uint64_t card_t1_connection_epoch = 0;
+        std::uint64_t card_t1_request_epoch = 0;
+        bool card_t1_send_sequence = false;
+        bool card_t1_receive_sequence = false;
         std::vector<std::uint8_t> card_atr;
         std::uint64_t card_atr_connection_epoch = 0;
         std::uint64_t card_atr_request_epoch = 0;
@@ -217,6 +223,24 @@ struct EnclosureRegistry::State {
 
         CardFunctionLease(std::shared_ptr<Root> value, std::defer_lock_t)
             : root(std::move(value)), lock(root->card_function_mutex, std::defer_lock) {}
+    };
+
+    struct CardT1SessionLease {
+        std::shared_ptr<Root> root;
+        std::unique_lock<std::mutex> lock;
+
+        explicit CardT1SessionLease(std::shared_ptr<Root> value)
+            : root(std::move(value)), lock(root->card_t1_mutex) {}
+    };
+
+    struct CardResetLease {
+        std::shared_ptr<Root> root;
+        std::unique_lock<std::mutex> t1_lock;
+        std::shared_ptr<CardFunctionLease> function_lease;
+
+        explicit CardResetLease(std::shared_ptr<Root> value)
+            : root(std::move(value)), t1_lock(root->card_t1_mutex),
+              function_lease(std::make_shared<CardFunctionLease>(root)) {}
     };
 
     struct UngroupedEntry {
@@ -1063,6 +1087,68 @@ dtv_internal_result EnclosureRegistry::card_transport_context(
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
+dtv_internal_result EnclosureRegistry::begin_card_t1_session(
+    dtv_enclosure *object, std::shared_ptr<void> *lease,
+    dtv::spi::CardTransportContext *context, bool *send_sequence, bool *receive_sequence)
+{
+    if (lease == nullptr || context == nullptr || send_sequence == nullptr ||
+        receive_sequence == nullptr) return invalid();
+    std::shared_ptr<State::Root> root;
+    {
+        std::lock_guard lock(state_->mutex);
+        root = state_->find_root(object);
+    }
+    if (!root) return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
+    std::shared_ptr<State::CardT1SessionLease> held;
+    try {
+        held = std::make_shared<State::CardT1SessionLease>(root);
+    } catch (...) {
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+    }
+    auto result = card_transport_context(object, context);
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+    if (!context->t1_selected)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+    {
+        std::lock_guard lock(state_->mutex);
+        if (state_->find_root(object) != root || !root->card_t1_session_valid ||
+            root->card_t1_connection_epoch != context->connection_epoch ||
+            root->card_t1_request_epoch != context->request_epoch)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        *send_sequence = root->card_t1_send_sequence;
+        *receive_sequence = root->card_t1_receive_sequence;
+    }
+    *lease = std::move(held);
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRegistry::finish_card_t1_exchange(
+    dtv_enclosure *object, const dtv::spi::CardTransportContext &context,
+    bool send_sequence, bool receive_sequence)
+{
+    std::lock_guard lock(state_->mutex);
+    const auto root = state_->find_root(object);
+    if (!root || root->status != DTV_ENCLOSURE_READY ||
+        root->card_reader_connection != context.connection_epoch ||
+        root->card_request_epoch != context.request_epoch || root->card_state != DTV_CARD_READY ||
+        !root->card_t1_session_valid || root->card_t1_connection_epoch != context.connection_epoch ||
+        root->card_t1_request_epoch != context.request_epoch)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
+    root->card_t1_send_sequence = send_sequence;
+    root->card_t1_receive_sequence = receive_sequence;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+void EnclosureRegistry::invalidate_card_t1_session(
+    dtv_enclosure *object, const dtv::spi::CardTransportContext &context)
+{
+    std::lock_guard lock(state_->mutex);
+    const auto root = state_->find_root(object);
+    if (root && root->card_t1_connection_epoch == context.connection_epoch &&
+        root->card_t1_request_epoch == context.request_epoch)
+        root->card_t1_session_valid = false;
+}
+
 dtv_internal_result EnclosureRegistry::begin_card_reset(
     dtv_enclosure *object, std::shared_ptr<void> *lease, std::uint64_t *connection_epoch,
     std::uint64_t *request_epoch)
@@ -1076,9 +1162,9 @@ dtv_internal_result EnclosureRegistry::begin_card_reset(
     }
     if (!root)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
-    std::shared_ptr<State::CardFunctionLease> held;
+    std::shared_ptr<State::CardResetLease> held;
     try {
-        held = std::make_shared<State::CardFunctionLease>(root);
+        held = std::make_shared<State::CardResetLease>(root);
     } catch (...) {
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
     }
@@ -1091,6 +1177,7 @@ dtv_internal_result EnclosureRegistry::begin_card_reset(
     root->card_atr_connection_epoch = 0;
     root->card_atr_request_epoch = 0;
     root->card_state = DTV_CARD_UNKNOWN;
+    root->card_t1_session_valid = false;
     ++root->card_request_epoch;
     if (root->card_request_epoch == 0) ++root->card_request_epoch;
     *lease = std::move(held);
@@ -1146,6 +1233,12 @@ dtv_internal_result EnclosureRegistry::finish_card_reset(
     root->card_atr_connection_epoch = connection_epoch;
     root->card_atr_request_epoch = request_epoch;
     root->card_state = DTV_CARD_READY;
+    const auto parameters = card_atr_t1_parameters(root->card_atr);
+    root->card_t1_session_valid = parameters.selected;
+    root->card_t1_connection_epoch = connection_epoch;
+    root->card_t1_request_epoch = request_epoch;
+    root->card_t1_send_sequence = false;
+    root->card_t1_receive_sequence = false;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
@@ -4150,6 +4243,83 @@ dtv_internal_result exchange_public_t1_block(
     aggregate.result_known = true;
     aggregate.transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     block_result->io = aggregate;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result exchange_public_t1_apdu(
+    dtv_enclosure *enclosure, std::span<const unsigned char> command, dtv_timeout timeout,
+    T1ApduResult *apdu_result)
+{
+    if (apdu_result == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    *apdu_result = T1ApduResult{};
+    const auto reject = [&](dtv_internal_result failure) {
+        apdu_result->io.transport_error = failure;
+        return failure;
+    };
+    if (enclosure == nullptr || command.empty() || command.data() == nullptr)
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
+    auto &registry = public_discovery_state().registry;
+    dtv::spi::CardTransportContext context{};
+    bool send_sequence = false;
+    bool receive_sequence = false;
+    std::shared_ptr<void> session_lease;
+    auto result = registry.begin_card_t1_session(enclosure, &session_lease, &context,
+        &send_sequence, &receive_sequence);
+    if (result.code != DTV_INTERNAL_RESULT_OK) return reject(result);
+    if (command.size() > context.t1_ifsc || command.size() > 254)
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
+
+    T1BlockResult block{};
+    result = exchange_public_t1_block(enclosure,
+        T1BlockRequest{0, static_cast<std::uint8_t>(send_sequence ? 0x40 : 0x00), command},
+        timeout, &block);
+    apdu_result->io = block.io;
+    if (result.code != DTV_INTERNAL_RESULT_OK) {
+        if (block.io.tx_bytes_done != 0 || !block.io.result_known)
+            registry.invalidate_card_t1_session(enclosure, context);
+        return result;
+    }
+    const auto unexpected = [&](dtv_internal_result failure) {
+        registry.invalidate_card_t1_session(enclosure, context);
+        apdu_result->io = block.io;
+        apdu_result->io.transport_error = failure;
+        apdu_result->io.result_known = false;
+        apdu_result->io.reply_complete = false;
+        return failure;
+    };
+    if (block.nad != 0)
+        return unexpected(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
+    if ((block.pcb & 0xc0) == 0xc0 || (block.pcb & 0x80) != 0)
+        return unexpected(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
+    if ((block.pcb & 0x1f) != 0)
+        return unexpected(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
+    if ((block.pcb & 0x20) != 0)
+        return unexpected(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
+    if (((block.pcb & 0x40) != 0) != receive_sequence)
+        return unexpected(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
+    try {
+        apdu_result->response.assign(block.inf.begin(), block.inf.end());
+    } catch (...) {
+        registry.invalidate_card_t1_session(enclosure, context);
+        apdu_result->io = block.io;
+        result = exception_result();
+        apdu_result->io.transport_error = result;
+        apdu_result->io.result_known = false;
+        apdu_result->io.reply_complete = false;
+        return result;
+    }
+    result = registry.finish_card_t1_exchange(enclosure, context, !send_sequence,
+        !receive_sequence);
+    if (result.code != DTV_INTERNAL_RESULT_OK) {
+        apdu_result->response.clear();
+        apdu_result->io = block.io;
+        apdu_result->io.transport_error = result;
+        apdu_result->io.result_known = false;
+        apdu_result->io.reply_complete = false;
+        return result;
+    }
+    apdu_result->io = block.io;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 

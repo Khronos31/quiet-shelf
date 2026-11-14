@@ -37,6 +37,7 @@ void set_scan_card_t1_exchange_mode(unsigned);
 void set_scan_card_t1_fault(unsigned);
 void set_scan_card_t1_crc(bool);
 void set_scan_card_t1_stale_reply(bool);
+void set_scan_card_t1_apdu_mode(bool, unsigned);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
@@ -2729,6 +2730,131 @@ int public_card_transport()
         t1_outputs[1][0] != std::vector<unsigned char>{0x00, 0x00, 0x03, 0x10, 0x20, 0x30, 0x03}) {
         return 18;
     }
+    const auto run_t1_apdu = [&](unsigned mode, std::span<const unsigned char> command,
+                                 dtv::internal::T1ApduResult *apdu_result,
+                                 std::vector<std::vector<unsigned char>> *sent = nullptr) {
+        set_scan_card_t1_exchange_mode(mode);
+        const auto output_start = backend->output_snapshot().size();
+        std::atomic<bool> done{false};
+        dtv_internal_result exchange_result{};
+        std::thread caller([&] {
+            exchange_result = dtv::internal::exchange_public_t1_apdu(root, command,
+                dtv_timeout{1000, 0}, apdu_result);
+            done.store(true, std::memory_order_release);
+        });
+        auto next_output = backend->endpoint_submission_count(0x02) + 1;
+        for (unsigned step = 0; step < 16 && !done.load(std::memory_order_acquire); ++step) {
+            if (!backend->wait_for_endpoint_submissions(0x02, next_output)) break;
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x02);
+            if (!backend->wait_for_callbacks(callbacks + 1)) break;
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x81);
+            if (!backend->wait_for_callbacks(callbacks + 1)) break;
+            ++next_output;
+        }
+        caller.join();
+        if (sent != nullptr) {
+            const auto output = backend->output_snapshot();
+            sent->assign(output.begin() + static_cast<std::ptrdiff_t>(output_start), output.end());
+        }
+        return exchange_result.code;
+    };
+    const std::array<unsigned char, 4> apdu_one{0x00, 0xa4, 0x04, 0x00};
+    const std::array<unsigned char, 4> apdu_two{0x00, 0xca, 0x00, 0x00};
+    dtv::internal::T1ApduResult apdu_one_result{};
+    dtv::internal::T1ApduResult apdu_two_result{};
+    std::vector<std::vector<unsigned char>> apdu_one_output;
+    std::vector<std::vector<unsigned char>> apdu_two_output;
+    set_scan_card_t1_apdu_mode(true, 0);
+    if (run_t1_apdu(1, apdu_one, &apdu_one_result, &apdu_one_output) !=
+            DTV_INTERNAL_RESULT_OK ||
+        run_t1_apdu(2, apdu_two, &apdu_two_result, &apdu_two_output) !=
+            DTV_INTERNAL_RESULT_OK ||
+        apdu_one_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        apdu_two_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+        apdu_one_output.size() < 3 ||
+        apdu_one_output[0] != std::vector<unsigned char>{0x00, 0x00, 0x04} ||
+        apdu_one_output[1] != std::vector<unsigned char>(apdu_one.begin(), apdu_one.end()) ||
+        apdu_one_output[2] != std::vector<unsigned char>{0xa4} ||
+        apdu_two_output.size() != 1 ||
+        apdu_two_output[0] != std::vector<unsigned char>{0x00, 0x40, 0x04, 0x00,
+            0xca, 0x00, 0x00, 0x8e}) {
+        std::fprintf(stderr, "APDU sequence results=%d/%d response=%zu/%zu sent=%zu/%zu pcb=%02x tx=%zu rx=%zu\n",
+            apdu_one_result.io.transport_error.code, apdu_two_result.io.transport_error.code,
+            apdu_one_result.response.size(), apdu_two_result.response.size(),
+            apdu_one_output.size(), apdu_two_output.size(),
+            apdu_two_output.empty() || apdu_two_output[0].size() < 2 ? 0 : apdu_two_output[0][1],
+            apdu_two_result.io.tx_bytes_done, apdu_two_result.io.rx_bytes_done);
+        return 29;
+    }
+    std::array<unsigned char, 33> oversized_apdu{};
+    const auto before_oversized = backend->output_snapshot().size();
+    dtv::internal::T1ApduResult oversized_result{};
+    if (dtv::internal::exchange_public_t1_apdu(root, oversized_apdu, dtv_timeout{1000, 0},
+            &oversized_result).code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT ||
+        backend->output_snapshot().size() != before_oversized) return 30;
+    set_scan_card_t1_apdu_mode(true, 1);
+    dtv::internal::T1ApduResult wrong_sequence_result{};
+    std::vector<std::vector<unsigned char>> wrong_sequence_output;
+    if (run_t1_apdu(1, apdu_one, &wrong_sequence_result, &wrong_sequence_output) !=
+            DTV_INTERNAL_RESULT_USB_IO ||
+        !wrong_sequence_result.response.empty() || wrong_sequence_result.io.result_known ||
+        wrong_sequence_result.io.reply_complete || wrong_sequence_output.size() < 3 ||
+        wrong_sequence_output[0] != std::vector<unsigned char>{0x00, 0x00, 0x04}) return 31;
+    const auto reset_t1_session = [&] {
+        const auto output = backend->endpoint_submission_count(0x02) + 1;
+        std::atomic<std::int32_t> value{DTV_ERROR_INTERNAL};
+        std::thread resetting([&] {
+            const std::uint8_t *atr = nullptr;
+            std::uint64_t atr_size = 0;
+            dtv_error reset_error{};
+            reset_error.struct_size = sizeof(reset_error);
+            value.store(dtv_reset_card(root, nullptr, &atr, &atr_size, &reset_error),
+                        std::memory_order_release);
+        });
+        if (!backend->wait_for_endpoint_submissions(0x02, output)) {
+            dtv_cancel_enclosure(root, &error);
+            resetting.join();
+            return false;
+        }
+        auto count = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x02);
+        if (!backend->wait_for_callbacks(count + 1)) {
+            dtv_cancel_enclosure(root, &error);
+            resetting.join();
+            return false;
+        }
+        count = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x81);
+        if (!backend->wait_for_callbacks(count + 1)) {
+            dtv_cancel_enclosure(root, &error);
+            resetting.join();
+            return false;
+        }
+        resetting.join();
+        return value.load(std::memory_order_acquire) == DTV_ERROR_OK;
+    };
+    for (const auto fault : {2u, 3u, 4u}) {
+        if (!reset_t1_session()) return 32;
+        set_scan_card_t1_apdu_mode(true, fault);
+        dtv::internal::T1ApduResult unsupported_result{};
+        if (run_t1_apdu(2, apdu_one, &unsupported_result) != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+            !unsupported_result.response.empty() || unsupported_result.io.result_known ||
+            unsupported_result.io.reply_complete) return 33;
+    }
+    if (!reset_t1_session()) return 34;
+    set_scan_card_t1_apdu_mode(true, 0);
+    dtv::internal::T1ApduResult reset_apdu_result{};
+    std::vector<std::vector<unsigned char>> reset_apdu_output;
+    if (run_t1_apdu(2, apdu_one, &reset_apdu_result, &reset_apdu_output) !=
+            DTV_INTERNAL_RESULT_OK ||
+        reset_apdu_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        reset_apdu_output.size() != 1 ||
+        reset_apdu_output[0] != std::vector<unsigned char>{0x00, 0x00, 0x04, 0x00,
+            0xa4, 0x04, 0x00, 0xa4}) return 35;
+    set_scan_card_t1_apdu_mode(false, 0);
+    set_scan_card_t1_exchange_mode(0);
     set_scan_card_t1_fault(1);
     dtv::internal::T1BlockResult incomplete_result{};
     if (run_t1_exchange(1, &incomplete_result) != DTV_INTERNAL_RESULT_USB_IO ||
@@ -2848,16 +2974,17 @@ int public_card_transport()
     const auto initial_card_generation = dtv_get_card_generation(root);
     set_scan_card_t1_crc(true);
     set_scan_card_t1_stale_reply(true);
+    set_scan_card_t1_apdu_mode(true, 0);
     set_scan_card_t1_exchange_mode(2);
     set_scan_card_interleave_phase(1);
     const auto interleave_output_count = backend->endpoint_submission_count(0x02);
     const auto interleave_output_start = backend->output_snapshot().size();
     std::atomic<bool> interleave_exchange_done{false};
     dtv_internal_result interleave_exchange_result{};
-    dtv::internal::T1BlockResult stale_t1_result{};
+    dtv::internal::T1ApduResult stale_t1_result{};
     interleave_exchange = std::thread([&] {
-        interleave_exchange_result = dtv::internal::exchange_public_t1_block(root,
-            dtv::internal::T1BlockRequest{0x00, 0x00, t1_inf}, dtv_timeout{5000, 0},
+        interleave_exchange_result = dtv::internal::exchange_public_t1_apdu(root,
+            apdu_one, dtv_timeout{5000, 0},
             &stale_t1_result);
         interleave_exchange_done.store(true, std::memory_order_release);
     });
@@ -2938,21 +3065,22 @@ int public_card_transport()
     }
     interleave_exchange.join();
     const auto interleave_outputs = backend->output_snapshot();
-    const std::array<unsigned char, 6> interleave_header{0x00, 0x00, 0x03, 0x10, 0x20, 0x30};
+    const std::array<unsigned char, 7> interleave_header{0x00, 0x00, 0x04, 0x00,
+        0xa4, 0x04, 0x00};
     if (interleave_exchange_result.code != DTV_INTERNAL_RESULT_NOT_READY ||
-        stale_t1_result.raw_block_length != 0 || !stale_t1_result.inf.empty() ||
-        stale_t1_result.io.tx_bytes_done != 8 || stale_t1_result.io.rx_bytes_done != 0 ||
+        !stale_t1_result.response.empty() ||
+        stale_t1_result.io.tx_bytes_done != 9 || stale_t1_result.io.rx_bytes_done != 0 ||
         stale_t1_result.io.reply_complete || stale_t1_result.io.result_known ||
         stale_t1_result.io.transport_error.code != DTV_INTERNAL_RESULT_NOT_READY ||
         backend->endpoint_submission_count(0x02) != interleave_output_count + 1 ||
         interleave_outputs.size() != interleave_output_start + 1 ||
-        interleave_outputs.back().size() != 8 ||
+        interleave_outputs.back().size() != 9 ||
         !std::equal(interleave_header.begin(), interleave_header.end(),
             interleave_outputs.back().begin()) ||
         scan_card_interleave_phase_value() != 4) {
-        std::fprintf(stderr, "T1 stale result=%d transport=%d raw=%zu inf=%zu tx=%zu rx=%zu known=%d complete=%d out=%u/%zu phase=%u\n",
+        std::fprintf(stderr, "T1 stale result=%d transport=%d inf=%zu tx=%zu rx=%zu known=%d complete=%d out=%u/%zu phase=%u\n",
             interleave_exchange_result.code, stale_t1_result.io.transport_error.code,
-            stale_t1_result.raw_block_length, stale_t1_result.inf.size(),
+            stale_t1_result.response.size(),
             stale_t1_result.io.tx_bytes_done, stale_t1_result.io.rx_bytes_done,
             stale_t1_result.io.result_known, stale_t1_result.io.reply_complete,
             backend->endpoint_submission_count(0x02) - interleave_output_count,
@@ -3018,16 +3146,16 @@ int public_card_transport()
         cleanup_interleave();
         return 45;
     }
-    dtv::internal::T1BlockResult next_session_result{};
+    dtv::internal::T1ApduResult next_session_result{};
     std::vector<std::vector<unsigned char>> next_session_outputs;
-    if (run_t1_exchange(2, &next_session_result, 1000, &next_session_outputs) !=
+    if (run_t1_apdu(2, apdu_one, &next_session_result, &next_session_outputs) !=
             DTV_INTERNAL_RESULT_OK ||
-        next_session_result.inf != std::vector<unsigned char>{0x90, 0x00} ||
-        next_session_result.io.tx_bytes_done != 8 ||
-        next_session_result.io.rx_bytes_done != 7 ||
+        next_session_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        next_session_result.io.tx_bytes_done != 9 ||
+        next_session_result.io.rx_bytes_done != 9 ||
         !next_session_result.io.reply_complete || !next_session_result.io.result_known ||
         next_session_outputs.size() != 1 ||
-        next_session_outputs[0].size() != 8 ||
+        next_session_outputs[0].size() != 9 ||
         !std::equal(interleave_header.begin(), interleave_header.end(),
             next_session_outputs[0].begin()) ||
         dtv_close_stream(interleave_stream, nullptr, &error) != DTV_CLOSE_CLOSED) {
@@ -3049,11 +3177,11 @@ int public_card_transport()
 
     set_scan_card_transport_drop_reply(true);
     dtv_internal_result close_operation_result{};
-    dtv::internal::T1BlockResult close_t1_result{};
+    dtv::internal::T1ApduResult close_t1_result{};
     set_scan_card_t1_exchange_mode(1);
     std::thread close_operation([&] {
-        close_operation_result = dtv::internal::exchange_public_t1_block(root,
-            dtv::internal::T1BlockRequest{0x00, 0x00, t1_inf}, dtv_timeout{5000, 0},
+        close_operation_result = dtv::internal::exchange_public_t1_apdu(root,
+            apdu_one, dtv_timeout{5000, 0},
             &close_t1_result);
     });
     auto close_output = backend->endpoint_submission_count(0x02) + 1;
@@ -3095,8 +3223,9 @@ int public_card_transport()
     close_operation.join();
     set_scan_card_transport_drop_reply(false);
     if (close_operation_result.code != DTV_INTERNAL_RESULT_CANCELLED ||
+        !close_t1_result.response.empty() ||
         close_t1_result.io.result_known || close_t1_result.io.reply_complete ||
-        close_t1_result.io.tx_bytes_done != 8 || close_t1_result.io.rx_bytes_done != 0) {
+        close_t1_result.io.tx_bytes_done != 9 || close_t1_result.io.rx_bytes_done != 0) {
         std::fprintf(stderr, "card close result=%d known=%d complete=%d tx=%zu rx=%zu\n",
             close_operation_result.code, close_t1_result.io.result_known,
             close_t1_result.io.reply_complete, close_t1_result.io.tx_bytes_done,

@@ -74,6 +74,12 @@ public:
     dtv_device *card_reader_device(const dtv_enclosure *) const;
     dtv_internal_result card_transport_context(const dtv_enclosure *,
                                               dtv::spi::CardTransportContext *) const;
+    dtv_internal_result begin_card_t1_session(dtv_enclosure *, std::shared_ptr<void> *,
+                                               dtv::spi::CardTransportContext *, bool *, bool *);
+    dtv_internal_result finish_card_t1_exchange(dtv_enclosure *,
+        const dtv::spi::CardTransportContext &, bool, bool);
+    void invalidate_card_t1_session(dtv_enclosure *,
+        const dtv::spi::CardTransportContext &);
     dtv_internal_result begin_card_reset(dtv_enclosure *, std::shared_ptr<void> *,
                                           std::uint64_t *, std::uint64_t *);
     dtv_internal_result try_begin_card_function(dtv_enclosure *, std::shared_ptr<void> *);
@@ -186,8 +192,14 @@ struct T1BlockResult {
     std::size_t raw_block_length = 0;
     dtv::spi::CardIoOutcome io;
 };
+struct T1ApduResult {
+    std::vector<unsigned char> response;
+    dtv::spi::CardIoOutcome io;
+};
 dtv_internal_result exchange_public_t1_block(
     dtv_enclosure *, const T1BlockRequest &, dtv_timeout, T1BlockResult *);
+dtv_internal_result exchange_public_t1_apdu(
+    dtv_enclosure *, std::span<const unsigned char>, dtv_timeout, T1ApduResult *);
 std::int32_t run_public_stream_operation(
     dtv_stream *, std::uint32_t, std::span<const unsigned char>, dtv_timeout,
     std::span<unsigned char>, std::size_t *, dtv_error *);
