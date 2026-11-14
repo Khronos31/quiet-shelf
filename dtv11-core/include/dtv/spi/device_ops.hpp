@@ -188,6 +188,10 @@ struct CardTransportContext {
     dtv_device *reader = nullptr;
     std::uint64_t connection_epoch = 0;
     std::uint64_t request_epoch = 0;
+    bool t1_selected = false;
+    bool t1_crc = false;
+    std::uint8_t t1_ifsc = 32;
+    std::uint8_t t1_ifsd = 32;
 };
 
 struct CardTransportRequest {
@@ -203,8 +207,11 @@ struct CardIoOutcome {
     dtv_internal_result transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 };
 
+enum class CardTransportMode : std::uint32_t { byte_chunks, complete_block };
+
 struct PublicCardTransportPlan {
     PublicOperationPlan operation;
+    CardTransportMode mode = CardTransportMode::byte_chunks;
 };
 
 struct PublicTuneRequest {

@@ -167,10 +167,27 @@ dtv_internal_result run_public_operation_for_test(
     dtv_enclosure *, const dtv::spi::PublicOperationRequest &, dtv_timeout,
     std::span<unsigned char>, std::size_t *, const dtv::spi::PublicOperationPlan * = nullptr,
     dtv::spi::CardIoOutcome * = nullptr,
-    const dtv::spi::CardTransportContext * = nullptr);
+    const dtv::spi::CardTransportContext * = nullptr,
+    std::shared_ptr<void> * = nullptr, bool = false);
 dtv_internal_result run_public_card_transport(
     dtv_enclosure *, const dtv::spi::CardTransportOperation &, dtv_timeout,
-    std::vector<unsigned char> *, dtv::spi::CardIoOutcome *);
+    std::vector<unsigned char> *, dtv::spi::CardIoOutcome *,
+    std::shared_ptr<void> * = nullptr);
+void release_public_card_ticket(dtv_enclosure *, std::shared_ptr<void> *);
+struct T1BlockRequest {
+    std::uint8_t nad = 0;
+    std::uint8_t pcb = 0;
+    std::span<const unsigned char> inf;
+};
+struct T1BlockResult {
+    std::uint8_t nad = 0;
+    std::uint8_t pcb = 0;
+    std::vector<unsigned char> inf;
+    std::size_t raw_block_length = 0;
+    dtv::spi::CardIoOutcome io;
+};
+dtv_internal_result exchange_public_t1_block(
+    dtv_enclosure *, const T1BlockRequest &, dtv_timeout, T1BlockResult *);
 std::int32_t run_public_stream_operation(
     dtv_stream *, std::uint32_t, std::span<const unsigned char>, dtv_timeout,
     std::span<unsigned char>, std::size_t *, dtv_error *);

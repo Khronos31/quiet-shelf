@@ -33,6 +33,9 @@ void set_scan_group_case(unsigned);
 void set_scan_public_open_case(unsigned);
 void set_scan_card_reply_mode(unsigned);
 void set_scan_card_transport_drop_reply(bool);
+void set_scan_card_t1_exchange_mode(unsigned);
+void set_scan_card_t1_fault(unsigned);
+void set_scan_card_t1_crc(bool);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
@@ -2666,6 +2669,142 @@ int public_card_transport()
         backend->output_snapshot().back() != std::vector<unsigned char>(block.begin(), block.end()))
         return 11;
 
+    const std::array<unsigned char, 3> t1_inf{0x10, 0x20, 0x30};
+    std::array<dtv::internal::T1BlockResult, 2> t1_results{};
+    const auto run_t1_exchange = [&](unsigned mode, dtv::internal::T1BlockResult *block_result,
+                                     std::uint32_t timeout_ms = 1000,
+                                     std::vector<std::vector<unsigned char>> *sent = nullptr) {
+        set_scan_card_t1_exchange_mode(mode);
+        const auto output_start = backend->output_snapshot().size();
+        std::atomic<bool> done{false};
+        dtv_internal_result exchange_result{};
+        std::thread caller([&] {
+            exchange_result = dtv::internal::exchange_public_t1_block(root,
+                dtv::internal::T1BlockRequest{0x00, 0x00, t1_inf}, dtv_timeout{timeout_ms, 0},
+                block_result);
+            done.store(true, std::memory_order_release);
+        });
+        auto next_output = backend->endpoint_submission_count(0x02) + 1;
+        for (unsigned step = 0; step < 16 && !done.load(std::memory_order_acquire); ++step) {
+            if (!backend->wait_for_endpoint_submissions(0x02, next_output)) break;
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x02);
+            if (!backend->wait_for_callbacks(callbacks + 1)) break;
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x81);
+            if (!backend->wait_for_callbacks(callbacks + 1)) break;
+            ++next_output;
+        }
+        caller.join();
+        if (sent != nullptr) {
+            const auto output = backend->output_snapshot();
+            sent->assign(output.begin() + static_cast<std::ptrdiff_t>(output_start), output.end());
+        }
+        if (exchange_result.code != DTV_INTERNAL_RESULT_OK)
+            std::fprintf(stderr, "common T1 mode=%u result=%d tx=%zu rx=%zu known=%u complete=%u\n",
+                mode, exchange_result.code, block_result->io.tx_bytes_done,
+                block_result->io.rx_bytes_done, block_result->io.result_known,
+                block_result->io.reply_complete);
+        return exchange_result.code;
+    };
+    std::array<std::vector<std::vector<unsigned char>>, 2> t1_outputs{};
+    if (run_t1_exchange(1, &t1_results[0], 1000, &t1_outputs[0]) != DTV_INTERNAL_RESULT_OK ||
+        run_t1_exchange(2, &t1_results[1], 1000, &t1_outputs[1]) != DTV_INTERNAL_RESULT_OK ||
+        t1_results[0].nad != 0 || t1_results[1].nad != 0 ||
+        t1_results[0].pcb != 0x40 || t1_results[1].pcb != 0x40 ||
+        t1_results[0].inf != std::vector<unsigned char>{0x90, 0x00} ||
+        t1_results[1].inf != t1_results[0].inf ||
+        t1_results[0].raw_block_length != 6 || t1_results[1].raw_block_length != 6 ||
+        t1_results[0].io.tx_bytes_done != 7 || t1_results[1].io.tx_bytes_done != 7 ||
+        t1_results[0].io.rx_bytes_done != 6 || t1_results[1].io.rx_bytes_done != 6 ||
+        !t1_results[0].io.reply_complete || !t1_results[1].io.reply_complete ||
+        !t1_results[0].io.result_known || !t1_results[1].io.result_known ||
+        t1_results[0].io.transport_error.code != DTV_INTERNAL_RESULT_OK ||
+        t1_results[1].io.transport_error.code != DTV_INTERNAL_RESULT_OK ||
+        t1_outputs[0].size() < 3 ||
+        t1_outputs[0][0] != std::vector<unsigned char>{0x00, 0x00, 0x03} ||
+        t1_outputs[0][1] != std::vector<unsigned char>{0x10, 0x20, 0x30} ||
+        t1_outputs[0][2] != std::vector<unsigned char>{0x03} || t1_outputs[1].empty() ||
+        t1_outputs[1][0] != std::vector<unsigned char>{0x00, 0x00, 0x03, 0x10, 0x20, 0x30, 0x03}) {
+        return 18;
+    }
+    set_scan_card_t1_fault(1);
+    dtv::internal::T1BlockResult incomplete_result{};
+    if (run_t1_exchange(1, &incomplete_result) != DTV_INTERNAL_RESULT_USB_IO ||
+        incomplete_result.io.reply_complete || incomplete_result.io.result_known)
+        return 19;
+    set_scan_card_t1_fault(2);
+    dtv::internal::T1BlockResult extra_result{};
+    if (run_t1_exchange(1, &extra_result) != DTV_INTERNAL_RESULT_USB_IO ||
+        extra_result.io.reply_complete || extra_result.io.result_known)
+        return 20;
+    set_scan_card_t1_fault(3);
+    dtv::internal::T1BlockResult bad_edc_result{};
+    if (run_t1_exchange(1, &bad_edc_result) != DTV_INTERNAL_RESULT_USB_IO ||
+        bad_edc_result.io.reply_complete || bad_edc_result.io.result_known)
+        return 21;
+    set_scan_card_t1_fault(0);
+    set_scan_card_t1_exchange_mode(1);
+    set_scan_card_transport_drop_reply(true);
+    const auto t1_timeout_outputs = backend->endpoint_submission_count(0x02);
+    dtv::internal::T1BlockResult timed_out_t1{};
+    if (run_t1_exchange(1, &timed_out_t1, 100) != DTV_INTERNAL_RESULT_TIMEOUT ||
+        timed_out_t1.io.reply_complete || timed_out_t1.io.result_known ||
+        backend->endpoint_submission_count(0x02) != t1_timeout_outputs + 4)
+        return 27;
+    set_scan_card_transport_drop_reply(false);
+    set_scan_card_t1_exchange_mode(0);
+    set_scan_card_t1_crc(true);
+    std::atomic<std::int32_t> crc_reset_result{DTV_ERROR_INTERNAL};
+    std::thread crc_resetting([&] {
+        const std::uint8_t *atr = nullptr;
+        std::uint64_t atr_size = 0;
+        dtv_error reset_error{};
+        reset_error.struct_size = sizeof(reset_error);
+        crc_reset_result.store(dtv_reset_card(root, nullptr, &atr, &atr_size, &reset_error),
+                               std::memory_order_release);
+    });
+    const auto crc_reset_output = backend->endpoint_submission_count(0x02) + 1;
+    if (!backend->wait_for_endpoint_submissions(0x02, crc_reset_output)) {
+        dtv_cancel_enclosure(root, &error);
+        crc_resetting.join();
+        return 22;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x02);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        crc_resetting.join();
+        return 23;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        crc_resetting.join();
+        return 24;
+    }
+    crc_resetting.join();
+    if (crc_reset_result.load(std::memory_order_acquire) != DTV_ERROR_OK) return 25;
+    const auto crc_byte_result = run_t1_exchange(1, &t1_results[0]);
+    const auto crc_block_result = crc_byte_result == DTV_INTERNAL_RESULT_OK
+        ? run_t1_exchange(2, &t1_results[1]) : DTV_INTERNAL_RESULT_INTERNAL;
+    if (crc_byte_result != DTV_INTERNAL_RESULT_OK ||
+        t1_results[0].inf != std::vector<unsigned char>{0x90, 0x00} ||
+        t1_results[1].inf != t1_results[0].inf ||
+        t1_results[0].raw_block_length != 7 || t1_results[1].raw_block_length != 7 ||
+        t1_results[0].io.tx_bytes_done != 8 || t1_results[1].io.tx_bytes_done != 8 ||
+        t1_results[0].io.rx_bytes_done != 7 || t1_results[1].io.rx_bytes_done != 7 ||
+        !t1_results[0].io.reply_complete || !t1_results[1].io.reply_complete ||
+        crc_block_result != DTV_INTERNAL_RESULT_OK) {
+        std::fprintf(stderr, "CRC exchange byte=%d block=%d byte_len=%zu block_len=%zu\n",
+            crc_byte_result, crc_block_result, t1_results[0].raw_block_length,
+            t1_results[1].raw_block_length);
+        return 26;
+    }
+    set_scan_card_t1_exchange_mode(0);
+    set_scan_card_t1_crc(false);
+
     set_scan_card_transport_drop_reply(true);
     reply.clear();
     const auto output_count = backend->endpoint_submission_count(0x02);
@@ -2678,22 +2817,37 @@ int public_card_transport()
 
     set_scan_card_transport_drop_reply(true);
     dtv_internal_result close_operation_result{};
+    dtv::internal::T1BlockResult close_t1_result{};
+    set_scan_card_t1_exchange_mode(1);
     std::thread close_operation([&] {
-        close_operation_result = dtv::internal::run_public_card_transport(root,
-            dtv::spi::CardByteRead{8}, dtv_timeout{5000, 0}, &reply, &outcome);
+        close_operation_result = dtv::internal::exchange_public_t1_block(root,
+            dtv::internal::T1BlockRequest{0x00, 0x00, t1_inf}, dtv_timeout{5000, 0},
+            &close_t1_result);
     });
-    const auto close_output = backend->endpoint_submission_count(0x02) + 1;
-    if (!backend->wait_for_endpoint_submissions(0x02, close_output)) {
-        dtv_cancel_enclosure(root, &error);
-        close_operation.join();
-        return 14;
-    }
-    callbacks = backend->callback_count_snapshot();
-    backend->complete_endpoint(0x02);
-    if (!backend->wait_for_callbacks(callbacks + 1)) {
-        dtv_cancel_enclosure(root, &error);
-        close_operation.join();
-        return 15;
+    auto close_output = backend->endpoint_submission_count(0x02) + 1;
+    for (unsigned step = 0; step < 4; ++step) {
+        if (!backend->wait_for_endpoint_submissions(0x02, close_output)) {
+            dtv_cancel_enclosure(root, &error);
+            close_operation.join();
+            return 14;
+        }
+        callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x02);
+        if (!backend->wait_for_callbacks(callbacks + 1)) {
+            dtv_cancel_enclosure(root, &error);
+            close_operation.join();
+            return 15;
+        }
+        if (step < 3) {
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x81);
+            if (!backend->wait_for_callbacks(callbacks + 1)) {
+                dtv_cancel_enclosure(root, &error);
+                close_operation.join();
+                return 16;
+            }
+        }
+        ++close_output;
     }
     const dtv_call_options close_call{sizeof(dtv_call_options), 1};
     const auto close_state = dtv_close_enclosure(root, &close_call, &error);
@@ -2709,10 +2863,12 @@ int public_card_transport()
     close_operation.join();
     set_scan_card_transport_drop_reply(false);
     if (close_operation_result.code != DTV_INTERNAL_RESULT_CANCELLED ||
-        outcome.result_known || outcome.reply_complete || outcome.tx_bytes_done != 2) {
+        close_t1_result.io.result_known || close_t1_result.io.reply_complete ||
+        close_t1_result.io.tx_bytes_done != 8 || close_t1_result.io.rx_bytes_done != 0) {
         std::fprintf(stderr, "card close result=%d known=%d complete=%d tx=%zu rx=%zu\n",
-            close_operation_result.code, outcome.result_known, outcome.reply_complete,
-            outcome.tx_bytes_done, outcome.rx_bytes_done);
+            close_operation_result.code, close_t1_result.io.result_known,
+            close_t1_result.io.reply_complete, close_t1_result.io.tx_bytes_done,
+            close_t1_result.io.rx_bytes_done);
         return 18;
     }
     const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);

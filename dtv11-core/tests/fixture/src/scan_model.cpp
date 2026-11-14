@@ -96,6 +96,68 @@ std::atomic<unsigned> scan_card_transaction{1};
 std::atomic<unsigned> scan_card_interleave_phase{0};
 std::atomic<unsigned> scan_card_transport_kind{0};
 std::atomic<bool> scan_card_transport_drop_reply{false};
+std::atomic<unsigned> scan_card_t1_exchange_mode{0};
+std::atomic<unsigned> scan_card_t1_fault{0};
+std::atomic<bool> scan_card_t1_crc{false};
+std::atomic<std::uint64_t> scan_card_t1_transaction{300};
+std::atomic<std::uint64_t> scan_card_t1_current_transaction{0};
+std::mutex scan_card_t1_mutex;
+std::vector<unsigned char> scan_card_t1_request;
+std::vector<unsigned char> scan_card_t1_reply;
+std::vector<unsigned char> scan_card_t1_pending;
+std::size_t scan_card_t1_reply_offset = 0;
+bool scan_card_t1_write_started = false;
+
+void scan_prepare_t1_reply(std::span<const unsigned char> request)
+{
+    const auto edc_size = scan_card_t1_crc.load(std::memory_order_acquire) ? 2u : 1u;
+    if (request.size() < 3 + edc_size ||
+        request.size() != static_cast<std::size_t>(request[2]) + 3 + edc_size)
+        return;
+    if (edc_size == 1) {
+        unsigned char lrc = 0;
+        for (const auto byte : request) lrc ^= byte;
+        if (lrc != 0) return;
+    } else {
+        std::uint16_t crc = 0xffff;
+        for (const auto byte : request.first(request.size() - 2)) {
+            crc ^= byte;
+            for (unsigned bit = 0; bit < 8; ++bit)
+                crc = (crc & 1) != 0 ? static_cast<std::uint16_t>((crc >> 1) ^ 0x8408)
+                                     : static_cast<std::uint16_t>(crc >> 1);
+        }
+        crc = static_cast<std::uint16_t>(~crc);
+        if (request[request.size() - 2] != static_cast<unsigned char>(crc & 0xff) ||
+            request.back() != static_cast<unsigned char>(crc >> 8)) return;
+    }
+    scan_card_t1_reply.clear();
+    scan_card_t1_reply.push_back(request[0]);
+    scan_card_t1_reply.push_back(static_cast<unsigned char>(request[1] ^ 0x40));
+    scan_card_t1_reply.push_back(2);
+    scan_card_t1_reply.push_back(0x90);
+    scan_card_t1_reply.push_back(0x00);
+    if (edc_size == 1) {
+        unsigned char lrc = 0;
+        for (const auto byte : scan_card_t1_reply) lrc ^= byte;
+        scan_card_t1_reply.push_back(lrc);
+    } else {
+        std::uint16_t crc = 0xffff;
+        for (const auto byte : scan_card_t1_reply) {
+            crc ^= byte;
+            for (unsigned bit = 0; bit < 8; ++bit)
+                crc = (crc & 1) != 0 ? static_cast<std::uint16_t>((crc >> 1) ^ 0x8408)
+                                     : static_cast<std::uint16_t>(crc >> 1);
+        }
+        crc = static_cast<std::uint16_t>(~crc);
+        scan_card_t1_reply.push_back(static_cast<unsigned char>(crc & 0xff));
+        scan_card_t1_reply.push_back(static_cast<unsigned char>(crc >> 8));
+    }
+    const auto fault = scan_card_t1_fault.load(std::memory_order_acquire);
+    if (fault == 1) scan_card_t1_reply.pop_back();
+    else if (fault == 2) scan_card_t1_reply.push_back(0x55);
+    else if (fault == 3) scan_card_t1_reply.back() ^= 0x01;
+    scan_card_t1_reply_offset = 0;
+}
 
 dtv_internal_result select_scan_group(
     const dtv_usb_candidate_info *candidates, std::uint32_t candidate_count,
@@ -256,20 +318,38 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
     }
     scan_shared_packets.fetch_add(1, std::memory_order_release);
     if (scan_public_open_case == 18 && packet->endpoint == 0x81) {
-        if (scan_card_transport_drop_reply.load(std::memory_order_acquire))
-            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-        static thread_local std::array<unsigned char, 8> reply{};
         const auto kind = scan_card_transport_kind.load(std::memory_order_acquire);
+        if (scan_card_transport_drop_reply.load(std::memory_order_acquire) && kind != 6)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        static thread_local std::array<unsigned char, 260> reply{};
         std::size_t size = 4;
         if (kind == 0) {
-            reply = {0, 0x3b, 0x80, 0x01, 0x81, 0, 0, 0};
-            size = 5;
+            if (scan_card_t1_crc.load(std::memory_order_acquire)) {
+                reply = {0, 0x3b, 0x80, 0x81, 0x41, 0x01, 0x41, 0};
+                size = 7;
+            } else {
+                reply = {0, 0x3b, 0x80, 0x01, 0x81, 0, 0, 0};
+                size = 5;
+            }
         } else if (kind == 1) {
             reply = {0xac, 0, 0, 0, 0, 0, 0, 0};
             size = 1;
         } else if (kind == 2) {
             reply = {0x5a, 0xc3, 0, 0, 0, 0, 0, 0};
             size = 2;
+        } else if (kind == 6) {
+            reply[0] = 0xac;
+            size = 1;
+        } else if (kind == 4 || kind == 5) {
+            std::lock_guard lock(scan_card_t1_mutex);
+            if (kind == 4) {
+                size = scan_card_t1_pending.size();
+                std::copy(scan_card_t1_pending.begin(), scan_card_t1_pending.end(), reply.begin());
+                scan_card_t1_pending.clear();
+            } else {
+                size = scan_card_t1_reply.size();
+                std::copy(scan_card_t1_reply.begin(), scan_card_t1_reply.end(), reply.begin());
+            }
         } else {
             reply = {0x00, 0x00, 0x01, 0x90, 0x00, 0, 0, 0};
             size = 5;
@@ -277,7 +357,8 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         message->kind = dtv::spi::PublicOpenMessageKind::control_reply;
         message->resource_scope = kind == 0 ? 17 : 18;
         message->transaction_id = kind == 0 ? scan_card_transaction.load(std::memory_order_acquire)
-            : 200 + kind;
+            : (kind >= 4 ? scan_card_t1_current_transaction.load(std::memory_order_acquire)
+                         : 200 + kind);
         message->generation = packet->generation;
         message->payload = std::span<const unsigned char>(reply).first(size);
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
@@ -658,26 +739,70 @@ dtv_internal_result scan_plan_card_transport(
     plan.resource_keys = std::span<const std::uint64_t>(&card_resource, 1);
     if (const auto *write = std::get_if<dtv::spi::CardByteWrite>(&request->operation)) {
         if (write->bytes.empty()) plan.arguments_valid = false;
-        plan.transaction_id = 201;
+        const auto t1_mode = scan_card_t1_exchange_mode.load(std::memory_order_acquire);
+        plan.transaction_id = t1_mode == 0 ? 201
+            : scan_card_t1_transaction.fetch_add(1, std::memory_order_acq_rel);
+        if (t1_mode != 0)
+            scan_card_t1_current_transaction.store(plan.transaction_id, std::memory_order_release);
         plan.output = write->bytes;
         plan.reply_capacity = 1;
-        scan_card_transport_kind.store(1, std::memory_order_release);
+        scan_card_transport_kind.store(t1_mode == 0 ? 1 : 6, std::memory_order_release);
+        if (t1_mode != 0) {
+            std::lock_guard lock(scan_card_t1_mutex);
+            if (!scan_card_t1_write_started) {
+                scan_card_t1_request.clear();
+                scan_card_t1_write_started = true;
+            }
+            scan_card_t1_request.insert(scan_card_t1_request.end(),
+                write->bytes.begin(), write->bytes.end());
+            if (scan_card_t1_request.size() >= 3 &&
+                scan_card_t1_request.size() == static_cast<std::size_t>(scan_card_t1_request[2]) + 3 +
+                    (scan_card_t1_crc.load(std::memory_order_acquire) ? 2u : 1u)) {
+                scan_prepare_t1_reply(scan_card_t1_request);
+                scan_card_t1_write_started = false;
+            }
+        }
     } else if (const auto *read = std::get_if<dtv::spi::CardByteRead>(&request->operation)) {
-        if (read->capacity < 2 || read->capacity > read_command.size())
+        const auto t1_mode = scan_card_t1_exchange_mode.load(std::memory_order_acquire);
+        if (read->capacity < (t1_mode == 0 ? 2u : 1u) || read->capacity > read_command.size())
             plan.arguments_valid = false;
         read_command[0] = 0x52;
         read_command[1] = 0x01;
-        plan.transaction_id = 202;
+        plan.transaction_id = t1_mode == 0 ? 202
+            : scan_card_t1_transaction.fetch_add(1, std::memory_order_acq_rel);
+        if (t1_mode != 0)
+            scan_card_t1_current_transaction.store(plan.transaction_id, std::memory_order_release);
         plan.output = std::span<const unsigned char>(read_command).first(2);
         plan.reply_capacity = read->capacity;
-        scan_card_transport_kind.store(2, std::memory_order_release);
+        scan_card_transport_kind.store(t1_mode == 0 ? 2 : 4, std::memory_order_release);
+        if (t1_mode != 0) {
+            std::lock_guard lock(scan_card_t1_mutex);
+            const auto available = scan_card_t1_reply.size() - scan_card_t1_reply_offset;
+            const auto count = (std::min)({available, read->capacity, std::size_t{2}});
+            scan_card_t1_pending.assign(
+                scan_card_t1_reply.begin() + static_cast<std::ptrdiff_t>(scan_card_t1_reply_offset),
+                scan_card_t1_reply.begin() + static_cast<std::ptrdiff_t>(scan_card_t1_reply_offset + count));
+            scan_card_t1_reply_offset += count;
+        }
     } else if (const auto *exchange = std::get_if<dtv::spi::CardT1BlockExchange>(&request->operation)) {
-        if (exchange->block.empty() || exchange->response_capacity < 5)
+        if (!exchange->block.empty() && exchange->response_capacity < 5)
             plan.arguments_valid = false;
-        plan.transaction_id = 203;
-        plan.output = exchange->block;
-        plan.reply_capacity = exchange->response_capacity;
-        scan_card_transport_kind.store(3, std::memory_order_release);
+        const auto mode = scan_card_t1_exchange_mode.load(std::memory_order_acquire);
+        transport_plan->mode = mode == 2 ? dtv::spi::CardTransportMode::complete_block
+            : dtv::spi::CardTransportMode::byte_chunks;
+        if (!exchange->block.empty()) {
+            plan.transaction_id = mode == 0 ? 203
+                : scan_card_t1_transaction.fetch_add(1, std::memory_order_acq_rel);
+            if (mode != 0)
+                scan_card_t1_current_transaction.store(plan.transaction_id, std::memory_order_release);
+            plan.output = exchange->block;
+            plan.reply_capacity = exchange->response_capacity;
+            scan_card_transport_kind.store(mode == 0 ? 3 : 5, std::memory_order_release);
+            if (mode == 2) {
+                std::lock_guard lock(scan_card_t1_mutex);
+                scan_prepare_t1_reply(exchange->block);
+            }
+        }
     } else {
         plan.arguments_valid = false;
     }
@@ -925,6 +1050,19 @@ void set_scan_public_open_case(unsigned value)
     scan_card_interleave_phase.store(0, std::memory_order_release);
     scan_card_transport_kind.store(0, std::memory_order_release);
     scan_card_transport_drop_reply.store(false, std::memory_order_release);
+    scan_card_t1_exchange_mode.store(0, std::memory_order_release);
+    scan_card_t1_fault.store(0, std::memory_order_release);
+    scan_card_t1_crc.store(false, std::memory_order_release);
+    scan_card_t1_transaction.store(300, std::memory_order_release);
+    scan_card_t1_current_transaction.store(0, std::memory_order_release);
+    {
+        std::lock_guard lock(scan_card_t1_mutex);
+        scan_card_t1_request.clear();
+        scan_card_t1_reply.clear();
+        scan_card_t1_pending.clear();
+        scan_card_t1_reply_offset = 0;
+        scan_card_t1_write_started = false;
+    }
     {
         std::lock_guard lock(scan_pid_mutex);
         scan_pid_active.clear();
@@ -951,6 +1089,21 @@ void set_scan_card_reply_mode(unsigned mode)
 void set_scan_card_transport_drop_reply(bool drop)
 {
     scan_card_transport_drop_reply.store(drop, std::memory_order_release);
+}
+
+void set_scan_card_t1_exchange_mode(unsigned mode)
+{
+    scan_card_t1_exchange_mode.store(mode, std::memory_order_release);
+}
+
+void set_scan_card_t1_fault(unsigned fault)
+{
+    scan_card_t1_fault.store(fault, std::memory_order_release);
+}
+
+void set_scan_card_t1_crc(bool crc)
+{
+    scan_card_t1_crc.store(crc, std::memory_order_release);
 }
 
 void set_scan_card_interleave_phase(unsigned phase)
