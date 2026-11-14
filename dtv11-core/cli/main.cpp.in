@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <dtv/cli.h>
+
+#ifndef _WIN32
+#include <csignal>
+#endif
+
+namespace {
+
+// L3 metadata APIの結果を、CLI内で使う借用descriptorへ移す。
+const dtv_model_info *model_at(uint32_t index)
+{
+    static dtv_model_info model{};
+    return dtv_model_get(index, &model).code == DTV_ERROR_OK ? &model : nullptr;
+}
+
+}
+
+int main(int argc, char **argv)
+{
+#ifndef _WIN32
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        return 70;
+    }
+#endif
+    const dtv_cli_config config{sizeof(dtv_cli_config), "@PRODUCT_NAME@",
+                                "@PRODUCT_COMMAND@", "@PRODUCT_VERSION@",
+                                "@PRODUCT_DEFAULT_MODEL@"};
+    uint32_t model_count = 0;
+    if (dtv_model_count(&model_count).code != DTV_ERROR_OK) {
+        return 70;
+    }
+    return dtv_cli_main(argc, const_cast<const char *const *>(argv), &config,
+                        model_at, model_count);
+}
