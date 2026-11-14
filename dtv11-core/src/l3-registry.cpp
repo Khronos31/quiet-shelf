@@ -5162,6 +5162,7 @@ extern "C" uint32_t dtv_get_enclosure_close_state(dtv_enclosure *object, dtv_err
     }
     if (stream_close_pending) return dtv_close_enclosure(object, nullptr, error);
     std::shared_ptr<EnclosureRuntime> runtime;
+    bool close_pending = false;
     {
         std::lock_guard lock(slot->mutex);
         if (slot->phase == PublicDiscoveryState::OpenSlot::Phase::closed) {
@@ -5169,10 +5170,15 @@ extern "C" uint32_t dtv_get_enclosure_close_state(dtv_enclosure *object, dtv_err
             return DTV_CLOSE_CLOSED;
         }
         runtime = slot->runtime;
-        if (!runtime || runtime->worker_count() != 0) {
-            set_public_error(error, DTV_ERROR_OK);
-            return DTV_CLOSE_PENDING;
-        }
+        close_pending = slot->phase == PublicDiscoveryState::OpenSlot::Phase::pending;
+    }
+    if (close_pending) {
+        const dtv_call_options continue_close{sizeof(dtv_call_options), 1};
+        return dtv_close_enclosure(object, &continue_close, error);
+    }
+    if (!runtime || runtime->worker_count() != 0) {
+        set_public_error(error, DTV_ERROR_OK);
+        return DTV_CLOSE_PENDING;
     }
     {
         std::lock_guard lock(slot->operation_mutex);
