@@ -100,6 +100,8 @@ std::atomic<unsigned> scan_card_t1_exchange_mode{0};
 std::atomic<unsigned> scan_card_t1_fault{0};
 std::atomic<bool> scan_card_t1_apdu_mode{false};
 std::atomic<unsigned> scan_card_t1_apdu_fault{0};
+std::atomic<bool> scan_card_t1_apdu_rblock_sent{false};
+std::atomic<unsigned> scan_card_t1_apdu_reply_count{0};
 std::atomic<bool> scan_card_t1_crc{false};
 std::atomic<bool> scan_card_t1_stale_reply{false};
 std::atomic<std::uint64_t> scan_card_t1_transaction{300};
@@ -110,6 +112,7 @@ std::vector<unsigned char> scan_card_t1_reply;
 std::vector<unsigned char> scan_card_t1_pending;
 std::size_t scan_card_t1_reply_offset = 0;
 bool scan_card_t1_write_started = false;
+bool scan_card_t1_complete_probe_pending = false;
 
 void scan_prepare_t1_reply(std::span<const unsigned char> request)
 {
@@ -138,21 +141,44 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
     if (scan_card_t1_apdu_mode.load(std::memory_order_acquire)) {
         const auto fault = scan_card_t1_apdu_fault.load(std::memory_order_acquire);
         auto pcb = static_cast<unsigned char>(request[1] & 0x40);
-        if (fault == 1) pcb ^= 0x40;
-        else if (fault == 2) pcb = 0x80;
-        else if (fault == 3) pcb |= 0x20;
-        else if (fault == 4) pcb = 0xc0;
-        scan_card_t1_reply.push_back(pcb);
-        scan_card_t1_reply.push_back(0);
-        const auto ins = request[3 + (request[2] > 1 ? 1 : 0)];
-        if (ins == 0xa4) {
-            scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x11, 0x22, 0x90, 0x00});
-        } else if (ins == 0xca) {
-            scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x33, 0x44, 0x90, 0x00});
-        } else {
-            scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x55, 0x66, 0x90, 0x00});
+        const auto expected_nr = static_cast<unsigned char>((request[1] & 0x40) != 0 ? 0x10 : 0);
+        bool send_r_block = fault == 9;
+        unsigned error_code = 0;
+        if ((fault == 5 || fault == 8 || fault == 12) &&
+            !scan_card_t1_apdu_rblock_sent.exchange(true, std::memory_order_acq_rel)) {
+            send_r_block = true;
+            error_code = fault == 8 ? 1 : 0;
+        } else if (fault == 6 || fault == 10 || fault == 11) {
+            send_r_block = true;
+            error_code = 0;
+            pcb = static_cast<unsigned char>(0x80 | (expected_nr ^ 0x10));
+        } else if (fault == 7) {
+            send_r_block = true;
+            error_code = 3;
         }
-        scan_card_t1_reply[2] = static_cast<unsigned char>(scan_card_t1_reply.size() - 3);
+        if (send_r_block) {
+            pcb = static_cast<unsigned char>(0x80 | expected_nr | error_code);
+            if (fault == 6) pcb = static_cast<unsigned char>(0x80 | (expected_nr ^ 0x10));
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(fault == 10 ? 1 : 0);
+            if (fault == 10) scan_card_t1_reply.push_back(0xaa);
+            if (fault == 11) scan_card_t1_reply[0] = 1;
+        } else {
+            if (fault == 1) pcb ^= 0x40;
+            else if (fault == 3) pcb |= 0x20;
+            else if (fault == 4) pcb = 0xc0;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(0);
+            const auto ins = request[3 + (request[2] > 1 ? 1 : 0)];
+            if (ins == 0xa4) {
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x11, 0x22, 0x90, 0x00});
+            } else if (ins == 0xca) {
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x33, 0x44, 0x90, 0x00});
+            } else {
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x55, 0x66, 0x90, 0x00});
+            }
+            scan_card_t1_reply[2] = static_cast<unsigned char>(scan_card_t1_reply.size() - 3);
+        }
     } else {
         scan_card_t1_reply.push_back(static_cast<unsigned char>(request[1] ^ 0x40));
         scan_card_t1_reply.push_back(2);
@@ -398,6 +424,9 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
     }
     if (scan_public_open_case == 18 && packet->endpoint == 0x81) {
         const auto kind = scan_card_transport_kind.load(std::memory_order_acquire);
+        if (scan_card_t1_apdu_fault.load(std::memory_order_acquire) == 12 && kind == 5 &&
+            scan_card_t1_apdu_reply_count.fetch_add(1, std::memory_order_acq_rel) != 0)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         if (scan_card_transport_drop_reply.load(std::memory_order_acquire) && kind != 6)
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         static thread_local std::array<unsigned char, 260> reply{};
@@ -879,7 +908,12 @@ dtv_internal_result scan_plan_card_transport(
             scan_card_transport_kind.store(mode == 0 ? 3 : 5, std::memory_order_release);
             if (mode == 2) {
                 std::lock_guard lock(scan_card_t1_mutex);
-                scan_prepare_t1_reply(exchange->block);
+                if (!scan_card_t1_complete_probe_pending) {
+                    scan_prepare_t1_reply(exchange->block);
+                    scan_card_t1_complete_probe_pending = true;
+                } else {
+                    scan_card_t1_complete_probe_pending = false;
+                }
             }
         }
     } else {
@@ -1133,6 +1167,8 @@ void set_scan_public_open_case(unsigned value)
     scan_card_t1_fault.store(0, std::memory_order_release);
     scan_card_t1_apdu_mode.store(false, std::memory_order_release);
     scan_card_t1_apdu_fault.store(0, std::memory_order_release);
+    scan_card_t1_apdu_rblock_sent.store(false, std::memory_order_release);
+    scan_card_t1_apdu_reply_count.store(0, std::memory_order_release);
     scan_card_t1_crc.store(false, std::memory_order_release);
     scan_card_t1_stale_reply.store(false, std::memory_order_release);
     scan_card_t1_transaction.store(300, std::memory_order_release);
@@ -1144,6 +1180,7 @@ void set_scan_public_open_case(unsigned value)
         scan_card_t1_pending.clear();
         scan_card_t1_reply_offset = 0;
         scan_card_t1_write_started = false;
+        scan_card_t1_complete_probe_pending = false;
     }
     {
         std::lock_guard lock(scan_pid_mutex);
@@ -1186,6 +1223,8 @@ void set_scan_card_t1_fault(unsigned fault)
 void set_scan_card_t1_apdu_mode(bool enabled, unsigned fault)
 {
     scan_card_t1_apdu_fault.store(fault, std::memory_order_release);
+    scan_card_t1_apdu_rblock_sent.store(false, std::memory_order_release);
+    scan_card_t1_apdu_reply_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_mode.store(enabled, std::memory_order_release);
 }
 

@@ -2732,18 +2732,19 @@ int public_card_transport()
     }
     const auto run_t1_apdu = [&](unsigned mode, std::span<const unsigned char> command,
                                  dtv::internal::T1ApduResult *apdu_result,
-                                 std::vector<std::vector<unsigned char>> *sent = nullptr) {
+                                 std::vector<std::vector<unsigned char>> *sent = nullptr,
+                                 std::uint32_t timeout_ms = 1000) {
         set_scan_card_t1_exchange_mode(mode);
         const auto output_start = backend->output_snapshot().size();
         std::atomic<bool> done{false};
         dtv_internal_result exchange_result{};
         std::thread caller([&] {
             exchange_result = dtv::internal::exchange_public_t1_apdu(root, command,
-                dtv_timeout{1000, 0}, apdu_result);
+                dtv_timeout{timeout_ms, 0}, apdu_result);
             done.store(true, std::memory_order_release);
         });
         auto next_output = backend->endpoint_submission_count(0x02) + 1;
-        for (unsigned step = 0; step < 16 && !done.load(std::memory_order_acquire); ++step) {
+        for (unsigned step = 0; step < 64 && !done.load(std::memory_order_acquire); ++step) {
             if (!backend->wait_for_endpoint_submissions(0x02, next_output)) break;
             callbacks = backend->callback_count_snapshot();
             backend->complete_endpoint(0x02);
@@ -2835,7 +2836,162 @@ int public_card_transport()
         resetting.join();
         return value.load(std::memory_order_acquire) == DTV_ERROR_OK;
     };
-    for (const auto fault : {2u, 3u, 4u}) {
+    const auto same_apdu_frame_sent = [&](unsigned mode,
+        const std::vector<std::vector<unsigned char>> &sent,
+        const std::vector<unsigned char> &frame, std::span<const unsigned char> command,
+        std::size_t expected_frames) {
+        if (mode == 2) {
+            if (sent.size() != expected_frames) return false;
+            return std::all_of(sent.begin(), sent.end(), [&](const auto &packet) {
+                return packet == frame;
+            });
+        }
+        std::vector<std::size_t> headers;
+        for (std::size_t index = 0; index < sent.size(); ++index) {
+            if (sent[index] == std::vector<unsigned char>{0x00, frame[1], frame[2]})
+                headers.push_back(index);
+        }
+        if (headers.size() != expected_frames) return false;
+        for (const auto index : headers) {
+            if (index + 2 >= sent.size() ||
+                sent[index + 1] != std::vector<unsigned char>(command.begin(), command.end()) ||
+                sent[index + 2] != std::vector<unsigned char>{frame.back()}) return false;
+        }
+        return true;
+    };
+    const std::vector<unsigned char> first_apdu_frame{
+        0x00, 0x00, 0x04, 0x00, 0xa4, 0x04, 0x00, 0xa4};
+    const std::vector<unsigned char> second_apdu_frame{
+        0x00, 0x40, 0x04, 0x00, 0xca, 0x00, 0x00, 0x8e};
+    for (const auto mode : {1u, 2u}) {
+        if (!reset_t1_session()) return 32;
+        set_scan_card_t1_apdu_mode(true, mode == 1 ? 5 : 8);
+        dtv::internal::T1ApduResult retried_result{};
+        std::vector<std::vector<unsigned char>> retried_output;
+        const auto retry_code = run_t1_apdu(mode, apdu_one, &retried_result, &retried_output);
+        if (retry_code != DTV_INTERNAL_RESULT_OK ||
+            retried_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            retried_result.io.tx_bytes_done != 16 || retried_result.io.rx_bytes_done != 12 ||
+            !retried_result.io.reply_complete || !retried_result.io.result_known ||
+            !same_apdu_frame_sent(mode, retried_output, first_apdu_frame, apdu_one, 2)) {
+            std::fprintf(stderr, "R retry mode=%u result=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u outputs=%zu\n",
+                mode, retry_code, retried_result.io.transport_error.code,
+                retried_result.response.size(), retried_result.io.tx_bytes_done,
+                retried_result.io.rx_bytes_done, retried_result.io.result_known,
+                retried_result.io.reply_complete, retried_output.size());
+            for (const auto &packet : retried_output) {
+                std::fprintf(stderr, "retry packet:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 33;
+        }
+        const auto next_mode = mode == 1 ? 2u : 1u;
+        set_scan_card_t1_apdu_mode(true, 0);
+        dtv::internal::T1ApduResult next_result{};
+        std::vector<std::vector<unsigned char>> next_output;
+        const auto next_code = run_t1_apdu(next_mode, apdu_two, &next_result, &next_output);
+        if (next_code != DTV_INTERNAL_RESULT_OK ||
+            next_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+            next_result.io.tx_bytes_done != 8 || !next_result.io.reply_complete ||
+            !next_result.io.result_known ||
+            !same_apdu_frame_sent(next_mode, next_output, second_apdu_frame, apdu_two, 1)) {
+            std::fprintf(stderr, "after R retry mode=%u next=%u result=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u outputs=%zu\n",
+                mode, next_mode, next_code, next_result.io.transport_error.code,
+                next_result.response.size(),
+                next_result.io.tx_bytes_done, next_result.io.rx_bytes_done,
+                next_result.io.result_known, next_result.io.reply_complete, next_output.size());
+            for (const auto &packet : next_output) {
+                std::fprintf(stderr, "next packet:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 34;
+        }
+    }
+    if (!reset_t1_session()) return 43;
+    set_scan_card_t1_apdu_mode(true, 0);
+    dtv::internal::T1ApduResult sequence_zero_result{};
+    std::vector<std::vector<unsigned char>> sequence_zero_output;
+    if (run_t1_apdu(1, apdu_one, &sequence_zero_result, &sequence_zero_output) !=
+            DTV_INTERNAL_RESULT_OK ||
+        !same_apdu_frame_sent(1, sequence_zero_output, first_apdu_frame, apdu_one, 1)) return 44;
+    set_scan_card_t1_apdu_mode(true, 5);
+    dtv::internal::T1ApduResult sequence_one_retry_result{};
+    std::vector<std::vector<unsigned char>> sequence_one_retry_output;
+    const auto sequence_one_retry_code = run_t1_apdu(2, apdu_two,
+        &sequence_one_retry_result, &sequence_one_retry_output);
+    if (sequence_one_retry_code != DTV_INTERNAL_RESULT_OK ||
+        sequence_one_retry_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+        sequence_one_retry_result.io.tx_bytes_done != 16 ||
+        sequence_one_retry_result.io.rx_bytes_done != 12 ||
+        !sequence_one_retry_result.io.reply_complete || !sequence_one_retry_result.io.result_known ||
+        !same_apdu_frame_sent(2, sequence_one_retry_output, second_apdu_frame, apdu_two, 2)) {
+        std::fprintf(stderr, "sequence one R result=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u output=%zu pcb=%02x\n",
+            sequence_one_retry_code, sequence_one_retry_result.io.transport_error.code,
+            sequence_one_retry_result.response.size(), sequence_one_retry_result.io.tx_bytes_done,
+            sequence_one_retry_result.io.rx_bytes_done, sequence_one_retry_result.io.result_known,
+            sequence_one_retry_result.io.reply_complete,
+            sequence_one_retry_output.size(),
+            sequence_one_retry_output.empty() || sequence_one_retry_output[0].size() < 2
+                ? 0 : sequence_one_retry_output[0][1]);
+        return 45;
+    }
+    set_scan_card_t1_apdu_mode(true, 0);
+    dtv::internal::T1ApduResult sequence_wrap_result{};
+    std::vector<std::vector<unsigned char>> sequence_wrap_output;
+    if (run_t1_apdu(1, apdu_one, &sequence_wrap_result, &sequence_wrap_output) !=
+            DTV_INTERNAL_RESULT_OK ||
+        sequence_wrap_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        !same_apdu_frame_sent(1, sequence_wrap_output, first_apdu_frame, apdu_one, 1)) return 46;
+    for (const auto fault : {6u, 7u, 10u, 11u}) {
+        if (!reset_t1_session()) return 35;
+        set_scan_card_t1_apdu_mode(true, fault);
+        dtv::internal::T1ApduResult invalid_r_result{};
+        std::vector<std::vector<unsigned char>> invalid_r_output;
+        if (run_t1_apdu(2, apdu_one, &invalid_r_result, &invalid_r_output) !=
+                DTV_INTERNAL_RESULT_USB_IO || !invalid_r_result.response.empty() ||
+            invalid_r_result.io.result_known || invalid_r_result.io.reply_complete ||
+            invalid_r_output.size() != 1) return 36;
+    }
+    if (!reset_t1_session()) return 37;
+    set_scan_card_t1_apdu_mode(true, 9);
+    dtv::internal::T1ApduResult repeated_r_result{};
+    std::vector<std::vector<unsigned char>> repeated_r_output;
+    if (run_t1_apdu(2, apdu_one, &repeated_r_result, &repeated_r_output) !=
+            DTV_INTERNAL_RESULT_UNSUPPORTED || !repeated_r_result.response.empty() ||
+        repeated_r_result.io.tx_bytes_done != 24 || repeated_r_result.io.rx_bytes_done != 12 ||
+        repeated_r_result.io.reply_complete || !repeated_r_result.io.result_known ||
+        repeated_r_output.size() != 3 || repeated_r_output[0] != first_apdu_frame ||
+        repeated_r_output[1] != first_apdu_frame || repeated_r_output[2] != first_apdu_frame)
+        return 38;
+    if (!reset_t1_session()) return 39;
+    set_scan_card_t1_apdu_mode(true, 5);
+    set_scan_card_transport_drop_reply(true);
+    dtv::internal::T1ApduResult missing_r_result{};
+    std::vector<std::vector<unsigned char>> missing_r_output;
+    const auto missing_r_code = run_t1_apdu(2, apdu_one, &missing_r_result,
+        &missing_r_output, 100);
+    set_scan_card_transport_drop_reply(false);
+    if (missing_r_code != DTV_INTERNAL_RESULT_TIMEOUT || !missing_r_result.response.empty() ||
+        missing_r_result.io.tx_bytes_done != first_apdu_frame.size() ||
+        missing_r_result.io.rx_bytes_done != 0 || missing_r_result.io.result_known ||
+        missing_r_result.io.reply_complete || missing_r_output.size() != 1 ||
+        missing_r_output[0] != first_apdu_frame) return 40;
+    if (!reset_t1_session()) return 41;
+    set_scan_card_t1_apdu_mode(true, 12);
+    dtv::internal::T1ApduResult missing_retry_result{};
+    std::vector<std::vector<unsigned char>> missing_retry_output;
+    const auto missing_retry_code = run_t1_apdu(2, apdu_one, &missing_retry_result,
+        &missing_retry_output, 100);
+    if (missing_retry_code != DTV_INTERNAL_RESULT_TIMEOUT ||
+        !missing_retry_result.response.empty() ||
+        missing_retry_result.io.tx_bytes_done != first_apdu_frame.size() * 2 ||
+        missing_retry_result.io.rx_bytes_done != 4 || missing_retry_result.io.result_known ||
+        missing_retry_result.io.reply_complete || missing_retry_output.size() != 2 ||
+        missing_retry_output[0] != first_apdu_frame ||
+        missing_retry_output[1] != first_apdu_frame) return 42;
+    for (const auto fault : {3u, 4u}) {
         if (!reset_t1_session()) return 32;
         set_scan_card_t1_apdu_mode(true, fault);
         dtv::internal::T1ApduResult unsupported_result{};

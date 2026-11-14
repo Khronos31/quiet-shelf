@@ -870,17 +870,44 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - **両adapterでの実測実績:**
     - 同一LRC sessionにおいて、byte_chunksとcomplete_blockの両adapterから異なる短いAPDU（command 1: `00 A4...` → response `11 22 90 00`、command 2: `00 CA...` → response `33 44 90 00`）の連続2回往復を実測確認し、送受双方のsequence（0→1）とcommand別応答INFを照合。
     - 共有通知（CARD_REMOVED/INSERTED）、別receiver 192→188 read、遅延旧応答拒否、およびclose PENDING/drain回収が本APDU経路でも整合して動作することを確認。
+- **受信R-block再送と単一I-block再送制御（PR51、C11中段・妥当R要求による同一I frame再送・3送信上限・正常I応答時のみsequence更新・S(RESYNCH)未実装失効・無replay）:**
+  - **位置付けと私有境界:**
+    - PR50のCore内部単一I-block APDU交換（`exchange_public_t1_apdu`）を基底とし、受信した妥当なR-blockの要求に応じて保持していた同一I-block（N(S)/INF/EDC）を規格範囲内で再送する私有再送制御を追加したCore内部単位（C11中段）である。
+    - 受信R-blockによる再送制御はCore内部の私有プロトコル処理であり、公開C API（`dtv_transmit_apdu`）の接続完了ではない。公開C宣言や製品SPIは変更しておらず、公開APDU完成やT=1規格全体準拠と取り違えない。また、実装の私有送信上限（3送信上限等）を新公開契約にしない。
+    - 送信側からのR-block生成、S-block（WTX/IFS/RESYNCH）処理、I-block連鎖（chaining）、公開APDU、PC/SCは後続工程である。
+  - **妥当な受信R-block判定と同一I frame再送:**
+    - **受信R-blockの妥当性検証:**
+      - NAD == 0、PCB bits 8..7 == `10`（R-block）、bit 6 == `0`、bit 5 == `N(R)`、bits 4..1 が error indication（0: エラーなし、1: EDCエラー、2: その他のエラー。3等は予約/不正）、LEN == 0 かつ INF なしを厳密に検査。
+      - 受信した `N(R)` が直前に送信したI-blockの `N(S)` と一致することを確認。
+    - **同一フレーム再送（no-replay）:**
+      - 上記の妥当なR-blockを満たす場合のみ、APDU全体を再入・再生成せず、保持している同一の `N(S)` / INF / EDC フレーム（pre-encoded frame）を同じ session / ticket を維持して再送（retransmit）。
+      - 両adapter（`byte_chunks` / `complete_block`）で同一の操作チケットおよび caller deadline を共有して動作。
+  - **送受sequence更新契機と送信上限・session失効:**
+    - **正常I応答でのみsequence更新:**
+      - R-block受信時や再送途中では送受sequenceを進めない。
+      - 期待するsequence番号を持った正常なI応答ブロックを受信・検証した時点で初めて、送受双方のsequence `N(S)` を一度だけトグル更新（0→1→0...）する。
+    - **3送信上限とS(RESYNCH)未実装失効:**
+      - ISO/IEC 7816-3:2006 §11.6.3.2（rules 7.4.1/7.4.2）に従い、初回送信を含めて最大3回のI送信（初回1回 + 再送2回）まで許容。
+      - 3回送信後もR-blockが継続した場合、規格上の回復手順である `S(RESYNCH request)` が未実装のため、成功INFを返さず `session` を無効化（失効）して終了（新resetで回復）。
+    - **timeout・不完全転送での扱い:**
+      - タイムアウト、キャンセル、応答欠損を勝手にR-block要求と解釈せず、再送を行わない。
+      - 初回送信でのタイムアウトは初回I送信のみ記録。R受信後の再送途中でブロックが不完全・タイムアウトとなった場合は、そこまでの進行量（tx/rx bytes）を保持しつつ結果不明（`result_known=false`）を集約してsessionを無効化する。
+  - **両adapterでの実測実績:**
+    - byte_chunks と complete_block の両adapterにおいて、`I(0,0) -> R(0) -> 同一I(0,0) -> 正常I応答` の再送往復、および次APDUでの `I(1,0)` 遷移を確認。
+    - complete_block において、sequence が `N(S)=1` の状態での `R(1) -> 同一I(1,0) -> 正常I応答` の再送と sequence wrap（1→0）を確認。
+    - error indication 1（EDCエラー）での再送受理、不正R（error code 3、誤N(R)、LEN!=0、誤NAD、S/chaining）での失敗とsession失効、3回試行上限での停止、初回到達前欠損での再送なし、R受信後欠損での進行量保持とsession失効を確認。
+    - 既存のCARD通知、別receiver 188 read、遅延旧応答拒否、reset回復、close取消/PENDING drainの回帰を同一fixture内で確認。
 - **後続工程との境界:**
-  - 本PR（PR50）で接続されたのは、公開カードリセット（`dtv_reset_card`）、取得済み ATR の公開 getter（`dtv_get_card_atr`）、三層機種dispatch、合成reset要求・応答、Core共通ATR構造/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、決定51整合、L3 §6.2 に基づく PENDING close 停止回収、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、およびCore内部単一I-block APDU交換・session sequence（PR50: 1 block APDU往復、送受N(S)管理、両adapter連続往復、IFSC検証、誤sequence/R/S/chaining拒否、送信後不明session無効化とreset回復）である。
-  - R-block ACK/error、S-block制御/WTX、I-block連鎖（chaining）、規格内block retry、公開APDU送受信API（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset/card transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回公開APDU完成やT=1規格全体準拠、全カード機能完成とはしない。
+  - 本PR（PR51）で接続されたのは、公開カードリセット（`dtv_reset_card`）、取得済み ATR の公開 getter（`dtv_get_card_atr`）、三層機種dispatch、合成reset要求・応答、Core共通ATR構造/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、決定51整合、L3 §6.2 に基づく PENDING close 停止回収、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、Core内部単一I-block APDU交換・session sequence（PR50）、および受信R-block再送と単一I-block再送制御（PR51: 妥当R要求による同一I frame再送、両adapter共通ticket/deadline、3送信上限、正常I応答時のみsequence更新、S(RESYNCH)未実装失効、無replay、reset回復）である。
+  - 送信側R-block生成、S-block制御/WTX/IFS/RESYNCH回復、I-block連鎖（chaining）、公開APDU送受信API（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset/card transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回公開APDU完成やT=1規格全体準拠、全カード機能完成とはしない。
 
 ## CLI接続・既存レガシーとの境界・未実装範囲
 
 - **CLI接続:** 生成された main は、argc/argv を変更せずそのまま既存Coreの `dtv_cli_main` へ渡す。L1の全parserや全subcommandの実装が完了したわけではない。
 - **レガシーとの境界:** 既存のメタデータAPI（`dtv_model_count`, `dtv_model_get`）や旧内部ランタイム（USB、discovery、firmware転送）は残存しているが、本PRで導入された新L3 registryとは分離されている。正本との識別子衝突を回避するため、内部レガシー型・状態名は機械的に改名されている。また、旧来の `UsbContext` 既定コンストラクタによる2-worker常駐経路もレガシー境界として残存している。
 - **未実装・未接続範囲:**
-  - 合成機種における完全rootの公開 open / close / state / release / cancel、1-worker ランタイム、共有 IN 継続受信、有界返信配送、claim 排他予約、共通操作受付・物理scope ticket予約、合成共有INからの公開CARD状態・CARD_INSERTED/REMOVEDイベント接続、安定した公開receiver配列・getter/support・動的宣言確定接点、公開LOCK_ACQUIRED/LOCK_LOSTイベント接続、公開シグナル取得API（`dtv_get_signal` によるロック現在値照会・決定53 reason同期）、公開周波数選局API（`dtv_tune_by_frequency`、合成機種SPI、決定54選局時ロック状態遷移・世代フェンス）、公開チャンネル選局API（`dtv_tune_by_channel`、厳密ASCII文法・決定55整数Hz換算/衛星IF・セレクタ既定/排他）、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream`, `dtv_cancel_stream`, `dtv_close_stream`, `dtv_get_stream_close_state`, `dtv_release_stream`, `dtv_get_dropped_bytes`, `dtv_get_desyncs`, `dtv_set_pid_filter`）、有限188/192バイトTS変換配送（Core TsFramer・製品transform接続）、合成連続ソースにおける決定56連続TSキュー満杯・SLOW_CONSUMER終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、公開カードリセットAPI（`dtv_reset_card`、合成reset、Core共通ATR検査・返却領域所有、直列化・二重世代フェンス、決定51整合、L3 §6.2 getter-only停止回収）、公開ATR getter API（`dtv_get_card_atr`、取得済みATR読み出し、現在値失効と返却領域寿命の分離）、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、およびCore内部単一I-block APDU交換・session sequence（PR50、C11初段: 単一I/I APDU往復・送受N(S)管理・両adapter連続2往復・IFSC検証・誤sequence/R/S/chaining拒否・送信後不明session無効化とreset回復）は本PRで実資源へ接続完了。
-  - R/S block制御・WTX・I-block連鎖（chaining）・規格内block retry、公開カードAPDU送受信API（`dtv_transmit_apdu` 等）、PC/SC、および実機校正CNR/電力測定の実装接続。
+  - 合成機種における完全rootの公開 open / close / state / release / cancel、1-worker ランタイム、共有 IN 継続受信、有界返信配送、claim 排他予約、共通操作受付・物理scope ticket予約、合成共有INからの公開CARD状態・CARD_INSERTED/REMOVEDイベント接続、安定した公開receiver配列・getter/support・動的宣言確定接点、公開LOCK_ACQUIRED/LOCK_LOSTイベント接続、公開シグナル取得API（`dtv_get_signal` によるロック現在値照会・決定53 reason同期）、公開周波数選局API（`dtv_tune_by_frequency`、合成機種SPI、決定54選局時ロック状態遷移・世代フェンス）、公開チャンネル選局API（`dtv_tune_by_channel`、厳密ASCII文法・決定55整数Hz換算/衛星IF・セレクタ既定/排他）、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream`, `dtv_cancel_stream`, `dtv_close_stream`, `dtv_get_stream_close_state`, `dtv_release_stream`, `dtv_get_dropped_bytes`, `dtv_get_desyncs`, `dtv_set_pid_filter`）、有限188/192バイトTS変換配送（Core TsFramer・製品transform接続）、合成連続ソースにおける決定56連続TSキュー満杯・SLOW_CONSUMER終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、公開カードリセットAPI（`dtv_reset_card`、合成reset、Core共通ATR検査・返却領域所有、直列化・二重世代フェンス、決定51整合、L3 §6.2 getter-only停止回収）、公開ATR getter API（`dtv_get_card_atr`、取得済みATR読み出し、現在値失効と返却領域寿命の分離）、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、Core内部単一I-block APDU交換・session sequence（PR50、C11初段）、および受信R-block再送と単一I-block再送制御（PR51、C11中段: 妥当R要求による同一I frame再送・両adapter共通ticket/deadline・3送信上限・正常I応答時のみsequence更新・S(RESYNCH)未実装失効・無replay）は本PRで実資源へ接続完了。
+  - 送信側R-block生成、S-block制御/WTX/IFS/RESYNCH回復、I-block連鎖（chaining）、公開カードAPDU送受信API（`dtv_transmit_apdu` 等）、PC/SC、および実機校正CNR/電力測定の実装接続。
   - 実機5製品（PX4, PIX, FS1等）の製品固有open計画・固有identify・初回/継続共有INの実機パラメータ・分類・実機CARD/LOCK通知値・実機受信部宣言・実機ロック判定閾値・実機tuneコマンド/機器丸め/RF変換・実機ストリーム転送/start-stopコマンド/ハードウェア通知フェンス・実機固有PID機器設定コマンド・実機固有電源/reset transport/コマンド。
   - ファームウェア転送 API。
   - daemon / wire API、各製品リポジトリの実装接続。
@@ -926,6 +953,10 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
     - PR50（単一I-block APDU交換およびsession sequence）fixture切り分けおよび修正経緯:
       - scan_modelへcommand依存の独立vectorとwrong-sequence/R/S/chaining応答を追加し、既存fixtureを拡張。
       - 初回テストでbyte_chunks送信パケット数を3固定とした期待が失敗したが、3つのblock-writeに加えて6つのread-controlパケットが含まれることを切り分け、frameの3 writeを検査しつつread-control出力を許容する期待へ修正（製品期待値の緩和やskipなし。合成環境・fixtureでの修正実績であり実機ハードウェア検証済みとは扱わない）。
+    - PR51（受信R-block再送と単一I-block再送制御）fixture切り分けおよび修正経緯:
+      - 開発中の return 34 は通常の次 APDU を再送と同じ 2 frame と数えた test helper 期待誤りであり、期待 frame 数を引数化して切り分け。
+      - return 33 は complete-block fixture が plan probe 時に一回限りの R 応答を消費し実転送時に I 応答を返していた fixture 状態管理が原因だったため、probe から実転送まで生成 R を保持する fixture 同期を追加。
+      - sequence=1 を使う return 45 で R N(R) の bit mask を誤って 0x20 と扱う実装不具合が判明し、ISO PCB layout の bit 5 = 0x10 に修正し N(R)=1 再送 case を追加して解消。製品期待値の弱化や skip はない（合成環境・fixture での修正実績であり実機ハードウェア検証済みとは扱わない）。
   - PR47作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.37秒。reset 前の getter NOT_READY、reset 後の getter バイト列・長さ完全一致、getter 単独での追加 endpoint 出力なし、reset 失敗後の出力クリアと getter NOT_READY、unsupported 筐体での出力クリア、別 receiver signal 進行後の pointer 有効性維持等を確認）、`git diff --check` 通過。
   - PR48作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.47秒。既存CARD/receiver/close回帰に加え、byte write/readとcompleted T=1 block往復、送受信byte数、応答欠落時unknown/no-retry、in-flight closeのCANCELLEDとPENDING回収を確認）、全target build 成功（`cmake --build build --parallel 2`）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `e7f6694155cb90d1a0926736ded4d64f83f1ff5b`）。
   - PR49作者検証:
@@ -933,9 +964,11 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
     - 最新head（`df95b45c`）: source/header不変、tests/fixturesのみ更新（+296, -1行）。変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 連続2回 pass（20.94秒、20.99秒。保留中CARD_REMOVED通知・state ABSENT・generation進行・別receiver 192→188 read因果同期、遅延旧INF 6F00フェンス `tx=8, rx=0`・不明・追加OUTなし、新session INF 9000成功を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `df95b45cfc23060210da204393e92adf329178f9`）。
     - なお、初回QAにおけるC7/C8判定不能はprobe配送/同期限界（外部probeからの同期観測限界）によるものであり、今回の作者fixtureは代表動的成功であるが、独立QAはこれから実施される。
   - PR50作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（35.19秒。単一I/I往復、両adapter連続2往復、N(S)=0/1遷移、command別INF、IFSC超過無I/O拒否、誤sequence/R/S/chaining拒否・session無効化・reset後回復、保留中CARD通知/別receiver 188 read/遅延旧応答拒否/close取消を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `e7f28b456e2e4fe6ff1c30155c8093b356994a53`、PR50 OPEN、base `t1-block-20261115`）。
+  - PR51作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（61.75秒。両adapterでの `I(0,0) -> R(0) -> I(0,0) -> response` および次 APDU での `I(1,0)` 遷移、complete-block での `N(S)=1` 時の `R(1) -> I(1,0)` 再送と sequence wrap、error indication 1 受理、不正 R・試行限度 3 回停止、初回到達前欠損での再送なし、R 受信後欠損での進行量保持と session 失効、既存 CARD 通知/別 receiver 188 read/遅延旧応答拒否/reset 回復/close 取消回帰を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `f170d710aa74ce54770ea5f50eace1be0e2a4acb`、PR51 OPEN、base `t1-iblock-20261115`）。
 - **未実施事項・過去の不合格履歴:**
   - 独立QA（コミット `4520f4e927c677653c937b337056694c1f668604`）において、PR41修正前 head（`dd9220bbe6aa6f6ed68bd41cd83b539343d22877`）に対する独立プローブにより、親 close 時にブロック待機中の stream reader が解除されない不具合（failure 30 / exit 91）が検出・不合格判定された履歴がある（PR41修正により解消、不合格の事実を改ざんしない）。
-  - 今回の PR50 head（`e7f28b456e2e4fe6ff1c30155c8093b356994a53`）に対する全 CTest suite、全体build、CLI、Android NDK compile、公開 quiet-shelf 最終 CI、規格独立確認、および由来確認は後続 QA に委任されており、未実施・成功済みにしない。本 PR50 は PR49 を base とするスタック PR であり、未 merge である。先行 PR49 の証拠を PR50 新経路の実測へ読み替えず、最新 head の CI 等を実施済みにしない。後続 QA は差分と最終 snapshot を確認する。
+  - 今回の PR51 head（`f170d710aa74ce54770ea5f50eace1be0e2a4acb`）に対する全 CTest suite、全体build、CLI、Android NDK compile、公開 quiet-shelf 最終 CI（Linux/Windows 同一 snapshot）、規格独立確認、および由来確認は後続 QA に委任されており、未実施・成功済みにしない。本 PR51 は PR50 を base とするスタック PR であり、未 merge である（先行 PR49, PR50 も未 merge）。先行 PR の証拠を PR51 新経路の実測へ読み替えず、最新 head の CI 等を実施済みにしない。後続 QA は差分と最終 snapshot を確認する。
+  - PR50 由来の初回 Windows reset 失敗は同 head 非再現・原因未特定であり、根拠なく原因断定しない（新しい全組合せ試験要求は作らない）。
   - **Android runtime の扱い:** Android runtime は後続の実機/runtime 工程であり、今回の QA には委任しない（今回 QA 委任は NDK compile まで）。
   - 全てのdeadline/欠損応答raceの専用個別網羅、T=1 全体準拠、公開 APDU 完成、実機検証済みの断定は行わない。
   - 実USB上の物理リソース衝突・物理unplug時の実機DISCONNECTED挙動、実機5製品の固有PID機器設定コマンド・実機TS転送接続・実機固有電源/reset transport/コマンド・実機カードAPDU・Androidランタイム実機動作・性能保証・全製品完成は未測定・未検証。

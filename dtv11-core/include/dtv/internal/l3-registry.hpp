@@ -197,7 +197,8 @@ struct T1ApduResult {
     dtv::spi::CardIoOutcome io;
 };
 dtv_internal_result exchange_public_t1_block(
-    dtv_enclosure *, const T1BlockRequest &, dtv_timeout, T1BlockResult *);
+    dtv_enclosure *, const T1BlockRequest &, dtv_timeout, T1BlockResult *,
+    std::shared_ptr<void> * = nullptr, std::span<const unsigned char> = {});
 dtv_internal_result exchange_public_t1_apdu(
     dtv_enclosure *, std::span<const unsigned char>, dtv_timeout, T1ApduResult *);
 std::int32_t run_public_stream_operation(
