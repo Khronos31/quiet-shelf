@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <dtv/spi/device_ops.hpp>
+#include <dtv/spi/feature.hpp>
+#include <dtv/internal/l3.hpp>
+#include "@PRODUCT_NAME@_firmware.hpp"
+
+namespace dtv::internal {
+dtv_enclosure *const *list_enclosures_for_product_by_tokens(
+    const char *, const dtv_usb_token *, uint32_t, dtv_error *);
+dtv_enclosure *const *list_enclosures_for_product_by_fds(
+    const char *, const int32_t *, uint32_t, dtv_error *);
+}
 
 namespace dtv::spi {
 
@@ -15,4 +25,60 @@ extern const ProductEntry @PRODUCT_ENTRY_SYMBOL@{
     @PRODUCT_MODELS_COUNT@
 };
 
+}
+
+extern "C" int32_t @PRODUCT_TO_ALL_SYMBOL@(const dtv_call_options *, dtv_error *);
+@l3_model_declarations@
+
+extern "C" void dtv_l3_register_product(
+    const char *, const dtv::spi::l3_model_record *const *, std::size_t,
+    const dtv::spi::ProductEntry *,
+    int32_t (*)(const dtv_call_options *, dtv_error *));
+
+extern "C" void @PRODUCT_LOAD_SYMBOL@(void)
+{
+    static const dtv::spi::l3_model_record *const models[] = {
+@l3_model_values@    };
+    dtv_l3_register_product("@PRODUCT_NAME@", models, @PRODUCT_MODELS_COUNT@,
+                            &dtv::spi::@PRODUCT_ENTRY_SYMBOL@,
+                            &@PRODUCT_TO_ALL_SYMBOL@);
+}
+
+extern "C" const dtv_model *const *@PRODUCT_LIST_MODELS_SYMBOL@(void)
+{
+    static const dtv_model *const models[] = {
+@l3_model_list_values@        nullptr
+    };
+    return models;
+}
+
+extern "C" int32_t @PRODUCT_SUPPORT_SYMBOL@(
+    uint32_t operation, uint32_t *out_tribool, dtv_error *error)
+{
+    return dtv_get_product_support("@PRODUCT_NAME@", operation, out_tribool, error);
+}
+
+extern "C" int32_t @MODEL_SUPPORT_SYMBOL@(
+    const char *model, uint32_t operation, uint32_t *out_tribool, dtv_error *error)
+{
+    return dtv_get_model_support(model, operation, out_tribool, error);
+}
+
+extern "C" dtv_enclosure *const *@PRODUCT_LIST_ENCLOSURES_SYMBOL@(dtv_error *error)
+{
+    return dtv::internal::list_enclosures_for_product("@PRODUCT_NAME@", error);
+}
+
+extern "C" dtv_enclosure *const *@PRODUCT_LIST_ENCLOSURES_BY_TOKENS_SYMBOL@(
+    const dtv_usb_token *tokens, uint32_t token_count, dtv_error *error)
+{
+    return dtv::internal::list_enclosures_for_product_by_tokens(
+        "@PRODUCT_NAME@", tokens, token_count, error);
+}
+
+extern "C" dtv_enclosure *const *@PRODUCT_LIST_ENCLOSURES_BY_FDS_SYMBOL@(
+    const int32_t *fds, uint32_t fd_count, dtv_error *error)
+{
+    return dtv::internal::list_enclosures_for_product_by_fds(
+        "@PRODUCT_NAME@", fds, fd_count, error);
 }

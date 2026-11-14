@@ -8,6 +8,7 @@
 #include <span>
 #include <vector>
 
+#include <dtv/dtv.h>
 #include <dtv/spi/types.h>
 
 namespace dtv::internal {
@@ -32,6 +33,7 @@ enum class UsbOperationTerminalReason {
 UsbOperationTerminalReason current_usb_terminal_reason();
 
 struct UsbTestDeviceFactory;
+class UsbTransferBackend;
 
 struct UsbInterfaceSnapshot {
     dtv_usb_interface_info info{};
@@ -41,6 +43,15 @@ struct UsbInterfaceSnapshot {
 struct UsbInterfaceClaim {
     std::uint8_t interface_number;
     std::uint8_t alternate_setting;
+};
+
+struct UsbConnectionIdentity {
+    std::uint64_t filesystem = 0;
+    std::uint64_t inode = 0;
+    std::uint64_t device = 0;
+    bool valid = false;
+
+    bool operator==(const UsbConnectionIdentity &) const = default;
 };
 
 struct UsbDeviceSnapshot {
@@ -56,6 +67,8 @@ struct UsbDeviceSnapshot {
     std::uint8_t device_address;
     std::uint8_t configuration_count;
     std::uint64_t candidate_id = 0;
+    std::uint64_t connection_token = 0;
+    dtv_usb_token selection_token = 0;
     std::vector<std::uint8_t> port_path;
     std::vector<UsbInterfaceSnapshot> interfaces;
 
@@ -65,12 +78,115 @@ private:
     friend struct UsbTestDeviceFactory;
 };
 
+struct UsbClaimDeviceInput {
+    std::uint64_t connection_epoch = 0;
+    UsbDeviceSnapshot snapshot;
+    std::vector<UsbInterfaceClaim> interfaces;
+};
+
+class UsbClaimLeaseGroup {
+public:
+    struct State;
+    UsbClaimLeaseGroup();
+    ~UsbClaimLeaseGroup();
+    UsbClaimLeaseGroup(const UsbClaimLeaseGroup &) = delete;
+    UsbClaimLeaseGroup &operator=(const UsbClaimLeaseGroup &) = delete;
+    UsbClaimLeaseGroup(UsbClaimLeaseGroup &&) noexcept;
+    UsbClaimLeaseGroup &operator=(UsbClaimLeaseGroup &&) noexcept;
+
+    dtv_internal_result release() noexcept;
+    std::uint64_t deadline_ns() const;
+    std::size_t size() const;
+
+private:
+    std::unique_ptr<State> state_;
+    friend class UsbContext;
+    friend class EnclosureRuntime;
+};
+
+enum class UsbRuntimeTerminal {
+    completed, cancelled, deadline, endpoint_cancelled, stopped, failed
+};
+
+struct UsbRuntimeCompletion {
+    std::uint64_t request_id = 0;
+    std::uint64_t submit_sequence = 0;
+    std::uint64_t completion_sequence = 0;
+    std::uint64_t generation = 0;
+    std::size_t handle_index = 0;
+    std::uint8_t endpoint = 0;
+    UsbRuntimeTerminal terminal = UsbRuntimeTerminal::failed;
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    std::size_t actual_length = 0;
+    bool reached_backend = false;
+    std::vector<unsigned char> bytes;
+};
+
+struct UsbRuntimePacket {
+    std::uint64_t request_id = 0;
+    std::uint64_t submit_sequence = 0;
+    std::uint64_t generation = 0;
+    std::size_t handle_index = 0;
+    std::uint8_t endpoint = 0;
+    std::size_t actual_length = 0;
+    std::span<const unsigned char> bytes;
+    UsbRuntimeTerminal terminal = UsbRuntimeTerminal::completed;
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+};
+
+struct UsbRuntimeStopResult {
+    bool pending = false;
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+};
+
+class EnclosureRuntime {
+public:
+    struct State;
+    static std::unique_ptr<EnclosureRuntime> start(
+        UsbClaimLeaseGroup &&, dtv_internal_result *result);
+    ~EnclosureRuntime();
+    EnclosureRuntime(const EnclosureRuntime &) = delete;
+    EnclosureRuntime &operator=(const EnclosureRuntime &) = delete;
+
+    dtv_internal_result submit_bulk_out(
+        std::size_t handle_index, std::uint8_t endpoint,
+        std::span<const unsigned char> bytes, std::uint64_t generation,
+        const dtv_runtime_clock *, const dtv_cancel *, std::uint64_t deadline_ns,
+        std::uint64_t *request_id);
+    dtv_internal_result submit_bulk_in(
+        std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
+        std::uint64_t generation, const dtv_runtime_clock *, const dtv_cancel *,
+        std::uint64_t deadline_ns, std::uint64_t *request_id);
+    dtv_internal_result submit_shared_bulk_in(
+        std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
+        std::uint64_t generation,
+        dtv_internal_result (*)(void *, const UsbRuntimePacket *), void *,
+        std::uint64_t *request_id);
+    dtv_internal_result cancel(std::uint64_t request_id);
+    dtv_internal_result wait_request(std::uint64_t request_id,
+                                     const dtv_runtime_clock *, std::uint64_t deadline_ns,
+                                     UsbRuntimeTerminal *terminal);
+    dtv_internal_result next_completion(UsbRuntimeCompletion *, bool *available);
+    dtv_internal_result take_completion(std::uint64_t request_id,
+                                        UsbRuntimeCompletion *, bool *available);
+    UsbRuntimeStopResult stop(const dtv_runtime_clock *, std::uint64_t deadline_ns);
+    dtv_internal_result join_release();
+    std::size_t worker_count() const;
+
+private:
+    explicit EnclosureRuntime(std::unique_ptr<State>);
+    std::unique_ptr<State> state_;
+};
+
+void set_enclosure_runtime_start_failure_for_test(bool);
+
 class UsbDevice;
 
 class UsbContext {
 public:
     struct State;
     UsbContext();
+    static UsbContext scan_only(std::shared_ptr<UsbTransferBackend> = {});
     ~UsbContext();
     UsbContext(const UsbContext &) = delete;
     UsbContext &operator=(const UsbContext &) = delete;
@@ -78,7 +194,15 @@ public:
     UsbContext &operator=(UsbContext &&) noexcept;
 
     dtv_internal_result result() const;
-    std::vector<UsbDeviceSnapshot> enumerate(dtv_internal_result *result = nullptr) const;
+    std::vector<UsbDeviceSnapshot> enumerate(dtv_internal_result *result = nullptr,
+                                            dtv_token_of_callback = nullptr,
+                                            void *token_user = nullptr) const;
+    std::vector<UsbDeviceSnapshot> enumerate_fds(std::span<const std::int32_t>,
+                                                 dtv_internal_result *result = nullptr) const;
+    dtv_internal_result acquire_claims(std::span<const UsbClaimDeviceInput>,
+                                       const dtv_runtime_clock *, const dtv_cancel *,
+                                       std::uint64_t deadline_ns,
+                                       UsbClaimLeaseGroup *out) const;
     std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &, int interface_number,
                                     const dtv_runtime_clock *clock = nullptr) const;
     std::unique_ptr<UsbDevice> open(const UsbDeviceSnapshot &,

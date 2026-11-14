@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <dtv/spi/device_ops.hpp>
+#include <dtv/spi/feature.hpp>
 
 namespace dtv::spi {
 
@@ -14,3 +15,8 @@ extern const ModelEntry cech_zd1j_model{
 };
 
 }
+
+DTV_PRODUCT(i0_torne_fixture, DTV_FEATURES());
+DTV_MODEL(i0_torne_fixture, cech_zd1j, DTV_FEATURES(), DTV_NO_FIRMWARE,
+          (::dtv::spi::model_information{"CECH-ZD1J", 0x054c, 0x04b2}));
+DTV_DEFINE_MODEL(i0_torne_fixture, cech_zd1j);

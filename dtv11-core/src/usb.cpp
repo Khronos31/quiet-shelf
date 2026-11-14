@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <climits>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <future>
@@ -16,16 +17,19 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <libusb.h>
 
 #include <dtv/internal/result.hpp>
+#include <dtv/internal/clock.hpp>
 
 #include "usb-transfer-backend.hpp"
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -39,6 +43,106 @@ thread_local std::uint64_t active_operation_deadline_ns = 0;
 thread_local bool lifecycle_cleanup_io = false;
 thread_local UsbOperationTerminalReason last_operation_terminal_reason =
     UsbOperationTerminalReason::none;
+
+struct ClaimReservationKey {
+    enum class Kind : std::uint8_t { wrapped_owner, physical_identity, connection_epoch } kind;
+    const void *owner = nullptr;
+    const void *context = nullptr;
+    std::uint64_t epoch = 0;
+    UsbConnectionIdentity identity{};
+
+    bool operator==(const ClaimReservationKey &) const = default;
+};
+
+struct ClaimReservationKeyHash {
+    std::size_t operator()(const ClaimReservationKey &key) const
+    {
+        std::size_t value = std::hash<unsigned>{}(static_cast<unsigned>(key.kind));
+        const auto combine = [&value](std::size_t next) {
+            value ^= next + std::size_t{0x9e3779b9} + (value << 6) + (value >> 2);
+        };
+        combine(std::hash<const void *>{}(key.owner));
+        combine(std::hash<const void *>{}(key.context));
+        combine(std::hash<std::uint64_t>{}(key.epoch));
+        combine(std::hash<std::uint64_t>{}(key.identity.filesystem));
+        combine(std::hash<std::uint64_t>{}(key.identity.inode));
+        combine(std::hash<std::uint64_t>{}(key.identity.device));
+        return value;
+    }
+};
+
+std::mutex claim_reservation_mutex;
+std::unordered_map<ClaimReservationKey, std::uint64_t, ClaimReservationKeyHash>
+    live_claim_reservations;
+std::uint64_t next_claim_reservation = 1;
+std::atomic<bool> fail_next_runtime_start_for_test{false};
+
+struct ClaimReservation {
+    std::uint64_t id = 0;
+    std::vector<ClaimReservationKey> keys;
+
+    ~ClaimReservation()
+    {
+        std::lock_guard lock(claim_reservation_mutex);
+        for (const auto &key : keys) {
+            const auto found = live_claim_reservations.find(key);
+            if (found != live_claim_reservations.end() && found->second == id) {
+                live_claim_reservations.erase(found);
+            }
+        }
+    }
+};
+
+std::unique_ptr<ClaimReservation> reserve_claims(std::vector<ClaimReservationKey> keys,
+                                                 dtv_internal_result *result)
+{
+    try {
+        std::unordered_set<ClaimReservationKey, ClaimReservationKeyHash> unique;
+        unique.reserve(keys.size());
+        for (const auto &key : keys) {
+            if (!unique.insert(key).second) {
+                if (result != nullptr) *result = dtv_internal_result_make(
+                    DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+                return nullptr;
+            }
+        }
+        auto reservation = std::make_unique<ClaimReservation>();
+        reservation->keys = std::move(keys);
+        std::lock_guard lock(claim_reservation_mutex);
+        for (const auto &key : reservation->keys) {
+            if (live_claim_reservations.contains(key)) {
+                if (result != nullptr) *result = dtv_internal_result_make(
+                    DTV_INTERNAL_RESULT_BUSY, 0);
+                return nullptr;
+            }
+        }
+        if (next_claim_reservation == 0) {
+            if (result != nullptr) *result = dtv_internal_result_make(
+                DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+            return nullptr;
+        }
+        reservation->id = next_claim_reservation++;
+        try {
+            for (const auto &key : reservation->keys) {
+                live_claim_reservations.emplace(key, reservation->id);
+            }
+        } catch (...) {
+            for (const auto &key : reservation->keys) {
+                const auto found = live_claim_reservations.find(key);
+                if (found != live_claim_reservations.end() && found->second == reservation->id) {
+                    live_claim_reservations.erase(found);
+                }
+            }
+            throw;
+        }
+        if (result != nullptr) *result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        return reservation;
+    } catch (...) {
+        if (result != nullptr) *result = dtv_internal_result_make(
+            DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+        return nullptr;
+    }
+}
 
 class LibusbTransferBackend final : public UsbTransferBackend {
 public:
@@ -103,6 +207,43 @@ public:
     {
         return libusb_get_device(handle);
     }
+    bool get_connection_identity(libusb_device *device, int descriptor,
+                                 UsbConnectionIdentity *identity) override
+    {
+#if defined(__linux__)
+        /* libusb USBFS wraps allocate fresh device objects, so key the kernel node. */
+        if (identity == nullptr) return false;
+        struct stat info{};
+        int status = -1;
+        if (descriptor >= 0) {
+            status = fstat(descriptor, &info);
+        } else {
+            char path[64]{};
+            std::snprintf(path, sizeof(path), "/dev/bus/usb/%03u/%03u",
+                          get_bus_number(device), get_device_address(device));
+            status = stat(path, &info);
+        }
+        if (status != 0) return false;
+        identity->filesystem = static_cast<std::uint64_t>(info.st_dev);
+        identity->inode = static_cast<std::uint64_t>(info.st_ino);
+        identity->device = static_cast<std::uint64_t>(info.st_rdev);
+        identity->valid = true;
+        return true;
+#else
+        (void)device;
+        (void)descriptor;
+        (void)identity;
+        return false;
+#endif
+    }
+    bool supports_connection_identity() const override
+    {
+#if defined(__linux__)
+        return true;
+#else
+        return false;
+#endif
+    }
     libusb_device *ref_device(libusb_device *device) override
     {
         return libusb_ref_device(device);
@@ -126,7 +267,12 @@ std::shared_ptr<UsbTransferBackend> make_libusb_transfer_backend()
 struct UsbTransferRequest;
 
 struct UsbContext::State {
+    struct DeviceConnection {
+        std::uint64_t token;
+        libusb_device *reference;
+    };
     libusb_context *context = nullptr;
+    bool scan_only = false;
     std::shared_ptr<UsbTransferBackend> backend = make_libusb_transfer_backend();
     dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     std::mutex requests_mutex;
@@ -137,6 +283,10 @@ struct UsbContext::State {
     std::condition_variable lifecycle_condition;
     std::deque<std::function<void()>> lifecycle_jobs;
     std::thread lifecycle_thread;
+    std::unordered_map<libusb_device *, DeviceConnection> device_connections;
+    std::vector<std::pair<UsbConnectionIdentity, std::uint64_t>> connection_epochs;
+    std::uint64_t next_connection_token = 1;
+    std::mutex scan_mutex;
     bool stop_event_thread = false;
     bool stop_lifecycle_thread = false;
     void mark_callbacks_returned();
@@ -192,15 +342,73 @@ struct UsbContext::State {
             }
             event_thread.join();
         }
+        for (const auto &[device, connection] : device_connections) {
+            (void)device;
+            backend->unref_device(connection.reference);
+        }
         if (context != nullptr) {
             backend->exit_context(context);
         }
+    }
+
+    std::uint64_t connection_token(libusb_device *device,
+                                   const UsbConnectionIdentity &identity,
+                                   bool observed_in_full_scan)
+    {
+        const auto found = device_connections.find(device);
+        if (identity.valid) {
+            const auto epoch = std::find_if(connection_epochs.begin(), connection_epochs.end(),
+                [&](const auto &entry) { return entry.first == identity; });
+            if (epoch != connection_epochs.end()) {
+                if (found != device_connections.end()) {
+                    found->second.token = epoch->second;
+                    return epoch->second;
+                }
+                if (observed_in_full_scan) {
+                    auto *reference = backend->ref_device(device);
+                    try {
+                        device_connections.emplace(device,
+                            DeviceConnection{epoch->second, reference});
+                    } catch (...) {
+                        backend->unref_device(reference);
+                        throw;
+                    }
+                }
+                return epoch->second;
+            }
+        }
+        if (found != device_connections.end()) {
+            if (!identity.valid) return found->second.token;
+            if (next_connection_token == 0) throw std::bad_alloc();
+            const auto token = next_connection_token++;
+            connection_epochs.emplace_back(identity, token);
+            found->second.token = token;
+            return token;
+        }
+        if (next_connection_token == 0) throw std::bad_alloc();
+        auto *reference = observed_in_full_scan ? backend->ref_device(device) : nullptr;
+        const auto token = next_connection_token++;
+        bool pointer_inserted = false;
+        try {
+            if (observed_in_full_scan) {
+                pointer_inserted = device_connections.emplace(
+                    device, DeviceConnection{token, reference}).second;
+            }
+            if (identity.valid) connection_epochs.emplace_back(identity, token);
+        } catch (...) {
+            if (pointer_inserted) device_connections.erase(device);
+            if (reference != nullptr) backend->unref_device(reference);
+            throw;
+        }
+        return token;
     }
 };
 
 struct UsbDeviceSnapshot::State {
     std::shared_ptr<UsbContext::State> context;
     libusb_device *device = nullptr;
+    std::shared_ptr<void> owner;
+    UsbConnectionIdentity identity;
     ~State()
     {
         if (device != nullptr) {
@@ -242,6 +450,911 @@ struct UsbHandleLease {
 #endif
     }
 };
+
+struct UsbClaimHandleLease {
+    std::shared_ptr<UsbContext::State> context;
+    std::shared_ptr<UsbHandleLease> wrapped_owner;
+    libusb_device_handle *handle = nullptr;
+    std::vector<int> claimed_interfaces;
+    bool owns_handle = false;
+
+    ~UsbClaimHandleLease()
+    {
+        release();
+    }
+
+    int release() noexcept
+    {
+        int first_error = LIBUSB_SUCCESS;
+        for (auto interface = claimed_interfaces.rbegin();
+             interface != claimed_interfaces.rend(); ++interface) {
+            const int result = context->backend->release_interface(handle, *interface);
+            if (first_error == LIBUSB_SUCCESS && result != LIBUSB_SUCCESS) first_error = result;
+        }
+        claimed_interfaces.clear();
+        if (owns_handle && handle != nullptr) {
+            context->backend->close_handle(handle);
+            handle = nullptr;
+        }
+        wrapped_owner.reset();
+        return first_error;
+    }
+};
+
+struct UsbClaimLeaseGroup::State {
+    std::vector<std::unique_ptr<UsbClaimHandleLease>> handles;
+    std::unique_ptr<ClaimReservation> reservation;
+    std::uint64_t deadline = 0;
+
+    ~State() { release(); }
+
+    int release() noexcept
+    {
+        int first_error = LIBUSB_SUCCESS;
+        while (!handles.empty()) {
+            const int result = handles.back()->release();
+            if (first_error == LIBUSB_SUCCESS && result != LIBUSB_SUCCESS) first_error = result;
+            handles.pop_back();
+        }
+        reservation.reset();
+        return first_error;
+    }
+};
+
+namespace {
+
+dtv_internal_result make_result(std::int32_t code, std::uint32_t detail = 0);
+dtv_internal_result usb_result(int code);
+dtv_internal_result invalid();
+dtv_internal_result claim_checkpoint(const dtv_runtime_clock *clock,
+                                     const dtv_cancel *cancel, std::uint64_t deadline);
+int transfer_error(libusb_transfer_status status);
+
+}
+
+struct EnclosureRuntime::State {
+    struct Request {
+        State *owner = nullptr;
+        std::uint64_t id = 0;
+        std::uint64_t submit_sequence = 0;
+        std::uint64_t generation = 0;
+        std::size_t handle_index = 0;
+        std::uint8_t endpoint = 0;
+        bool input = false;
+        bool continuous = false;
+        bool initial_published = false;
+        dtv_internal_result (*sink)(void *, const UsbRuntimePacket *) = nullptr;
+        void *sink_user = nullptr;
+        std::vector<unsigned char> buffer;
+        dtv_runtime_clock clock{};
+        bool has_clock = false;
+        const dtv_cancel *cancel = nullptr;
+        std::uint64_t deadline = 0;
+        libusb_transfer *transfer = nullptr;
+        libusb_transfer_status status = LIBUSB_TRANSFER_ERROR;
+        int actual_length = 0;
+        bool reached_backend = false;
+        bool callback_received = false;
+        bool terminal_requested = false;
+        bool cancel_sent = false;
+        bool completion_ready = false;
+        UsbRuntimeTerminal terminal = UsbRuntimeTerminal::failed;
+        dtv_internal_result terminal_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        UsbRuntimeCompletion completion;
+    };
+
+    static constexpr std::size_t kRequestCapacity = 64;
+    using ActiveRequest = std::pair<libusb_transfer *, std::shared_ptr<Request>>;
+    UsbClaimLeaseGroup claims;
+    std::shared_ptr<UsbContext::State> context;
+    std::vector<UsbClaimHandleLease *> handles;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Request>> requests;
+    std::array<std::shared_ptr<Request>, kRequestCapacity> active{};
+    std::size_t active_size = 0;
+    std::deque<std::uint64_t> pending;
+    std::array<std::uint64_t, kRequestCapacity> completed{};
+    std::size_t completed_head = 0;
+    std::size_t completed_size = 0;
+    std::thread worker;
+    std::uint64_t next_request_id = 1;
+    std::uint64_t next_submit_sequence = 1;
+    std::uint64_t next_completion_sequence = 1;
+    bool stopping = false;
+    bool exited = true;
+    bool started = false;
+    bool released = false;
+    std::mutex join_mutex;
+
+    bool has_active_locked() const { return active_size != 0; }
+
+    static void transfer_completed(libusb_transfer *transfer)
+    {
+        auto *request = static_cast<Request *>(transfer->user_data);
+        std::lock_guard lock(request->owner->mutex);
+        request->status = transfer->status;
+        request->actual_length = transfer->actual_length;
+        request->callback_received = true;
+        request->owner->condition.notify_all();
+    }
+
+    void push_completed_locked(const std::shared_ptr<Request> &request,
+                               UsbRuntimeTerminal terminal, dtv_internal_result result,
+                               std::size_t actual_length, bool include_bytes)
+    {
+        if (request->completion_ready) return;
+        request->terminal = terminal;
+        request->terminal_result = result;
+        request->completion.request_id = request->id;
+        request->completion.submit_sequence = request->submit_sequence;
+        request->completion.completion_sequence = next_completion_sequence++;
+        request->completion.generation = request->generation;
+        request->completion.handle_index = request->handle_index;
+        request->completion.endpoint = request->endpoint;
+        request->completion.terminal = terminal;
+        request->completion.result = result;
+        request->completion.actual_length = actual_length;
+        request->completion.reached_backend = request->reached_backend;
+        if (include_bytes && request->continuous) {
+            const auto size = (std::min)(actual_length, request->buffer.size());
+            request->completion.bytes.assign(request->buffer.begin(), request->buffer.begin() + size);
+        } else if (include_bytes) {
+            const auto size = (std::min)(actual_length, request->buffer.size());
+            request->buffer.resize(size);
+            request->completion.bytes = std::move(request->buffer);
+        } else {
+            request->buffer.clear();
+        }
+        request->completion_ready = true;
+        request->initial_published = true;
+        const auto tail = (completed_head + completed_size) % completed.size();
+        completed[tail] = request->id;
+        ++completed_size;
+        condition.notify_all();
+    }
+
+    void finish_without_transfer(const std::shared_ptr<Request> &request,
+                                 UsbRuntimeTerminal terminal,
+                                 dtv_internal_result result)
+    {
+        bool notify_sink = false;
+        {
+            std::lock_guard lock(mutex);
+            if (request->continuous && request->initial_published) {
+                request->terminal_requested = true;
+                request->terminal = terminal;
+                request->terminal_result = result;
+                notify_sink = true;
+                condition.notify_all();
+            } else {
+                push_completed_locked(request, terminal, result, 0, false);
+            }
+        }
+        if (notify_sink) {
+            UsbRuntimePacket packet;
+            packet.request_id = request->id;
+            packet.submit_sequence = request->submit_sequence;
+            packet.generation = request->generation;
+            packet.handle_index = request->handle_index;
+            packet.endpoint = request->endpoint;
+            packet.terminal = terminal;
+            packet.result = result;
+            (void)call_callback([&] { return request->sink(request->sink_user, &packet); });
+        }
+    }
+
+    void mark_terminal_locked(const std::shared_ptr<Request> &request,
+                              UsbRuntimeTerminal terminal, dtv_internal_result result)
+    {
+        if (request->terminal_requested || (request->completion_ready && !request->continuous)) return;
+        request->terminal_requested = true;
+        request->terminal = terminal;
+        request->terminal_result = result;
+        condition.notify_all();
+    }
+
+    dtv_internal_result queue_request(
+        std::size_t handle_index, std::uint8_t endpoint, bool input,
+        std::span<const unsigned char> output, std::size_t input_capacity,
+        std::uint64_t generation, const dtv_runtime_clock *clock,
+        const dtv_cancel *cancel, std::uint64_t deadline, std::uint64_t *request_id)
+    {
+        if (request_id == nullptr || handle_index >= handles.size() ||
+            (input ? input_capacity > INT_MAX : output.size() > INT_MAX)) return invalid();
+        try {
+            auto request = std::make_shared<Request>();
+            request->owner = this;
+            request->handle_index = handle_index;
+            request->endpoint = endpoint;
+            request->input = input;
+            request->generation = generation;
+            request->deadline = deadline;
+            request->cancel = cancel;
+            if (clock != nullptr) {
+                request->clock = *clock;
+                request->has_clock = true;
+            }
+            if (input) request->buffer.resize(input_capacity);
+            else request->buffer.assign(output.begin(), output.end());
+            std::lock_guard lock(mutex);
+            if (stopping || !started || requests.size() >= kRequestCapacity ||
+                next_request_id == 0 || next_submit_sequence == 0) {
+                return stopping ? make_result(DTV_INTERNAL_RESULT_NOT_READY)
+                                : make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+            }
+            request->id = next_request_id++;
+            request->submit_sequence = next_submit_sequence++;
+            requests.emplace(request->id, request);
+            try {
+                pending.push_back(request->id);
+            } catch (...) {
+                requests.erase(request->id);
+                throw;
+            }
+            *request_id = request->id;
+            condition.notify_all();
+            return make_result(DTV_INTERNAL_RESULT_OK);
+        } catch (...) {
+            return exception_result();
+        }
+    }
+
+    dtv_internal_result queue_shared_request(
+        std::size_t handle_index, std::uint8_t endpoint, std::size_t input_capacity,
+        std::uint64_t generation,
+        dtv_internal_result (*sink)(void *, const UsbRuntimePacket *), void *sink_user,
+        std::uint64_t *request_id)
+    {
+        if (sink == nullptr || input_capacity == 0 || request_id == nullptr ||
+            handle_index >= handles.size() || input_capacity > INT_MAX) return invalid();
+        try {
+            auto request = std::make_shared<Request>();
+            request->owner = this;
+            request->handle_index = handle_index;
+            request->endpoint = endpoint;
+            request->input = true;
+            request->continuous = true;
+            request->sink = sink;
+            request->sink_user = sink_user;
+            request->generation = generation;
+            request->buffer.resize(input_capacity);
+            request->completion.bytes.resize(input_capacity);
+            std::lock_guard lock(mutex);
+            if (stopping || !started || requests.size() >= kRequestCapacity ||
+                next_request_id == 0 || next_submit_sequence == 0) {
+                return stopping ? make_result(DTV_INTERNAL_RESULT_NOT_READY)
+                                : make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+            }
+            request->id = next_request_id++;
+            request->submit_sequence = next_submit_sequence++;
+            requests.emplace(request->id, request);
+            try { pending.push_back(request->id); }
+            catch (...) { requests.erase(request->id); throw; }
+            *request_id = request->id;
+            condition.notify_all();
+            return make_result(DTV_INTERNAL_RESULT_OK);
+        } catch (...) {
+            return exception_result();
+        }
+    }
+
+    void check_deadlines_and_cancel_tokens()
+    {
+        std::array<std::shared_ptr<Request>, kRequestCapacity> current{};
+        std::size_t current_size = 0;
+        {
+            std::lock_guard lock(mutex);
+            for (const auto &[id, request] : requests) {
+                (void)id;
+                if (!request->completion_ready && !request->terminal_requested) {
+                    current[current_size++] = request;
+                }
+            }
+        }
+        for (std::size_t index = 0; index < current_size; ++index) {
+            const auto &request = current[index];
+            const auto *clock = request->has_clock ? &request->clock : nullptr;
+            if (request->cancel != nullptr && clock != nullptr && clock->is_cancelled != nullptr) {
+                std::uint32_t cancelled = 0;
+                const auto result = call_callback([&] {
+                    return clock->is_cancelled(clock->user, request->cancel, &cancelled);
+                });
+                std::lock_guard lock(mutex);
+                if (result.code != DTV_INTERNAL_RESULT_OK) {
+                    mark_terminal_locked(request, UsbRuntimeTerminal::failed, result);
+                    continue;
+                }
+                if (cancelled != 0) {
+                    mark_terminal_locked(request, UsbRuntimeTerminal::cancelled,
+                                         make_result(DTV_INTERNAL_RESULT_TIMEOUT));
+                    continue;
+                }
+            }
+            if (request->deadline != 0 && request->deadline != UINT64_MAX) {
+                const auto *runtime_clock = request->has_clock ? &request->clock
+                                                               : system_runtime_clock();
+                if (runtime_clock->monotonic_now_ns != nullptr) {
+                    std::uint64_t now = 0;
+                    const auto result = call_callback([&] {
+                        now = runtime_clock->monotonic_now_ns(runtime_clock->user);
+                        return make_result(DTV_INTERNAL_RESULT_OK);
+                    });
+                    std::lock_guard lock(mutex);
+                    if (result.code != DTV_INTERNAL_RESULT_OK) {
+                        mark_terminal_locked(request, UsbRuntimeTerminal::failed, result);
+                    } else if (now >= request->deadline) {
+                        mark_terminal_locked(request, UsbRuntimeTerminal::deadline,
+                                             make_result(DTV_INTERNAL_RESULT_TIMEOUT));
+                    }
+                }
+            }
+        }
+    }
+
+    void process_pending()
+    {
+        for (;;) {
+            std::shared_ptr<Request> request;
+            {
+                std::lock_guard lock(mutex);
+                if (pending.empty()) return;
+                const auto id = pending.front();
+                pending.pop_front();
+                const auto found = requests.find(id);
+                if (found == requests.end()) continue;
+                request = found->second;
+                if (stopping && !request->terminal_requested) {
+                    mark_terminal_locked(request, UsbRuntimeTerminal::stopped,
+                                         make_result(DTV_INTERNAL_RESULT_NOT_READY));
+                }
+                if (request->terminal_requested) {
+                    push_completed_locked(request, request->terminal, request->terminal_result,
+                                          0, false);
+                    continue;
+                }
+            }
+            auto result = claim_checkpoint(request->has_clock ? &request->clock : nullptr,
+                                           request->cancel, request->deadline);
+            if (result.code != DTV_INTERNAL_RESULT_OK) {
+                auto terminal = UsbRuntimeTerminal::failed;
+                if (result.code == DTV_INTERNAL_RESULT_TIMEOUT) {
+                    terminal = UsbRuntimeTerminal::deadline;
+                    const auto *clock = request->has_clock ? &request->clock : system_runtime_clock();
+                    if (request->cancel != nullptr && clock->is_cancelled != nullptr) {
+                        std::uint32_t cancelled = 0;
+                        const auto cancel_result = call_callback([&] {
+                            return clock->is_cancelled(clock->user, request->cancel, &cancelled);
+                        });
+                        if (cancel_result.code != DTV_INTERNAL_RESULT_OK) {
+                            result = cancel_result;
+                            terminal = UsbRuntimeTerminal::failed;
+                        } else if (cancelled != 0) {
+                            terminal = UsbRuntimeTerminal::cancelled;
+                        }
+                    }
+                }
+                finish_without_transfer(request, terminal, result);
+                continue;
+            }
+            auto *lease = handles[request->handle_index];
+            libusb_transfer *transfer = nullptr;
+            try {
+                transfer = context->backend->allocate_transfer();
+            } catch (...) {
+                finish_without_transfer(request, UsbRuntimeTerminal::failed, exception_result());
+                continue;
+            }
+            if (transfer == nullptr) {
+                finish_without_transfer(request, UsbRuntimeTerminal::failed,
+                                        make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED));
+                continue;
+            }
+            request->transfer = transfer;
+            libusb_fill_bulk_transfer(transfer, lease->handle, request->endpoint,
+                request->buffer.data(), static_cast<int>(request->buffer.size()),
+                transfer_completed, request.get(), 0);
+            {
+                std::lock_guard lock(mutex);
+                const auto slot = std::find_if(active.begin(), active.end(),
+                    [](const auto &entry) { return !entry; });
+                if (slot == active.end()) {
+                    request->transfer = nullptr;
+                    try { context->backend->free_transfer(transfer); } catch (...) {}
+                    push_completed_locked(request, UsbRuntimeTerminal::failed,
+                        make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED), 0, false);
+                    continue;
+                }
+                *slot = request;
+                ++active_size;
+            }
+            int status = LIBUSB_ERROR_OTHER;
+            try {
+                status = context->backend->submit_transfer(transfer);
+            } catch (...) {
+                status = LIBUSB_ERROR_OTHER;
+            }
+            if (status != LIBUSB_SUCCESS) {
+                {
+                    std::lock_guard lock(mutex);
+                    const auto slot = std::find_if(active.begin(), active.end(),
+                        [&](const auto &entry) { return entry && entry->transfer == transfer; });
+                    if (slot != active.end()) {
+                        slot->reset();
+                        --active_size;
+                    }
+                    request->transfer = nullptr;
+                }
+                dtv_internal_result result = usb_result(status);
+                try { context->backend->free_transfer(transfer); }
+                catch (...) { result = exception_result(); }
+                finish_without_transfer(request, UsbRuntimeTerminal::failed, result);
+            } else {
+                std::lock_guard lock(mutex);
+                request->reached_backend = true;
+            }
+        }
+    }
+
+    void request_cancellations()
+    {
+        std::array<ActiveRequest, kRequestCapacity> cancel_list{};
+        std::size_t cancel_count = 0;
+        {
+            std::lock_guard lock(mutex);
+            for (const auto &request : active) {
+                if (!request) continue;
+                if (request->terminal_requested && !request->cancel_sent) {
+                    request->cancel_sent = true;
+                    cancel_list[cancel_count++] = {request->transfer, request};
+                }
+            }
+        }
+        for (std::size_t index = 0; index < cancel_count; ++index) {
+            const auto &[transfer, request] = cancel_list[index];
+            try {
+                (void)context->backend->cancel_transfer(transfer);
+            } catch (...) {
+                std::lock_guard lock(mutex);
+                mark_terminal_locked(request, UsbRuntimeTerminal::failed, exception_result());
+            }
+        }
+    }
+
+    void retire_callbacks()
+    {
+        std::array<ActiveRequest, kRequestCapacity> retired{};
+        std::size_t retired_count = 0;
+        {
+            std::lock_guard lock(mutex);
+            for (auto &request : active) {
+                if (!request) continue;
+                if (!request->callback_received) {
+                    continue;
+                }
+                if (request->continuous) {
+                    const bool earlier_pending = std::any_of(active.begin(), active.end(),
+                        [&](const auto &candidate) {
+                            return candidate && candidate->continuous &&
+                                candidate->handle_index == request->handle_index &&
+                                candidate->endpoint == request->endpoint &&
+                                candidate->submit_sequence < request->submit_sequence;
+                        });
+                    if (earlier_pending) continue;
+                }
+                retired[retired_count++] = {request->transfer, request};
+                request->transfer = nullptr;
+                request.reset();
+                --active_size;
+            }
+        }
+        for (std::size_t index = 0; index < retired_count; ++index) {
+            const auto &[transfer, request] = retired[index];
+            auto free_result = make_result(DTV_INTERNAL_RESULT_OK);
+            try { context->backend->free_transfer(transfer); }
+            catch (...) { free_result = exception_result(); }
+            UsbRuntimeTerminal terminal;
+            dtv_internal_result result;
+            {
+            std::unique_lock lock(mutex);
+            if (free_result.code != DTV_INTERNAL_RESULT_OK) {
+                terminal = UsbRuntimeTerminal::failed;
+                result = free_result;
+            } else if (request->terminal_requested) {
+                terminal = request->terminal;
+                result = request->terminal_result;
+            } else if (request->status == LIBUSB_TRANSFER_COMPLETED) {
+                terminal = UsbRuntimeTerminal::completed;
+                result = make_result(DTV_INTERNAL_RESULT_OK,
+                                     static_cast<std::uint32_t>((std::max)(request->actual_length, 0)));
+            } else if (request->status == LIBUSB_TRANSFER_CANCELLED) {
+                terminal = UsbRuntimeTerminal::endpoint_cancelled;
+                result = usb_result(LIBUSB_ERROR_INTERRUPTED);
+            } else {
+                terminal = UsbRuntimeTerminal::failed;
+                result = usb_result(transfer_error(request->status));
+            }
+            if (!request->continuous || !request->initial_published ||
+                terminal != UsbRuntimeTerminal::completed || stopping || request->terminal_requested) {
+                if (!request->continuous || !request->initial_published) {
+                    if (request->continuous && terminal == UsbRuntimeTerminal::completed &&
+                        !stopping && !request->terminal_requested) {
+                        UsbRuntimePacket packet;
+                        packet.request_id = request->id;
+                        packet.submit_sequence = request->submit_sequence;
+                        packet.generation = request->generation;
+                        packet.handle_index = request->handle_index;
+                        packet.endpoint = request->endpoint;
+                        packet.actual_length = static_cast<std::size_t>((std::max)(request->actual_length, 0));
+                        packet.bytes = std::span<const unsigned char>(request->buffer.data(),
+                            (std::min)(packet.actual_length, request->buffer.size()));
+                        lock.unlock();
+                        const auto sink_result = call_callback([&] {
+                            return request->sink(request->sink_user, &packet);
+                        });
+                        lock.lock();
+                        if (sink_result.code != DTV_INTERNAL_RESULT_OK) {
+                            terminal = UsbRuntimeTerminal::failed;
+                            result = sink_result;
+                        }
+                    }
+                    push_completed_locked(request, terminal, result,
+                        static_cast<std::size_t>((std::max)(request->actual_length, 0)),
+                        request->input && terminal == UsbRuntimeTerminal::completed);
+                    if (request->continuous && terminal == UsbRuntimeTerminal::completed &&
+                        !stopping && !request->terminal_requested && next_submit_sequence != 0) {
+                        request->submit_sequence = next_submit_sequence++;
+                        request->callback_received = false;
+                        request->actual_length = 0;
+                        try { pending.push_back(request->id); }
+                        catch (...) {
+                            request->terminal_requested = true;
+                            request->terminal = UsbRuntimeTerminal::failed;
+                            request->terminal_result = exception_result();
+                        }
+                        condition.notify_all();
+                    }
+                } else if (request->continuous) {
+                    request->terminal_requested = true;
+                    request->terminal = terminal;
+                    request->terminal_result = result;
+                    condition.notify_all();
+                    UsbRuntimePacket packet;
+                    packet.request_id = request->id;
+                    packet.submit_sequence = request->submit_sequence;
+                    packet.generation = request->generation;
+                    packet.handle_index = request->handle_index;
+                    packet.endpoint = request->endpoint;
+                    packet.terminal = terminal;
+                    packet.result = result;
+                    lock.unlock();
+                    (void)call_callback([&] { return request->sink(request->sink_user, &packet); });
+                }
+                continue;
+            }
+            }
+            UsbRuntimePacket packet;
+            packet.request_id = request->id;
+            packet.submit_sequence = request->submit_sequence;
+            packet.generation = request->generation;
+            packet.handle_index = request->handle_index;
+            packet.endpoint = request->endpoint;
+            packet.actual_length = static_cast<std::size_t>((std::max)(request->actual_length, 0));
+            packet.bytes = std::span<const unsigned char>(request->buffer.data(),
+                (std::min)(packet.actual_length, request->buffer.size()));
+            const auto sink_result = call_callback([&] { return request->sink(request->sink_user, &packet); });
+            std::lock_guard lock(mutex);
+            if (sink_result.code != DTV_INTERNAL_RESULT_OK || stopping || request->terminal_requested) {
+                request->terminal_requested = true;
+                request->terminal = stopping ? UsbRuntimeTerminal::stopped : UsbRuntimeTerminal::failed;
+                request->terminal_result = stopping
+                    ? make_result(DTV_INTERNAL_RESULT_NOT_READY) : sink_result;
+                condition.notify_all();
+                continue;
+            }
+            if (next_submit_sequence == 0) {
+                request->terminal_requested = true;
+                request->terminal = UsbRuntimeTerminal::failed;
+                request->terminal_result = make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+                condition.notify_all();
+                continue;
+            }
+            request->submit_sequence = next_submit_sequence++;
+            request->callback_received = false;
+            request->cancel_sent = false;
+            request->actual_length = 0;
+            try {
+                pending.push_back(request->id);
+            } catch (...) {
+                request->terminal_requested = true;
+                request->terminal = UsbRuntimeTerminal::failed;
+                request->terminal_result = exception_result();
+                condition.notify_all();
+            }
+            condition.notify_all();
+        }
+    }
+
+    void run() noexcept
+    {
+        for (;;) {
+            check_deadlines_and_cancel_tokens();
+            process_pending();
+            request_cancellations();
+            retire_callbacks();
+            {
+                std::unique_lock lock(mutex);
+                if (stopping && !has_active_locked() && pending.empty()) {
+                    exited = true;
+                    condition.notify_all();
+                    return;
+                }
+                if (!has_active_locked()) {
+                    condition.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                        return stopping || !pending.empty() || has_active_locked();
+                    });
+                    continue;
+                }
+            }
+            timeval timeout{0, 10000};
+            try {
+                const int result = context->backend->handle_events(context->context, &timeout);
+                if (result != LIBUSB_SUCCESS) {
+                    std::lock_guard lock(mutex);
+                    for (const auto &request : active) {
+                        if (!request) continue;
+                        mark_terminal_locked(request, UsbRuntimeTerminal::failed,
+                                             usb_result(result));
+                    }
+                }
+            } catch (...) {
+                std::lock_guard lock(mutex);
+                for (const auto &request : active) {
+                    if (!request) continue;
+                    mark_terminal_locked(request, UsbRuntimeTerminal::failed, exception_result());
+                }
+            }
+            retire_callbacks();
+        }
+    }
+};
+
+EnclosureRuntime::EnclosureRuntime(std::unique_ptr<State> state) : state_(std::move(state)) {}
+
+std::unique_ptr<EnclosureRuntime> EnclosureRuntime::start(
+    UsbClaimLeaseGroup &&claims, dtv_internal_result *result)
+{
+    if (!claims.state_ || claims.state_->handles.empty()) {
+        if (result != nullptr) *result = invalid();
+        return nullptr;
+    }
+    if (fail_next_runtime_start_for_test.exchange(false, std::memory_order_acq_rel)) {
+        if (result != nullptr) *result = make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+        return nullptr;
+    }
+    try {
+        auto state = std::make_unique<State>();
+        state->claims = std::move(claims);
+        state->handles.reserve(state->claims.state_->handles.size());
+        for (const auto &lease : state->claims.state_->handles) {
+            if (!lease || lease->handle == nullptr || !lease->context ||
+                lease->context->context == nullptr || !lease->context->scan_only) {
+                if (result != nullptr) *result = invalid();
+                return nullptr;
+            }
+            if (!state->context) state->context = lease->context;
+            if (state->context != lease->context) {
+                if (result != nullptr) *result = invalid();
+                return nullptr;
+            }
+            state->handles.push_back(lease.get());
+        }
+        auto runtime = std::unique_ptr<EnclosureRuntime>(new EnclosureRuntime(std::move(state)));
+        auto *runtime_state = runtime->state_.get();
+        {
+            std::lock_guard lock(runtime_state->mutex);
+            runtime_state->started = true;
+            runtime_state->exited = false;
+        }
+        try {
+            runtime_state->worker = std::thread([runtime_state] { runtime_state->run(); });
+        } catch (...) {
+            std::lock_guard lock(runtime_state->mutex);
+            runtime_state->started = false;
+            runtime_state->exited = true;
+            if (result != nullptr) *result = exception_result();
+            return nullptr;
+        }
+        if (result != nullptr) *result = make_result(DTV_INTERNAL_RESULT_OK, 0);
+        return runtime;
+    } catch (...) {
+        if (result != nullptr) *result = exception_result();
+        return nullptr;
+    }
+}
+
+void set_enclosure_runtime_start_failure_for_test(bool fail)
+{
+    fail_next_runtime_start_for_test.store(fail, std::memory_order_release);
+}
+
+EnclosureRuntime::~EnclosureRuntime()
+{
+    if (!state_) return;
+    auto stopped = stop(nullptr, UINT64_MAX);
+    (void)stopped;
+    (void)join_release();
+}
+
+dtv_internal_result EnclosureRuntime::submit_bulk_out(
+    std::size_t handle_index, std::uint8_t endpoint, std::span<const unsigned char> bytes,
+    std::uint64_t generation, const dtv_runtime_clock *clock, const dtv_cancel *cancel,
+    std::uint64_t deadline_ns, std::uint64_t *request_id)
+{
+    return state_->queue_request(handle_index, endpoint, false, bytes, 0, generation,
+                                 clock, cancel, deadline_ns, request_id);
+}
+
+dtv_internal_result EnclosureRuntime::submit_bulk_in(
+    std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
+    std::uint64_t generation, const dtv_runtime_clock *clock, const dtv_cancel *cancel,
+    std::uint64_t deadline_ns, std::uint64_t *request_id)
+{
+    return state_->queue_request(handle_index, endpoint, true, {}, capacity, generation,
+                                 clock, cancel, deadline_ns, request_id);
+}
+
+dtv_internal_result EnclosureRuntime::submit_shared_bulk_in(
+    std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
+    std::uint64_t generation,
+    dtv_internal_result (*sink)(void *, const UsbRuntimePacket *), void *sink_user,
+    std::uint64_t *request_id)
+{
+    return state_->queue_shared_request(handle_index, endpoint, capacity, generation,
+                                        sink, sink_user, request_id);
+}
+
+dtv_internal_result EnclosureRuntime::cancel(std::uint64_t request_id)
+{
+    std::lock_guard lock(state_->mutex);
+    const auto found = state_->requests.find(request_id);
+    if (found == state_->requests.end()) return invalid();
+    state_->mark_terminal_locked(found->second, UsbRuntimeTerminal::cancelled,
+                                 make_result(DTV_INTERNAL_RESULT_TIMEOUT, 0));
+    return make_result(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRuntime::wait_request(
+    std::uint64_t request_id, const dtv_runtime_clock *clock, std::uint64_t deadline_ns,
+    UsbRuntimeTerminal *terminal)
+{
+    if (terminal == nullptr) return invalid();
+    std::unique_lock lock(state_->mutex);
+    const auto found = state_->requests.find(request_id);
+    if (found == state_->requests.end()) return invalid();
+    const auto request = found->second;
+    for (;;) {
+        if (request->completion_ready) {
+            *terminal = request->terminal;
+            return request->terminal_result;
+        }
+        if (request->terminal_requested) {
+            *terminal = request->terminal;
+            return request->terminal_result;
+        }
+        lock.unlock();
+        const auto checkpoint = claim_checkpoint(clock, nullptr, deadline_ns);
+        lock.lock();
+        if (checkpoint.code != DTV_INTERNAL_RESULT_OK) return checkpoint;
+        state_->condition.wait_for(lock, std::chrono::milliseconds(5));
+    }
+}
+
+dtv_internal_result EnclosureRuntime::next_completion(UsbRuntimeCompletion *completion,
+                                                       bool *available)
+{
+    if (completion == nullptr || available == nullptr) return invalid();
+    std::lock_guard lock(state_->mutex);
+    *available = false;
+    if (state_->completed_size == 0) return make_result(DTV_INTERNAL_RESULT_OK, 0);
+    const auto id = state_->completed[state_->completed_head];
+    state_->completed_head = (state_->completed_head + 1) % state_->completed.size();
+    --state_->completed_size;
+    const auto found = state_->requests.find(id);
+    if (found == state_->requests.end()) return make_result(DTV_INTERNAL_RESULT_USB_IO, 0);
+    *completion = std::move(found->second->completion);
+    if (found->second->continuous) {
+        found->second->completion_ready = false;
+        found->second->completion.bytes.clear();
+    } else {
+        state_->requests.erase(found);
+    }
+    *available = true;
+    return make_result(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRuntime::take_completion(std::uint64_t request_id,
+                                                        UsbRuntimeCompletion *completion,
+                                                        bool *available)
+{
+    if (request_id == 0 || completion == nullptr || available == nullptr) return invalid();
+    std::lock_guard lock(state_->mutex);
+    *available = false;
+    const auto found = state_->requests.find(request_id);
+    if (found == state_->requests.end()) return invalid();
+    if (!found->second->completion_ready) return make_result(DTV_INTERNAL_RESULT_OK, 0);
+    std::size_t position = state_->completed_size;
+    for (std::size_t index = 0; index < state_->completed_size; ++index) {
+        const auto slot = (state_->completed_head + index) % state_->completed.size();
+        if (state_->completed[slot] == request_id) {
+            position = index;
+            break;
+        }
+    }
+    if (position == state_->completed_size) return make_result(DTV_INTERNAL_RESULT_INTERNAL, 0);
+    *completion = std::move(found->second->completion);
+    for (std::size_t index = position; index + 1 < state_->completed_size; ++index) {
+        const auto current = (state_->completed_head + index) % state_->completed.size();
+        const auto next = (state_->completed_head + index + 1) % state_->completed.size();
+        state_->completed[current] = state_->completed[next];
+    }
+    --state_->completed_size;
+    state_->requests.erase(found);
+    *available = true;
+    return make_result(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+UsbRuntimeStopResult EnclosureRuntime::stop(const dtv_runtime_clock *clock,
+                                             std::uint64_t deadline_ns)
+{
+    UsbRuntimeStopResult result;
+    {
+        std::lock_guard lock(state_->mutex);
+        state_->stopping = true;
+        for (const auto &[id, request] : state_->requests) {
+            (void)id;
+            if (!request->completion_ready || request->continuous) {
+                state_->mark_terminal_locked(request, UsbRuntimeTerminal::stopped,
+                    make_result(DTV_INTERNAL_RESULT_NOT_READY, 0));
+            }
+        }
+        state_->condition.notify_all();
+    }
+    std::unique_lock lock(state_->mutex);
+    while (!state_->exited) {
+        lock.unlock();
+        const auto checkpoint = claim_checkpoint(clock, nullptr, deadline_ns);
+        lock.lock();
+        if (checkpoint.code != DTV_INTERNAL_RESULT_OK) {
+            result.pending = true;
+            result.result = checkpoint;
+            return result;
+        }
+        state_->condition.wait_for(lock, std::chrono::milliseconds(5));
+    }
+    lock.unlock();
+    result.result = join_release();
+    return result;
+}
+
+dtv_internal_result EnclosureRuntime::join_release()
+{
+    std::lock_guard join_lock(state_->join_mutex);
+    {
+        std::lock_guard lock(state_->mutex);
+        if (!state_->exited) return make_result(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    }
+    if (state_->worker.joinable()) state_->worker.join();
+    if (state_->released) return make_result(DTV_INTERNAL_RESULT_OK, 0);
+    state_->released = true;
+    return state_->claims.release();
+}
+
+std::size_t EnclosureRuntime::worker_count() const
+{
+    std::lock_guard lock(state_->mutex);
+    return state_->started && !state_->exited ? 1 : 0;
+}
 
 struct UsbDevice::State {
     struct IoBinding {
@@ -315,7 +1428,7 @@ void UsbContext::State::mark_callbacks_returned()
 
 namespace {
 
-dtv_internal_result make_result(std::int32_t code, std::uint32_t detail = 0)
+dtv_internal_result make_result(std::int32_t code, std::uint32_t detail)
 {
     return dtv_internal_result_make(code, detail);
 }
@@ -326,6 +1439,40 @@ dtv_internal_result usb_result(int code)
         return make_result(DTV_INTERNAL_RESULT_TIMEOUT, static_cast<std::uint32_t>(-code));
     }
     return make_result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(-code));
+}
+
+dtv_internal_result claim_result(int code)
+{
+    if (code == LIBUSB_ERROR_BUSY) {
+        return make_result(DTV_INTERNAL_RESULT_BUSY, static_cast<std::uint32_t>(-code));
+    }
+    return usb_result(code);
+}
+
+dtv_internal_result invalid();
+
+dtv_internal_result claim_checkpoint(const dtv_runtime_clock *clock,
+                                     const dtv_cancel *cancel, std::uint64_t deadline)
+{
+    const auto *runtime = clock == nullptr ? system_runtime_clock() : clock;
+    if (cancel != nullptr && runtime->is_cancelled != nullptr) {
+        std::uint32_t cancelled = 0;
+        const auto result = call_callback([&] {
+            return runtime->is_cancelled(runtime->user, cancel, &cancelled);
+        });
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        if (cancelled != 0) return make_result(DTV_INTERNAL_RESULT_TIMEOUT);
+    }
+    if (deadline == 0 || deadline == UINT64_MAX) return make_result(DTV_INTERNAL_RESULT_OK);
+    if (runtime->monotonic_now_ns == nullptr) return invalid();
+    std::uint64_t now = 0;
+    const auto result = call_callback([&] {
+        now = runtime->monotonic_now_ns(runtime->user);
+        return make_result(DTV_INTERNAL_RESULT_OK);
+    });
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+    return now >= deadline ? make_result(DTV_INTERNAL_RESULT_TIMEOUT)
+                           : make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 enum class TimeoutConversion {
@@ -843,6 +1990,30 @@ dtv_usb_io make_io(void *user, const dtv_runtime_clock *clock)
 
 }
 
+UsbClaimLeaseGroup::UsbClaimLeaseGroup() : state_(std::make_unique<State>()) {}
+UsbClaimLeaseGroup::~UsbClaimLeaseGroup() = default;
+UsbClaimLeaseGroup::UsbClaimLeaseGroup(UsbClaimLeaseGroup &&) noexcept = default;
+UsbClaimLeaseGroup &UsbClaimLeaseGroup::operator=(UsbClaimLeaseGroup &&) noexcept = default;
+
+dtv_internal_result UsbClaimLeaseGroup::release() noexcept
+{
+    if (!state_) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    const int result = state_->release();
+    return result == LIBUSB_SUCCESS ? dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0)
+                                   : dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO,
+                                                              static_cast<std::uint32_t>(-result));
+}
+
+std::uint64_t UsbClaimLeaseGroup::deadline_ns() const
+{
+    return state_ ? state_->deadline : 0;
+}
+
+std::size_t UsbClaimLeaseGroup::size() const
+{
+    return state_ ? state_->handles.size() : 0;
+}
+
 UsbOperationTerminalReason current_usb_terminal_reason()
 {
     return last_operation_terminal_reason;
@@ -880,6 +2051,18 @@ UsbContext::UsbContext() : state_(std::make_shared<State>())
     }
 }
 
+UsbContext UsbContext::scan_only(std::shared_ptr<UsbTransferBackend> backend)
+{
+    auto state = std::make_shared<State>();
+    state->scan_only = true;
+    if (backend) state->backend = std::move(backend);
+    const int result = state->backend->init_context(&state->context);
+    if (result != LIBUSB_SUCCESS) {
+        state->result = usb_result(result);
+    }
+    return UsbContext(std::move(state));
+}
+
 UsbContext::~UsbContext() = default;
 UsbContext::UsbContext(std::shared_ptr<State> state) : state_(std::move(state)) {}
 UsbContext::UsbContext(UsbContext &&) noexcept = default;
@@ -890,7 +2073,9 @@ dtv_internal_result UsbContext::result() const
     return state_ ? state_->result : no_context();
 }
 
-std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result) const
+std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result,
+                                                    dtv_token_of_callback token_callback,
+                                                    void *token_user) const
 {
     std::vector<UsbDeviceSnapshot> snapshots;
     if (!state_ || state_->context == nullptr) {
@@ -899,18 +2084,35 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
         }
         return snapshots;
     }
+    std::unique_lock scan_lock(state_->scan_mutex, std::defer_lock);
+    if (state_->scan_only) scan_lock.lock();
     libusb_device **devices = nullptr;
-    const ssize_t count = libusb_get_device_list(state_->context, &devices);
+    const ssize_t count = state_->backend->get_device_list(state_->context, &devices);
     if (count < 0) {
         if (result != nullptr) {
             *result = usb_result(static_cast<int>(count));
         }
         return snapshots;
     }
+    std::unordered_set<libusb_device *> observed_devices;
+    std::unordered_set<std::uint64_t> observed_connections;
     try {
+        if (state_->scan_only) {
+            observed_devices.reserve(static_cast<std::size_t>(count));
+            observed_connections.reserve(static_cast<std::size_t>(count));
+        }
         for (ssize_t i = 0; i < count; ++i) {
+            if (state_->scan_only) observed_devices.insert(devices[i]);
+            const auto selection_token = token_callback == nullptr
+                ? dtv_usb_token{0} : token_callback(token_user, devices[i]);
             libusb_device_descriptor descriptor{};
-            if (state_->backend->get_device_descriptor(devices[i], &descriptor) != LIBUSB_SUCCESS) {
+            const int descriptor_result = state_->backend->get_device_descriptor(devices[i], &descriptor);
+            if (descriptor_result != LIBUSB_SUCCESS) {
+                if (state_->scan_only) {
+                    state_->backend->free_device_list(devices, 1);
+                    if (result != nullptr) *result = usb_result(descriptor_result);
+                    return {};
+                }
                 continue;
             }
             UsbDeviceSnapshot snapshot{};
@@ -924,16 +2126,44 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             snapshot.device_address = state_->backend->get_device_address(devices[i]);
             snapshot.configuration_count = descriptor.bNumConfigurations;
             snapshot.candidate_id = static_cast<std::uint64_t>(i) + 1;
+            snapshot.selection_token = selection_token;
             std::uint8_t ports[8]{};
-            const int port_count = libusb_get_port_numbers(devices[i], ports, sizeof(ports));
+            const int port_count = state_->backend->get_port_numbers(devices[i], ports, sizeof(ports));
+            if (state_->scan_only && port_count < 0) {
+                state_->backend->free_device_list(devices, 1);
+                if (result != nullptr) *result = usb_result(port_count);
+                return {};
+            }
             if (port_count > 0) {
                 snapshot.port_path.assign(ports, ports + port_count);
+            }
+            if (state_->scan_only) {
+                UsbConnectionIdentity identity{};
+                const bool identity_found = state_->backend->get_connection_identity(
+                    devices[i], -1, &identity);
+                if (state_->backend->supports_connection_identity() && !identity_found) {
+                    state_->backend->free_device_list(devices, 1);
+                    if (result != nullptr) *result = usb_result(LIBUSB_ERROR_IO);
+                    return {};
+                }
+                snapshot.connection_token = state_->connection_token(devices[i], identity, true);
+                observed_connections.insert(snapshot.connection_token);
+                snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
+                snapshot.state_->context = state_;
+                snapshot.state_->device = state_->backend->ref_device(devices[i]);
+                snapshot.state_->identity = identity;
             }
             for (std::uint8_t config_index = 0; config_index < descriptor.bNumConfigurations;
                  ++config_index) {
                 libusb_config_descriptor *config = nullptr;
-                if (state_->backend->get_config_descriptor(devices[i], config_index, &config) !=
-                    LIBUSB_SUCCESS) {
+                const int config_result = state_->backend->get_config_descriptor(
+                    devices[i], config_index, &config);
+                if (config_result != LIBUSB_SUCCESS) {
+                    if (state_->scan_only) {
+                        state_->backend->free_device_list(devices, 1);
+                        if (result != nullptr) *result = usb_result(config_result);
+                        return {};
+                    }
                     continue;
                 }
                     std::unique_ptr<libusb_config_descriptor,
@@ -963,20 +2193,337 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
                     }
                 }
             }
-            snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
-            snapshot.state_->context = state_;
-            snapshot.state_->device = state_->backend->ref_device(devices[i]);
+            if (!snapshot.state_) {
+                snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
+                snapshot.state_->context = state_;
+                snapshot.state_->device = state_->backend->ref_device(devices[i]);
+            }
             snapshots.push_back(std::move(snapshot));
         }
     } catch (...) {
-        libusb_free_device_list(devices, 1);
+        state_->backend->free_device_list(devices, 1);
         throw;
     }
-    libusb_free_device_list(devices, 1);
+    if (state_->scan_only) {
+        for (auto it = state_->device_connections.begin(); it != state_->device_connections.end();) {
+            if (observed_devices.contains(it->first)) {
+                ++it;
+                continue;
+            }
+            state_->backend->unref_device(it->second.reference);
+            it = state_->device_connections.erase(it);
+        }
+        state_->connection_epochs.erase(
+            std::remove_if(state_->connection_epochs.begin(), state_->connection_epochs.end(),
+                [&](const auto &entry) { return !observed_connections.contains(entry.second); }),
+            state_->connection_epochs.end());
+    }
+    state_->backend->free_device_list(devices, 1);
     if (result != nullptr) {
         *result = make_result(DTV_INTERNAL_RESULT_OK);
     }
     return snapshots;
+}
+
+std::vector<UsbDeviceSnapshot> UsbContext::enumerate_fds(
+    std::span<const std::int32_t> descriptors, dtv_internal_result *result) const
+{
+    std::vector<UsbDeviceSnapshot> snapshots;
+    if (!state_ || state_->context == nullptr) {
+        if (result != nullptr) *result = no_context();
+        return snapshots;
+    }
+#if defined(__linux__)
+    std::unique_lock scan_lock(state_->scan_mutex);
+    try {
+        snapshots.reserve(descriptors.size());
+        for (std::size_t index = 0; index < descriptors.size(); ++index) {
+            const int owned = fcntl(descriptors[index], F_DUPFD_CLOEXEC, 0);
+            if (owned < 0) {
+                if (result != nullptr) *result = invalid();
+                return {};
+            }
+            auto lease = std::make_shared<UsbHandleLease>();
+            lease->context = state_;
+            lease->owned_descriptor = owned;
+            const int wrapped = state_->backend->wrap_sys_device(
+                state_->context, owned, &lease->handle);
+            if (wrapped != LIBUSB_SUCCESS) {
+                if (result != nullptr) *result = usb_result(wrapped);
+                return {};
+            }
+            auto *device = state_->backend->get_device(lease->handle);
+            if (device == nullptr) {
+                if (result != nullptr) *result = usb_result(LIBUSB_ERROR_NO_DEVICE);
+                return {};
+            }
+            libusb_device_descriptor descriptor{};
+            int status = state_->backend->get_device_descriptor(device, &descriptor);
+            if (status != LIBUSB_SUCCESS) {
+                if (result != nullptr) *result = usb_result(status);
+                return {};
+            }
+            UsbDeviceSnapshot snapshot{};
+            snapshot.vendor_id = descriptor.idVendor;
+            snapshot.product_id = descriptor.idProduct;
+            snapshot.device_version = descriptor.bcdDevice;
+            snapshot.device_class = descriptor.bDeviceClass;
+            snapshot.device_subclass = descriptor.bDeviceSubClass;
+            snapshot.device_protocol = descriptor.bDeviceProtocol;
+            snapshot.bus_number = state_->backend->get_bus_number(device);
+            snapshot.device_address = state_->backend->get_device_address(device);
+            snapshot.configuration_count = descriptor.bNumConfigurations;
+            snapshot.candidate_id = static_cast<std::uint64_t>(index) + 1;
+            std::uint8_t ports[8]{};
+            const int port_count = state_->backend->get_port_numbers(device, ports, sizeof(ports));
+            if (port_count < 0) {
+                if (result != nullptr) *result = usb_result(port_count);
+                return {};
+            }
+            if (port_count > 0) snapshot.port_path.assign(ports, ports + port_count);
+            UsbConnectionIdentity identity{};
+            if (!state_->backend->get_connection_identity(device, owned, &identity) ||
+                !identity.valid) {
+                if (result != nullptr) *result = usb_result(LIBUSB_ERROR_IO);
+                return {};
+            }
+            snapshot.connection_token = state_->connection_token(device, identity, false);
+            snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
+            snapshot.state_->context = state_;
+            snapshot.state_->device = state_->backend->ref_device(device);
+            snapshot.state_->owner = lease;
+            snapshot.state_->identity = identity;
+            for (std::uint8_t config_index = 0; config_index < descriptor.bNumConfigurations;
+                 ++config_index) {
+                libusb_config_descriptor *config = nullptr;
+                status = state_->backend->get_config_descriptor(device, config_index, &config);
+                if (status != LIBUSB_SUCCESS) {
+                    if (result != nullptr) *result = usb_result(status);
+                    return {};
+                }
+                std::unique_ptr<libusb_config_descriptor,
+                                std::function<void(libusb_config_descriptor *)>>
+                    guard(config, [backend = state_->backend](auto *value) {
+                        backend->free_config_descriptor(value);
+                    });
+                for (std::uint8_t interface_index = 0; interface_index < config->bNumInterfaces;
+                     ++interface_index) {
+                    const auto &interface = config->interface[interface_index];
+                    for (int alt_index = 0; alt_index < interface.num_altsetting; ++alt_index) {
+                        const auto &alt = interface.altsetting[alt_index];
+                        UsbInterfaceSnapshot view{};
+                        view.info.configuration = config->bConfigurationValue;
+                        view.info.interface_number = alt.bInterfaceNumber;
+                        view.info.alternate_setting = alt.bAlternateSetting;
+                        view.info.class_code = alt.bInterfaceClass;
+                        view.info.subclass_code = alt.bInterfaceSubClass;
+                        view.info.protocol_code = alt.bInterfaceProtocol;
+                        for (std::uint8_t endpoint_index = 0; endpoint_index < alt.bNumEndpoints;
+                             ++endpoint_index) {
+                            const auto &endpoint = alt.endpoint[endpoint_index];
+                            view.endpoints.push_back({endpoint.bEndpointAddress, endpoint.bmAttributes,
+                                                      endpoint.wMaxPacketSize, endpoint.bInterval});
+                        }
+                        snapshot.interfaces.push_back(std::move(view));
+                    }
+                }
+            }
+            snapshots.push_back(std::move(snapshot));
+        }
+    } catch (...) {
+        if (result != nullptr) *result = exception_result();
+        return {};
+    }
+    if (result != nullptr) *result = make_result(DTV_INTERNAL_RESULT_OK);
+    return snapshots;
+#else
+    (void)descriptors;
+    if (result != nullptr) *result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+    return snapshots;
+#endif
+}
+
+dtv_internal_result UsbContext::acquire_claims(
+    std::span<const UsbClaimDeviceInput> inputs, const dtv_runtime_clock *clock,
+    const dtv_cancel *cancel, std::uint64_t deadline_ns, UsbClaimLeaseGroup *out) const
+{
+    if (out == nullptr || !state_ || state_->context == nullptr || inputs.empty() ||
+        out->size() != 0) return invalid();
+    try {
+        UsbClaimLeaseGroup pending;
+        pending.state_->deadline = deadline_ns;
+        pending.state_->handles.reserve(inputs.size());
+        std::vector<std::shared_ptr<UsbHandleLease>> wrapped_owners;
+        wrapped_owners.reserve(inputs.size());
+        std::vector<ClaimReservationKey> reservation_keys;
+        reservation_keys.reserve(inputs.size() * 3);
+        std::vector<UsbConnectionIdentity> identities;
+        identities.reserve(inputs.size());
+        std::unordered_set<std::uint64_t> connections;
+        connections.reserve(inputs.size());
+
+        for (const auto &input : inputs) {
+            const auto &snapshot = input.snapshot;
+            if (input.connection_epoch == 0 || input.connection_epoch != snapshot.connection_token ||
+                !connections.insert(input.connection_epoch).second || input.interfaces.empty() ||
+                !snapshot.state_ || snapshot.state_->context != state_ ||
+                snapshot.state_->device == nullptr) return invalid();
+            auto owner = snapshot.state_->owner
+                ? std::static_pointer_cast<UsbHandleLease>(snapshot.state_->owner)
+                : std::shared_ptr<UsbHandleLease>{};
+            if (owner && (owner->context != state_ || owner->handle == nullptr ||
+                          owner->owned_descriptor < 0)) return invalid();
+            ClaimReservationKey reservation_key{};
+            if (owner) {
+                reservation_key.kind = ClaimReservationKey::Kind::wrapped_owner;
+                reservation_key.owner = owner.get();
+                reservation_keys.push_back(reservation_key);
+            }
+            if (snapshot.state_->identity.valid) {
+                reservation_key.kind = ClaimReservationKey::Kind::physical_identity;
+                reservation_key.owner = nullptr;
+                reservation_key.identity = snapshot.state_->identity;
+                reservation_keys.push_back(reservation_key);
+            }
+            reservation_key = {};
+            reservation_key.kind = ClaimReservationKey::Kind::connection_epoch;
+            reservation_key.context = state_.get();
+            reservation_key.epoch = input.connection_epoch;
+            reservation_keys.push_back(reservation_key);
+            wrapped_owners.push_back(std::move(owner));
+            std::vector<unsigned> seen;
+            seen.reserve(input.interfaces.size());
+            for (const auto &claim : input.interfaces) {
+                if (std::find(seen.begin(), seen.end(), claim.interface_number) != seen.end()) {
+                    return invalid();
+                }
+                seen.push_back(claim.interface_number);
+                const auto matches = std::count_if(snapshot.interfaces.begin(), snapshot.interfaces.end(),
+                    [&](const auto &interface) {
+                        return interface.info.interface_number == claim.interface_number &&
+                               interface.info.alternate_setting == claim.alternate_setting;
+                    });
+                if (matches != 1) return make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            }
+        }
+
+        dtv_internal_result reservation_result{};
+        pending.state_->reservation = reserve_claims(std::move(reservation_keys),
+                                                      &reservation_result);
+        if (!pending.state_->reservation) return reservation_result;
+
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+            const auto &input = inputs[index];
+            const auto &snapshot = input.snapshot;
+            auto result = claim_checkpoint(clock, cancel, deadline_ns);
+            if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+            libusb_device_descriptor descriptor{};
+            int status = state_->backend->get_device_descriptor(snapshot.state_->device, &descriptor);
+            if (status != LIBUSB_SUCCESS) return usb_result(status);
+            result = claim_checkpoint(clock, cancel, deadline_ns);
+            if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+            if (descriptor.idVendor != snapshot.vendor_id || descriptor.idProduct != snapshot.product_id ||
+                descriptor.bcdDevice != snapshot.device_version ||
+                descriptor.bDeviceClass != snapshot.device_class ||
+                descriptor.bDeviceSubClass != snapshot.device_subclass ||
+                descriptor.bDeviceProtocol != snapshot.device_protocol ||
+                descriptor.bNumConfigurations != snapshot.configuration_count ||
+                state_->backend->get_bus_number(snapshot.state_->device) != snapshot.bus_number ||
+                state_->backend->get_device_address(snapshot.state_->device) != snapshot.device_address) {
+                return usb_result(LIBUSB_ERROR_NO_DEVICE);
+            }
+            if (state_->backend->supports_connection_identity()) {
+                const int fd = wrapped_owners[index]
+                    ? wrapped_owners[index]->owned_descriptor : -1;
+                UsbConnectionIdentity current{};
+                if (!state_->backend->get_connection_identity(snapshot.state_->device, fd, &current) ||
+                    !current.valid) return usb_result(LIBUSB_ERROR_IO);
+                if (!snapshot.state_->identity.valid || current != snapshot.state_->identity) {
+                    return usb_result(LIBUSB_ERROR_NO_DEVICE);
+                }
+                for (std::size_t previous = 0; previous < identities.size(); ++previous) {
+                    if (identities[previous] == current &&
+                        inputs[previous].connection_epoch != input.connection_epoch) return invalid();
+                }
+                identities.push_back(current);
+            }
+            result = claim_checkpoint(clock, cancel, deadline_ns);
+            if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+            libusb_config_descriptor *configuration = nullptr;
+            status = state_->backend->get_active_config_descriptor(snapshot.state_->device,
+                                                                    &configuration);
+            if (status == LIBUSB_ERROR_NOT_FOUND) {
+                status = state_->backend->get_config_descriptor(snapshot.state_->device, 0,
+                                                                 &configuration);
+            }
+            if (status != LIBUSB_SUCCESS || configuration == nullptr) {
+                return status == LIBUSB_SUCCESS ? make_result(DTV_INTERNAL_RESULT_UNSUPPORTED)
+                                                : usb_result(status);
+            }
+            std::unique_ptr<libusb_config_descriptor,
+                std::function<void(libusb_config_descriptor *)>> configuration_guard(
+                    configuration, [backend = state_->backend](auto *value) {
+                        backend->free_config_descriptor(value);
+                    });
+            for (const auto &claim : input.interfaces) {
+                std::size_t matches = 0;
+                for (std::uint8_t interface_index = 0;
+                     interface_index < configuration->bNumInterfaces; ++interface_index) {
+                    const auto &interface = configuration->interface[interface_index];
+                    for (int alternate_index = 0; alternate_index < interface.num_altsetting;
+                         ++alternate_index) {
+                        const auto &alternate = interface.altsetting[alternate_index];
+                        if (alternate.bInterfaceNumber == claim.interface_number &&
+                            alternate.bAlternateSetting == claim.alternate_setting) ++matches;
+                    }
+                }
+                if (matches != 1) return make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            }
+            result = claim_checkpoint(clock, cancel, deadline_ns);
+            if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        }
+
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+            auto result = claim_checkpoint(clock, cancel, deadline_ns);
+            if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+            auto owner = std::make_unique<UsbClaimHandleLease>();
+            owner->context = state_;
+            owner->wrapped_owner = wrapped_owners[index];
+            owner->handle = owner->wrapped_owner ? owner->wrapped_owner->handle : nullptr;
+            owner->owns_handle = !owner->wrapped_owner;
+            owner->claimed_interfaces.reserve(inputs[index].interfaces.size());
+            pending.state_->handles.push_back(std::move(owner));
+            auto &lease = *pending.state_->handles.back();
+            if (lease.owns_handle) {
+                const int status = state_->backend->open_device(
+                    inputs[index].snapshot.state_->device, &lease.handle);
+                if (status != LIBUSB_SUCCESS) return usb_result(status);
+                result = claim_checkpoint(clock, cancel, deadline_ns);
+                if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+            }
+            for (const auto &claim : inputs[index].interfaces) {
+                result = claim_checkpoint(clock, cancel, deadline_ns);
+                if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+                const int status = state_->backend->claim_interface(lease.handle,
+                                                                     claim.interface_number);
+                if (status != LIBUSB_SUCCESS) return claim_result(status);
+                lease.claimed_interfaces.push_back(claim.interface_number);
+                result = claim_checkpoint(clock, cancel, deadline_ns);
+                if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+                if (claim.alternate_setting != 0) {
+                    const int alternate_status = state_->backend->set_interface_alt_setting(
+                        lease.handle, claim.interface_number, claim.alternate_setting);
+                    if (alternate_status != LIBUSB_SUCCESS) return claim_result(alternate_status);
+                    result = claim_checkpoint(clock, cancel, deadline_ns);
+                    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+                }
+            }
+        }
+        *out = std::move(pending);
+        return make_result(DTV_INTERNAL_RESULT_OK);
+    } catch (...) {
+        return exception_result();
+    }
 }
 
 UsbDevice::UsbDevice(std::unique_ptr<State> state) : state_(std::move(state)) {}
@@ -1333,6 +2880,13 @@ UsbContext UsbTestDeviceFactory::context(std::shared_ptr<UsbTransferBackend> bac
     return UsbContext(std::move(context));
 }
 
+std::size_t UsbTestDeviceFactory::worker_count(const UsbContext &context)
+{
+    if (!context.state_) return 0;
+    return static_cast<std::size_t>(context.state_->event_thread.joinable()) +
+           static_cast<std::size_t>(context.state_->lifecycle_thread.joinable());
+}
+
 UsbDeviceSnapshot UsbTestDeviceFactory::snapshot(const UsbContext &context)
 {
     UsbDeviceSnapshot snapshot{};
@@ -1346,6 +2900,34 @@ UsbDeviceSnapshot UsbTestDeviceFactory::snapshot(const UsbContext &context)
     snapshot.state_->context = context.state_;
     snapshot.state_->device = context.state_->backend->ref_device(
         reinterpret_cast<libusb_device *>(static_cast<std::uintptr_t>(3)));
+    return snapshot;
+}
+
+UsbDeviceSnapshot UsbTestDeviceFactory::snapshot(const UsbContext &context,
+                                                  std::uintptr_t raw_device)
+{
+    UsbDeviceSnapshot snapshot{};
+    auto *device = reinterpret_cast<libusb_device *>(raw_device);
+    libusb_device_descriptor descriptor{};
+    if (context.state_ && context.state_->backend->get_device_descriptor(device, &descriptor) ==
+                              LIBUSB_SUCCESS) {
+        snapshot.vendor_id = descriptor.idVendor;
+        snapshot.product_id = descriptor.idProduct;
+        snapshot.device_version = descriptor.bcdDevice;
+        snapshot.device_class = descriptor.bDeviceClass;
+        snapshot.device_subclass = descriptor.bDeviceSubClass;
+        snapshot.device_protocol = descriptor.bDeviceProtocol;
+        snapshot.configuration_count = descriptor.bNumConfigurations;
+        snapshot.bus_number = context.state_->backend->get_bus_number(device);
+        snapshot.device_address = context.state_->backend->get_device_address(device);
+    }
+    snapshot.state_ = std::make_shared<UsbDeviceSnapshot::State>();
+    snapshot.state_->context = context.state_;
+    snapshot.state_->device = context.state_->backend->ref_device(device);
+    if (context.state_->backend->supports_connection_identity()) {
+        (void)context.state_->backend->get_connection_identity(device, -1,
+                                                                &snapshot.state_->identity);
+    }
     return snapshot;
 }
 

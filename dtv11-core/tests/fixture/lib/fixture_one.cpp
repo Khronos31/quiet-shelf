@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <dtv/spi/device_ops.hpp>
+#include <dtv/spi/feature.hpp>
 
 namespace dtv::spi {
 
@@ -67,4 +68,21 @@ extern const ModelEntry fixture_one_model{
     .destroy_state = fixture_one_destroy_state,
 };
 
+}
+
+DTV_PRODUCT(fixture, DTV_FEATURES(::dtv::spi::Feature::LnbPower));
+DTV_MODEL(fixture, fixture_one, DTV_FEATURES(::dtv::spi::Feature::LnbPower), DTV_NO_FIRMWARE,
+          (::dtv::spi::model_information{"Fixture One", 0x1234, 0x0001}));
+DTV_DEFINE_MODEL(fixture, fixture_one);
+
+extern "C" int32_t dtv_model_impl_lnb_on_fixture_fixture_one(
+    dtv_enclosure *, const dtv_call_options *, dtv_error *)
+{
+    return DTV_ERROR_OK;
+}
+
+extern "C" int32_t dtv_model_impl_lnb_off_fixture_fixture_one(
+    dtv_enclosure *, const dtv_call_options *, dtv_error *)
+{
+    return DTV_ERROR_OK;
 }

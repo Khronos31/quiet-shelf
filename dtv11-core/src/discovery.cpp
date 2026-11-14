@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -26,6 +27,27 @@ bool identity_matches(const dtv::spi::ModelEntry &model,
         }
     }
     return false;
+}
+
+bool declares_identity(const dtv::spi::l3_model_record &model,
+                       const UsbDeviceSnapshot &snapshot)
+{
+    if (model.model != nullptr && model.model->vid == snapshot.vendor_id &&
+        model.model->pid == snapshot.product_id) return true;
+    if (model.discovery == nullptr) return false;
+    const auto &discovery = *model.discovery;
+    for (std::size_t index = 0; index < discovery.cold_identity_count; ++index) {
+        if (discovery.cold_identities[index].vendor_id == snapshot.vendor_id &&
+            discovery.cold_identities[index].product_id == snapshot.product_id) return true;
+    }
+    return false;
+}
+
+bool same_usb_location(const UsbDeviceSnapshot &left, const UsbDeviceSnapshot &right)
+{
+    return left.vendor_id == right.vendor_id && left.product_id == right.product_id &&
+           left.bus_number == right.bus_number && left.device_address == right.device_address &&
+           left.port_path == right.port_path;
 }
 
 bool same_functions(const BootGroupCandidate &left,
@@ -193,6 +215,109 @@ std::vector<BootGroupCandidate> discover_boot_candidates(
     }
     if (out_result) *out_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     return found;
+}
+
+dtv_internal_result collect_complete_groups(
+    std::span<const LoadedProductDiscoveryView> products,
+    std::vector<UsbDeviceSnapshot> snapshots,
+    CompleteGroupBatch *out)
+{
+    if (out == nullptr) {
+        return invalid();
+    }
+    out->snapshots.clear();
+    out->groups.clear();
+    out->ungrouped.clear();
+    try {
+        std::vector<const dtv::spi::ProductEntry *> discovery_products;
+        discovery_products.reserve(products.size());
+        for (const auto &product : products) {
+            if (product.product == nullptr || product.models == nullptr ||
+                product.model_count != product.product->model_count ||
+                (product.model_count != 0 && product.product->models == nullptr)) {
+                return invalid();
+            }
+            for (std::size_t index = 0; index < product.model_count; ++index) {
+                if (product.models[index] == nullptr || product.models[index]->discovery == nullptr ||
+                    product.models[index]->discovery != product.product->models[index]) {
+                    return invalid();
+                }
+            }
+            discovery_products.push_back(product.product);
+        }
+
+        dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        auto candidates = discover_boot_candidates(snapshots, discovery_products, &result);
+        if (result.code != DTV_INTERNAL_RESULT_OK) {
+            return result;
+        }
+
+        CompleteGroupBatch batch;
+        batch.snapshots = std::move(snapshots);
+        std::set<std::uint64_t> complete_connections;
+        for (auto &candidate : candidates) {
+            if (candidate.match != DTV_USB_GROUP_COMPLETE) continue;
+            for (const auto &function : candidate.functions) {
+                if (function.candidate_index >= batch.snapshots.size()) return invalid();
+                complete_connections.insert(
+                    batch.snapshots[function.candidate_index].connection_token);
+            }
+            const auto product = std::find_if(products.begin(), products.end(), [&](const auto &view) {
+                return view.product == candidate.product;
+            });
+            if (product == products.end()) return invalid();
+            const dtv::spi::l3_model_record *model_record = nullptr;
+            for (std::size_t index = 0; index < product->model_count; ++index) {
+                if (product->models[index]->discovery != candidate.model) continue;
+                if (model_record != nullptr) return invalid();
+                model_record = product->models[index];
+            }
+            if (model_record == nullptr) return invalid();
+            batch.groups.push_back({candidate.product, model_record,
+                                    candidate.anchor_candidate_index,
+                                    std::move(candidate.functions)});
+        }
+
+        std::map<std::uint64_t, std::size_t> ungrouped_by_connection;
+        for (std::size_t snapshot_index = 0; snapshot_index < batch.snapshots.size();
+             ++snapshot_index) {
+            const auto &snapshot = batch.snapshots[snapshot_index];
+            std::set<const dtv::spi::ModelEntry *> matching_models;
+            for (const auto &product : products) {
+                for (std::size_t model_index = 0; model_index < product.model_count;
+                     ++model_index) {
+                    const auto *model = product.models[model_index];
+                    if (declares_identity(*model, snapshot)) {
+                        matching_models.insert(model->discovery);
+                    }
+                }
+            }
+            if (matching_models.empty() || complete_connections.contains(snapshot.connection_token)) {
+                continue;
+            }
+            if (snapshot.connection_token == 0) return invalid();
+            const auto previous = ungrouped_by_connection.find(snapshot.connection_token);
+            if (previous != ungrouped_by_connection.end()) {
+                const auto &prior = batch.snapshots[
+                    batch.ungrouped[previous->second].snapshot_index];
+                if (!same_usb_location(prior, snapshot)) return invalid();
+                continue;
+            }
+            const char *model_name = nullptr;
+            if (matching_models.size() == 1) {
+                const auto *model = *matching_models.begin();
+                if (model != nullptr && model->model.name != nullptr &&
+                    model->model.name[0] != '\0') model_name = model->model.name;
+            }
+            ungrouped_by_connection.emplace(snapshot.connection_token, batch.ungrouped.size());
+            batch.ungrouped.push_back({static_cast<std::uint32_t>(snapshot_index),
+                                       snapshot.connection_token, model_name});
+        }
+        *out = std::move(batch);
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    } catch (...) {
+        return dtv::internal::exception_result();
+    }
 }
 
 dtv_internal_result check_operation_requirements(

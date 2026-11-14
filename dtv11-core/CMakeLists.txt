@@ -50,6 +50,8 @@ add_library(dtv-userland STATIC
     src/clock.cpp
     src/discovery.cpp
     src/firmware.cpp
+    src/l3.cpp
+    src/l3-registry.cpp
     src/result.cpp
     src/ts-framer.cpp
     src/usb.cpp)
@@ -82,4 +84,11 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(ts_framer_contract tests/ts-framer.cpp)
     target_link_libraries(ts_framer_contract PRIVATE dtv::userland)
     add_test(NAME ts_framer_contract COMMAND ts_framer_contract)
+    add_executable(l3_c_consumer tests/l3-consumer.c)
+    target_link_libraries(l3_c_consumer PRIVATE dtv::userland)
+    set_target_properties(l3_c_consumer PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME l3_c_consumer COMMAND l3_c_consumer)
+    add_executable(feature_declaration_contract tests/feature-declaration.cpp)
+    target_link_libraries(feature_declaration_contract PRIVATE dtv::userland)
+    add_test(NAME feature_declaration_contract COMMAND feature_declaration_contract)
 endif()
