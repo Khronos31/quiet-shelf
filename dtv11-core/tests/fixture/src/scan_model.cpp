@@ -94,6 +94,8 @@ std::atomic<unsigned> scan_pid_receiver_one_count{0};
 std::atomic<unsigned> scan_card_reply_mode{0};
 std::atomic<unsigned> scan_card_transaction{1};
 std::atomic<unsigned> scan_card_interleave_phase{0};
+std::atomic<unsigned> scan_card_transport_kind{0};
+std::atomic<bool> scan_card_transport_drop_reply{false};
 
 dtv_internal_result select_scan_group(
     const dtv_usb_candidate_info *candidates, std::uint32_t candidate_count,
@@ -180,7 +182,8 @@ dtv_internal_result scan_open_plan(
                     scan_public_open_case == 10 || scan_public_open_case == 11 ||
                     scan_public_open_case == 12 || scan_public_open_case == 13 ||
                     scan_public_open_case == 14 || scan_public_open_case == 15 ||
-                    scan_public_open_case == 16 || scan_public_open_case == 17) &&
+                    scan_public_open_case == 16 || scan_public_open_case == 17 ||
+                    scan_public_open_case == 18) &&
                     candidate_index == 1
                     ? 0x82 : 0x81;
                 if ((endpoint.address == wanted_endpoint && (endpoint.attributes & 0x03u) == 0x02u) ||
@@ -191,7 +194,7 @@ dtv_internal_result scan_open_plan(
                         scan_public_open_case == 11 || scan_public_open_case == 12 ||
                         scan_public_open_case == 13 || scan_public_open_case == 14 ||
                         scan_public_open_case == 15 || scan_public_open_case == 16 ||
-                        scan_public_open_case == 17) {
+                        scan_public_open_case == 17 || scan_public_open_case == 18) {
                         plans[*count].shared_in_depth = scan_public_open_case == 10 && candidate_index == 0
                             ? 2 : 1;
                         plans[*count].prestream_sink_limit = 16;
@@ -201,7 +204,8 @@ dtv_internal_result scan_open_plan(
                         plans[*count].reply_capacity = 32;
                         plans[*count].card_reader_source =
                             (scan_public_open_case == 12 || scan_public_open_case == 15 ||
-                             scan_public_open_case == 16 || scan_public_open_case == 17) &&
+                             scan_public_open_case == 16 || scan_public_open_case == 17 ||
+                             scan_public_open_case == 18) &&
                             candidate_index == 0;
                         plans[*count].receiver_lock_source =
                             scan_public_open_case == 12 && candidate_index == 0;
@@ -251,6 +255,33 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         scan_shared_order_endpoints[packet_index] = packet->endpoint;
     }
     scan_shared_packets.fetch_add(1, std::memory_order_release);
+    if (scan_public_open_case == 18 && packet->endpoint == 0x81) {
+        if (scan_card_transport_drop_reply.load(std::memory_order_acquire))
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        static thread_local std::array<unsigned char, 8> reply{};
+        const auto kind = scan_card_transport_kind.load(std::memory_order_acquire);
+        std::size_t size = 4;
+        if (kind == 0) {
+            reply = {0, 0x3b, 0x80, 0x01, 0x81, 0, 0, 0};
+            size = 5;
+        } else if (kind == 1) {
+            reply = {0xac, 0, 0, 0, 0, 0, 0, 0};
+            size = 1;
+        } else if (kind == 2) {
+            reply = {0x5a, 0xc3, 0, 0, 0, 0, 0, 0};
+            size = 2;
+        } else {
+            reply = {0x00, 0x00, 0x01, 0x90, 0x00, 0, 0, 0};
+            size = 5;
+        }
+        message->kind = dtv::spi::PublicOpenMessageKind::control_reply;
+        message->resource_scope = kind == 0 ? 17 : 18;
+        message->transaction_id = kind == 0 ? scan_card_transaction.load(std::memory_order_acquire)
+            : 200 + kind;
+        message->generation = packet->generation;
+        message->payload = std::span<const unsigned char>(reply).first(size);
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
     if (scan_public_open_case == 17 &&
         scan_card_interleave_phase.load(std::memory_order_acquire) != 0) {
         const auto phase = scan_card_interleave_phase.load(std::memory_order_acquire);
@@ -576,6 +607,7 @@ dtv_internal_result scan_plan_operation(dtv_context *, const dtv::spi::PublicOpe
             request->arguments[0] == 0x52 && request->arguments[1] != 0;
         if (!plan->arguments_valid) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         scan_card_transaction.store(request->arguments[1], std::memory_order_release);
+        scan_card_transport_kind.store(0, std::memory_order_release);
         static constexpr std::uint64_t card_resource = 902;
         static constexpr std::array<unsigned char, 1> output{0x52};
         plan->handle_index = 0;
@@ -604,6 +636,51 @@ dtv_internal_result scan_plan_operation(dtv_context *, const dtv::spi::PublicOpe
     plan->reply_capacity = 32;
     plan->resource_keys = std::span<const std::uint64_t>(keys.data(), request->arguments[0]);
     plan->output = request->arguments.subspan(4);
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result scan_plan_card_transport(
+    dtv_context *, const dtv::spi::CardTransportRequest *request,
+    dtv::spi::PublicCardTransportPlan *transport_plan)
+{
+    if (request == nullptr || transport_plan == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    static thread_local std::array<unsigned char, 1024> read_command{};
+    static constexpr std::uint64_t card_resource = 918;
+    auto &plan = transport_plan->operation;
+    plan.supported = true;
+    plan.ready = scan_public_open_case == 18;
+    plan.arguments_valid = true;
+    plan.handle_index = 0;
+    plan.bulk_out_endpoint = 0x02;
+    plan.resource_scope = 18;
+    plan.reply_capacity = 32;
+    plan.resource_keys = std::span<const std::uint64_t>(&card_resource, 1);
+    if (const auto *write = std::get_if<dtv::spi::CardByteWrite>(&request->operation)) {
+        if (write->bytes.empty()) plan.arguments_valid = false;
+        plan.transaction_id = 201;
+        plan.output = write->bytes;
+        plan.reply_capacity = 1;
+        scan_card_transport_kind.store(1, std::memory_order_release);
+    } else if (const auto *read = std::get_if<dtv::spi::CardByteRead>(&request->operation)) {
+        if (read->capacity < 2 || read->capacity > read_command.size())
+            plan.arguments_valid = false;
+        read_command[0] = 0x52;
+        read_command[1] = 0x01;
+        plan.transaction_id = 202;
+        plan.output = std::span<const unsigned char>(read_command).first(2);
+        plan.reply_capacity = read->capacity;
+        scan_card_transport_kind.store(2, std::memory_order_release);
+    } else if (const auto *exchange = std::get_if<dtv::spi::CardT1BlockExchange>(&request->operation)) {
+        if (exchange->block.empty() || exchange->response_capacity < 5)
+            plan.arguments_valid = false;
+        plan.transaction_id = 203;
+        plan.output = exchange->block;
+        plan.reply_capacity = exchange->response_capacity;
+        scan_card_transport_kind.store(3, std::memory_order_release);
+    } else {
+        plan.arguments_valid = false;
+    }
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
@@ -787,7 +864,7 @@ const dtv::spi::PublicOpenOps scan_public_open_ops{
     scan_open_plan, scan_open_identify, nullptr, scan_shared_demux, scan_shared_identify,
     scan_plan_operation, scan_plan_tune, scan_tune_by_frequency,
     scan_prepare_stream, scan_start_stream, scan_stop_stream, scan_after_stream_drain,
-    scan_plan_stream, scan_transform_stream};
+    scan_plan_stream, scan_transform_stream, scan_plan_card_transport};
 
 }
 
@@ -846,6 +923,8 @@ void set_scan_public_open_case(unsigned value)
     scan_card_reply_mode.store(0, std::memory_order_release);
     scan_card_transaction.store(1, std::memory_order_release);
     scan_card_interleave_phase.store(0, std::memory_order_release);
+    scan_card_transport_kind.store(0, std::memory_order_release);
+    scan_card_transport_drop_reply.store(false, std::memory_order_release);
     {
         std::lock_guard lock(scan_pid_mutex);
         scan_pid_active.clear();
@@ -867,6 +946,11 @@ void set_scan_public_open_case(unsigned value)
 void set_scan_card_reply_mode(unsigned mode)
 {
     scan_card_reply_mode.store(mode, std::memory_order_release);
+}
+
+void set_scan_card_transport_drop_reply(bool drop)
+{
+    scan_card_transport_drop_reply.store(drop, std::memory_order_release);
 }
 
 void set_scan_card_interleave_phase(unsigned phase)
@@ -950,14 +1034,14 @@ bool scan_shared_mode_enabled()
         scan_public_open_case == 11 || scan_public_open_case == 12 ||
         scan_public_open_case == 13 || scan_public_open_case == 14 ||
         scan_public_open_case == 15 || scan_public_open_case == 16 ||
-        scan_public_open_case == 17;
+        scan_public_open_case == 17 || scan_public_open_case == 18;
 }
 
 bool scan_operation_mode_enabled()
 {
     return scan_public_open_case == 11 || scan_public_open_case == 13 ||
         scan_public_open_case == 15 || scan_public_open_case == 16 ||
-        scan_public_open_case == 17;
+        scan_public_open_case == 17 || scan_public_open_case == 18;
 }
 
 std::size_t scan_stream_queue_capacity_value()

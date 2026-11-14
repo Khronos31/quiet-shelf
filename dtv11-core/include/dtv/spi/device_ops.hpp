@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <variant>
 
 #include <dtv/cli.h>
 #include <dtv/dtv.h>
@@ -168,6 +169,44 @@ struct PublicOperationPlan {
     std::span<const unsigned char> output;
 };
 
+struct CardByteWrite {
+    std::span<const unsigned char> bytes;
+};
+
+struct CardByteRead {
+    std::size_t capacity = 0;
+};
+
+struct CardT1BlockExchange {
+    std::span<const unsigned char> block;
+    std::size_t response_capacity = 0;
+};
+
+using CardTransportOperation = std::variant<CardByteWrite, CardByteRead, CardT1BlockExchange>;
+
+struct CardTransportContext {
+    dtv_device *reader = nullptr;
+    std::uint64_t connection_epoch = 0;
+    std::uint64_t request_epoch = 0;
+};
+
+struct CardTransportRequest {
+    CardTransportContext context;
+    CardTransportOperation operation;
+};
+
+struct CardIoOutcome {
+    std::size_t tx_bytes_done = 0;
+    std::size_t rx_bytes_done = 0;
+    bool reply_complete = false;
+    bool result_known = true;
+    dtv_internal_result transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+};
+
+struct PublicCardTransportPlan {
+    PublicOperationPlan operation;
+};
+
 struct PublicTuneRequest {
     std::uint32_t receiver_index = 0;
     std::uint64_t connection_epoch = 0;
@@ -219,6 +258,8 @@ struct PublicOpenOps {
                                             std::span<const unsigned char>,
                                             std::span<unsigned char>, std::size_t *,
                                             std::size_t *) = nullptr;
+    dtv_internal_result (*plan_card_transport)(dtv_context *, const CardTransportRequest *,
+                                               PublicCardTransportPlan *) = nullptr;
 };
 
 struct ModelEntry {

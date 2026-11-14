@@ -72,6 +72,8 @@ public:
     std::uint32_t card_state(const dtv_enclosure *) const;
     std::uint32_t card_generation(const dtv_enclosure *) const;
     dtv_device *card_reader_device(const dtv_enclosure *) const;
+    dtv_internal_result card_transport_context(const dtv_enclosure *,
+                                              dtv::spi::CardTransportContext *) const;
     dtv_internal_result begin_card_reset(dtv_enclosure *, std::shared_ptr<void> *,
                                           std::uint64_t *, std::uint64_t *);
     dtv_internal_result try_begin_card_function(dtv_enclosure *, std::shared_ptr<void> *);
@@ -163,7 +165,12 @@ dtv_internal_result update_public_discovery_receiver_declarations_for_test(
 void set_public_operation_allocation_failure_for_test(bool);
 dtv_internal_result run_public_operation_for_test(
     dtv_enclosure *, const dtv::spi::PublicOperationRequest &, dtv_timeout,
-    std::span<unsigned char>, std::size_t *);
+    std::span<unsigned char>, std::size_t *, const dtv::spi::PublicOperationPlan * = nullptr,
+    dtv::spi::CardIoOutcome * = nullptr,
+    const dtv::spi::CardTransportContext * = nullptr);
+dtv_internal_result run_public_card_transport(
+    dtv_enclosure *, const dtv::spi::CardTransportOperation &, dtv_timeout,
+    std::vector<unsigned char> *, dtv::spi::CardIoOutcome *);
 std::int32_t run_public_stream_operation(
     dtv_stream *, std::uint32_t, std::span<const unsigned char>, dtv_timeout,
     std::span<unsigned char>, std::size_t *, dtv_error *);

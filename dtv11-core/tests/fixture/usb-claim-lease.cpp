@@ -32,6 +32,7 @@ extern "C" int dtv_public_test_receiver_transition(dtv_enclosure *);
 void set_scan_group_case(unsigned);
 void set_scan_public_open_case(unsigned);
 void set_scan_card_reply_mode(unsigned);
+void set_scan_card_transport_drop_reply(bool);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
@@ -2526,6 +2527,209 @@ int public_reset_card()
     return 0;
 }
 
+int public_card_transport()
+{
+    set_scan_public_open_case(18);
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 219), snapshot(context, 4, 220)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error error{};
+    error.struct_size = sizeof(error);
+    auto *const *enclosures = dtv_list_enclosures(&error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    std::atomic<std::int32_t> open_result{DTV_ERROR_INTERNAL};
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    std::thread opening([&] {
+        open_result.store(dtv_open_enclosure(root, nullptr, &open_error),
+                          std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x81, 1) ||
+        !backend->wait_for_endpoint_submissions(0x82, 1)) {
+        std::fprintf(stderr, "card transport open endpoints: %u/%u result=%d\n",
+            backend->endpoint_submission_count(0x81), backend->endpoint_submission_count(0x82),
+            open_result.load(std::memory_order_acquire));
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+        opening.join();
+        return 3;
+    }
+    backend->complete_endpoint(0x81);
+    backend->complete_endpoint(0x82);
+    opening.join();
+    if (open_result.load(std::memory_order_acquire) != DTV_ERROR_OK) return 4;
+
+    const auto reset_output = backend->endpoint_submission_count(0x02) + 1;
+    std::atomic<std::int32_t> reset_result{DTV_ERROR_INTERNAL};
+    std::thread resetting([&] {
+        const std::uint8_t *atr = nullptr;
+        std::uint64_t atr_size = 0;
+        dtv_error reset_error{};
+        reset_error.struct_size = sizeof(reset_error);
+        reset_result.store(dtv_reset_card(root, nullptr, &atr, &atr_size, &reset_error),
+                           std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x02, reset_output)) {
+        dtv_cancel_enclosure(root, &error);
+        resetting.join();
+        return 5;
+    }
+    auto callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x02);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        resetting.join();
+        return 6;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        resetting.join();
+        return 7;
+    }
+    resetting.join();
+    if (reset_result.load(std::memory_order_acquire) != DTV_ERROR_OK ||
+        dtv_get_card_state(root) != DTV_CARD_READY) return 8;
+
+    const auto exchange = [&](const dtv::spi::CardTransportOperation &operation,
+                              std::vector<unsigned char> *reply,
+                              dtv::spi::CardIoOutcome *outcome, unsigned expected_transaction,
+                              dtv_timeout timeout) {
+        dtv_internal_result result{};
+        std::thread caller([&] {
+            result = dtv::internal::run_public_card_transport(root, operation, timeout,
+                reply, outcome);
+        });
+        const auto output_submission = backend->endpoint_submission_count(0x02) + 1;
+        if (!backend->wait_for_endpoint_submissions(0x02, output_submission)) {
+            dtv_cancel_enclosure(root, &error);
+            caller.join();
+            return false;
+        }
+        callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x02);
+        if (!backend->wait_for_callbacks(callbacks + 1)) {
+            dtv_cancel_enclosure(root, &error);
+            caller.join();
+            return false;
+        }
+        if (timeout.timeout_ms == 0 || expected_transaction != 0) {
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x81);
+            if (expected_transaction != 0 && !backend->wait_for_callbacks(callbacks + 1)) {
+                caller.join();
+                return false;
+            }
+        }
+        caller.join();
+        if (expected_transaction != 0 && result.code != DTV_INTERNAL_RESULT_OK)
+            std::fprintf(stderr, "card transport result=%d detail=%u expected=%u tx=%zu rx=%zu packets=%u\n",
+                result.code, result.detail, expected_transaction, outcome->tx_bytes_done,
+                outcome->rx_bytes_done, scan_shared_packet_count());
+        return true;
+    };
+
+    const std::array<unsigned char, 3> byte_chunk{0x3f, 0x01, 0x7a};
+    std::vector<unsigned char> reply;
+    dtv::spi::CardIoOutcome outcome{};
+    const auto before_write = backend->output_snapshot().size();
+    if (!exchange(dtv::spi::CardByteWrite{byte_chunk}, &reply, &outcome, 201,
+            dtv_timeout{500, 0}) || reply != std::vector<unsigned char>{0xac} ||
+        outcome.tx_bytes_done != byte_chunk.size() || outcome.rx_bytes_done != 1 ||
+        !outcome.reply_complete || !outcome.result_known ||
+        backend->output_snapshot().size() != before_write + 1 ||
+        backend->output_snapshot().back() != std::vector<unsigned char>(byte_chunk.begin(), byte_chunk.end()))
+        return 9;
+
+    reply.clear();
+    if (!exchange(dtv::spi::CardByteRead{8}, &reply, &outcome, 202, dtv_timeout{500, 0}) ||
+        reply != std::vector<unsigned char>{0x5a, 0xc3} || outcome.tx_bytes_done != 2 ||
+        outcome.rx_bytes_done != 2 || !outcome.reply_complete || !outcome.result_known ||
+        backend->output_snapshot().back() != std::vector<unsigned char>{0x52, 0x01}) return 10;
+
+    const std::array<unsigned char, 5> block{0x00, 0x00, 0x01, 0x00, 0x00};
+    reply.clear();
+    if (!exchange(dtv::spi::CardT1BlockExchange{block, 16}, &reply, &outcome, 203,
+            dtv_timeout{500, 0}) ||
+        reply != std::vector<unsigned char>{0x00, 0x00, 0x01, 0x90, 0x00} ||
+        outcome.tx_bytes_done != block.size() || outcome.rx_bytes_done != 5 ||
+        !outcome.reply_complete || !outcome.result_known ||
+        backend->output_snapshot().back() != std::vector<unsigned char>(block.begin(), block.end()))
+        return 11;
+
+    set_scan_card_transport_drop_reply(true);
+    reply.clear();
+    const auto output_count = backend->endpoint_submission_count(0x02);
+    if (!exchange(dtv::spi::CardByteWrite{byte_chunk}, &reply, &outcome, 0,
+            dtv_timeout{40, 0})) return 12;
+    set_scan_card_transport_drop_reply(false);
+    if (outcome.result_known || outcome.reply_complete || outcome.tx_bytes_done != byte_chunk.size() ||
+        outcome.rx_bytes_done != 0 || outcome.transport_error.code != DTV_INTERNAL_RESULT_TIMEOUT ||
+        backend->endpoint_submission_count(0x02) != output_count + 1) return 13;
+
+    set_scan_card_transport_drop_reply(true);
+    dtv_internal_result close_operation_result{};
+    std::thread close_operation([&] {
+        close_operation_result = dtv::internal::run_public_card_transport(root,
+            dtv::spi::CardByteRead{8}, dtv_timeout{5000, 0}, &reply, &outcome);
+    });
+    const auto close_output = backend->endpoint_submission_count(0x02) + 1;
+    if (!backend->wait_for_endpoint_submissions(0x02, close_output)) {
+        dtv_cancel_enclosure(root, &error);
+        close_operation.join();
+        return 14;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x02);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        close_operation.join();
+        return 15;
+    }
+    const dtv_call_options close_call{sizeof(dtv_call_options), 1};
+    const auto close_state = dtv_close_enclosure(root, &close_call, &error);
+    if (close_state == DTV_CLOSE_PENDING) {
+        const auto callbacks_before = backend->callback_count_snapshot();
+        const auto pending_transfers = backend->pending_transfer_count();
+        backend->complete_endpoint(0x81, 2);
+        backend->complete_endpoint(0x82, 2);
+        if (!backend->wait_for_callbacks(callbacks_before + pending_transfers)) return 16;
+    } else if (close_state != DTV_CLOSE_CLOSED) {
+        return 17;
+    }
+    close_operation.join();
+    set_scan_card_transport_drop_reply(false);
+    if (close_operation_result.code != DTV_INTERNAL_RESULT_CANCELLED ||
+        outcome.result_known || outcome.reply_complete || outcome.tx_bytes_done != 2) {
+        std::fprintf(stderr, "card close result=%d known=%d complete=%d tx=%zu rx=%zu\n",
+            close_operation_result.code, outcome.result_known, outcome.reply_complete,
+            outcome.tx_bytes_done, outcome.rx_bytes_done);
+        return 18;
+    }
+    const auto close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto final_close_state = dtv_get_enclosure_close_state(root, &error);
+    while (final_close_state == DTV_CLOSE_PENDING &&
+           std::chrono::steady_clock::now() < close_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        final_close_state = dtv_get_enclosure_close_state(root, &error);
+    }
+    if (final_close_state != DTV_CLOSE_CLOSED) return 19;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    dtv::internal::set_public_discovery_batch_for_test({});
+    set_scan_public_open_case(0);
+    return 0;
+}
+
 int public_open_operation_admission()
 {
     auto backend = std::make_shared<FakeBackend>();
@@ -3244,6 +3448,10 @@ int main()
     if (const int result = public_reset_card(); result != 0) {
         std::fprintf(stderr, "public_reset_card failed: %d\n", result);
         return 140 + result;
+    }
+    if (const int result = public_card_transport(); result != 0) {
+        std::fprintf(stderr, "public_card_transport failed: %d\n", result);
+        return 160 + result;
     }
     if (const int result = registry_plan_and_success(); result != 0) {
         std::fprintf(stderr, "registry_plan_and_success failed: %d\n", result);
