@@ -99,6 +99,7 @@ std::atomic<bool> scan_card_transport_drop_reply{false};
 std::atomic<unsigned> scan_card_t1_exchange_mode{0};
 std::atomic<unsigned> scan_card_t1_fault{0};
 std::atomic<bool> scan_card_t1_crc{false};
+std::atomic<bool> scan_card_t1_stale_reply{false};
 std::atomic<std::uint64_t> scan_card_t1_transaction{300};
 std::atomic<std::uint64_t> scan_card_t1_current_transaction{0};
 std::mutex scan_card_t1_mutex;
@@ -134,7 +135,8 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
     scan_card_t1_reply.push_back(request[0]);
     scan_card_t1_reply.push_back(static_cast<unsigned char>(request[1] ^ 0x40));
     scan_card_t1_reply.push_back(2);
-    scan_card_t1_reply.push_back(0x90);
+    scan_card_t1_reply.push_back(scan_card_t1_stale_reply.load(std::memory_order_acquire)
+        ? 0x6f : 0x90);
     scan_card_t1_reply.push_back(0x00);
     if (edc_size == 1) {
         unsigned char lrc = 0;
@@ -317,6 +319,61 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         scan_shared_order_endpoints[packet_index] = packet->endpoint;
     }
     scan_shared_packets.fetch_add(1, std::memory_order_release);
+    if (scan_public_open_case == 18 &&
+        scan_card_interleave_phase.load(std::memory_order_acquire) != 0) {
+        const auto phase = scan_card_interleave_phase.load(std::memory_order_acquire);
+        if (phase == 1 && packet->endpoint == 0x81) {
+            message->kind = dtv::spi::PublicOpenMessageKind::notification;
+            message->notification_kind = dtv::spi::PublicOpenNotificationKind::card_state;
+            message->generation = packet->generation;
+            message->card_state = DTV_CARD_ABSENT;
+            scan_card_interleave_phase.store(2, std::memory_order_release);
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        }
+        if (phase == 2 && packet->endpoint == 0x82) {
+            static thread_local std::array<unsigned char, 5 * 192> source{};
+            for (std::size_t packet_index = 0; packet_index < 5; ++packet_index) {
+                const auto offset = packet_index * 192;
+                std::fill(source.begin() + offset, source.begin() + offset + 4, 0xa0);
+                source[offset + 4] = 0x47;
+                source[offset + 5] = static_cast<unsigned char>(0x81 + packet_index);
+                for (std::size_t index = 6; index < 192; ++index)
+                    source[offset + index] = static_cast<unsigned char>((offset + index) * 11);
+            }
+            message->kind = dtv::spi::PublicOpenMessageKind::source_chunk;
+            message->receiver_index = 1;
+            message->stream_generation = scan_stream_generation.load(std::memory_order_acquire);
+            message->generation = packet->generation;
+            message->payload = source;
+            scan_card_interleave_phase.store(3, std::memory_order_release);
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        }
+        if (phase == 3 && packet->endpoint == 0x81) {
+            static thread_local std::array<unsigned char, 260> reply{};
+            std::size_t size = 0;
+            {
+                std::lock_guard lock(scan_card_t1_mutex);
+                size = scan_card_t1_reply.size();
+                std::copy(scan_card_t1_reply.begin(), scan_card_t1_reply.end(), reply.begin());
+            }
+            message->kind = dtv::spi::PublicOpenMessageKind::control_reply;
+            message->resource_scope = 18;
+            message->transaction_id = scan_card_t1_current_transaction.load(std::memory_order_acquire);
+            message->generation = packet->generation;
+            message->payload = std::span<const unsigned char>(reply).first(size);
+            scan_card_interleave_phase.store(4, std::memory_order_release);
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        }
+        if (phase == 4 && packet->endpoint == 0x81) {
+            message->kind = dtv::spi::PublicOpenMessageKind::notification;
+            message->notification_kind = dtv::spi::PublicOpenNotificationKind::card_state;
+            message->generation = packet->generation;
+            message->card_state = DTV_CARD_PRESENT;
+            scan_card_interleave_phase.store(5, std::memory_order_release);
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        }
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
     if (scan_public_open_case == 18 && packet->endpoint == 0x81) {
         const auto kind = scan_card_transport_kind.load(std::memory_order_acquire);
         if (scan_card_transport_drop_reply.load(std::memory_order_acquire) && kind != 6)
@@ -1053,6 +1110,7 @@ void set_scan_public_open_case(unsigned value)
     scan_card_t1_exchange_mode.store(0, std::memory_order_release);
     scan_card_t1_fault.store(0, std::memory_order_release);
     scan_card_t1_crc.store(false, std::memory_order_release);
+    scan_card_t1_stale_reply.store(false, std::memory_order_release);
     scan_card_t1_transaction.store(300, std::memory_order_release);
     scan_card_t1_current_transaction.store(0, std::memory_order_release);
     {
@@ -1104,6 +1162,11 @@ void set_scan_card_t1_fault(unsigned fault)
 void set_scan_card_t1_crc(bool crc)
 {
     scan_card_t1_crc.store(crc, std::memory_order_release);
+}
+
+void set_scan_card_t1_stale_reply(bool stale)
+{
+    scan_card_t1_stale_reply.store(stale, std::memory_order_release);
 }
 
 void set_scan_card_interleave_phase(unsigned phase)

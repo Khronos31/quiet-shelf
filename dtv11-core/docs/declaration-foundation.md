@@ -842,6 +842,12 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
     - 要求・結果バッファはCoreが所有し、借用spanは呼出し中のみ有効。
     - `CardIoOutcome` により送受信バイト進行、reply_complete、result_known、transport_errorを保持。
     - 送信済みかつ結果不明（timeout, cancel, close時等）の場合に、搬送層で同一要求を自動再送（replay）しない。通常のT=1 block retryは後続の共通プロトコル層の責務とする。
+  - **代表fixtureにおける並行進行・遅延旧epochフェンス・readiness条件（C7/C8実測事実）:**
+    - **保留中の並行通知・別receiver読取:** case18 fixtureにおいて、CRC選択済みセッションのcomplete-block T=1交換を保留中に、別エンドポイントから公開 `CARD_REMOVED` 通知を配送。公開 `dtv_get_card_state` が `ABSENT`、`CARD_REMOVED` イベント発行、`card_generation` 増加を確認した時点でもT=1 callerは保留中（pending）のまま維持される。
+    - **別receiver readとの因果同期:** 別 receiver 1 の live stream generation を使い 192バイト source パケットを endpoint 0x82 から配送し、公開 `dtv_read_stream` が 188バイトを返すことを因果同期で確認。read 完了時も CARD state は ABSENT で T=1 caller は保留中（pending）を維持。
+    - **遅延旧epoch応答フェンスと進行量:** CARD_REMOVED 後、元の T=1 request transaction へ CRC-valid な遅延 reply（INF 6F00）を配送した際、caller に block/INF を返さず、`raw_block_length=0`、INF empty、`tx_bytes_done=8`、`rx_bytes_done=0`、`reply_complete=false`、`result_known=false`、追加 OUT なし（OUT 1回のみ）を確認。
+    - **ABSENT readiness 条件とエラーマッピング:** 抜去による ABSENT 状態での実測内部結果は `NOT_READY`。`card_transport_context` は `card_state` が `READY` でない場合に `NOT_READY` を返し、request epoch 照合より先に return するため、公開エラーコードは `DTV_ERROR_NOT_READY` となる。これを純粋な接続・要求エポック不一致時の `DISCONNECTED` と混同せず、既存の readiness 条件に沿って確認（新しいエラー優先順位の規定や全物理競合の保証ではない）。
+    - **新セッション確立と無自動replay:** `CARD_INSERTED` を公開 state/event で確認後に reset を行い、新 session で別 T=1 block を送信した際、応答 INF 9000 が正常に得られ、旧 6F00 が混入しないこと、成功と進行バイト数を確認。旧交換の OUT 送信は1回のみで、搬送層での自動再送や APDU replay は行われない。
 - **後続工程との境界:**
   - 本PR（PR49）で接続されたのは、公開カードリセット（`dtv_reset_card`）、取得済み ATR の公開 getter（`dtv_get_card_atr`）、三層機種dispatch、合成reset要求・応答、Core共通ATR構造/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、決定51整合、L3 §6.2 に基づく PENDING close 停止回収、型付き私有カード搬送境界（PR48）、および共通T=1完成block交換口（PR49: ATR由来条件、Core block codec、byte累積読取、完成block FW責務分離、共通結果正規化・進行確定性・無replay）である。
   - Core共通T=1 protocol（I/R/S block意味、sequence、WTX、chaining、block retry）、公開APDU送受信API（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset/card transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回公開APDU完成やT=1規格全体準拠、全カード機能完成とはしない。
@@ -892,15 +898,20 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
     - PR48（カード搬送）fixture切り分けおよび修正経緯:
       - 初回fixture応答長誤設定の修正: byte-write synthetic demux が 1 byte の応答領域に対して 4 byte を通知し、waiter から `RESOURCE_EXHAUSTED` となった。byte-write 応答長を 1 byte へ合わせて解消（既存期待値の弱化・skipなし）。
       - close/cancel 時の完了済み送信 completion 回収不足の実装修正: close/cancel 直後に runtime が完了済み USB 送信 completion を回収する前に caller が抜け、送信進行量が 0 のままだった（Core の cancel 経路で完了通知を先に回収しない実装不足）。typed transport の timeout/cancel 経路で完了済み completion を回収し、tx 進行量と retired 状態を記録するよう修正して解消。これらは実機ハードウェアでの検証済みではなく、合成環境・fixture での修正実績である。
-    - PR49（共通T=1完成block交換）fixture切り分けおよび修正経緯:
-      - 開発中のfixture実行において、fixture側の入力分割状態、1-byte末尾read仮定、transaction ID再利用、合成CRC ATRのTC配置、LRC期待値、close fixtureの保持session EDC期待値の誤りを合意済みwire/session条件に合わせて修正。実装不具合を隠すskipや期待緩和ではない（合成環境・fixtureでの修正実績であり実機ハードウェア検証済みとは扱わない）。
+    - PR49（共通T=1完成block交換および代表並行fixture）fixture切り分けおよび修正経緯:
+      - 開発中のfixture実行において、fixture側の入力分割状態、1-byte末尾read仮定、transaction ID再利用、合成CRC ATRのTC配置、LRC期待値、close fixtureの保持session EDC期待値の誤りを合意済みwire/session条件に合わせて修正。
+      - C7/C8代表fixture（commit `df95b45c`）実行において、初回はsetupで残ったUSB_DISCONNECTEDイベントを誤認していたためinterleave前にsetupイベントを排出するよう修正。ABSENT通知時の実測内部結果（`card_transport_context` の NOT_READY 返却）にアサーションを整合させ、後続close fixtureが前提とするCRC sessionを再確立するよう修正。実装不具合を隠すskipや期待緩和ではない（合成環境・fixtureでの修正実績であり実機ハードウェア検証済みとは扱わない）。
   - PR47作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.37秒。reset 前の getter NOT_READY、reset 後の getter バイト列・長さ完全一致、getter 単独での追加 endpoint 出力なし、reset 失敗後の出力クリアと getter NOT_READY、unsupported 筐体での出力クリア、別 receiver signal 進行後の pointer 有効性維持等を確認）、`git diff --check` 通過。
   - PR48作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.47秒。既存CARD/receiver/close回帰に加え、byte write/readとcompleted T=1 block往復、送受信byte数、応答欠落時unknown/no-retry、in-flight closeのCANCELLEDとPENDING回収を確認）、全target build 成功（`cmake --build build --parallel 2`）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `e7f6694155cb90d1a0926736ded4d64f83f1ff5b`）。
-  - PR49作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（18.93秒。LRC/CRC、byte-chunkと完成block双方の往復、応答bytes/進行、不完全・余剰・不正frame、timeout/no-replay、closeを確認）、`git diff origin/main...HEAD --check` 通過、GitHub exact-head 照合一致（commit `71bac0a5193b7016e564388b1ffcd6c3dd60424f`）。
+  - PR49作者検証:
+    - 旧head（`71bac0a5`）: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（18.93秒。LRC/CRC、byte-chunkと完成block双方の往復、応答bytes/進行、不完全・余剰・不正frame、timeout/no-replay、closeを確認）、`git diff origin/main...HEAD --check` 通過。
+    - 最新head（`df95b45c`）: source/header不変、tests/fixturesのみ更新（+296, -1行）。変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 連続2回 pass（20.94秒、20.99秒。保留中CARD_REMOVED通知・state ABSENT・generation進行・別receiver 192→188 read因果同期、遅延旧INF 6F00フェンス `tx=8, rx=0`・不明・追加OUTなし、新session INF 9000成功を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `df95b45cfc23060210da204393e92adf329178f9`）。
+    - なお、初回QAにおけるC7/C8判定不能はprobe配送/同期限界（外部probeからの同期観測限界）によるものであり、今回の作者fixtureは代表動的成功であるが、独立QAはこれから実施される。
 - **未実施事項・過去の不合格履歴:**
   - 独立QA（コミット `4520f4e927c677653c937b337056694c1f668604`）において、PR41修正前 head（`dd9220bbe6aa6f6ed68bd41cd83b539343d22877`）に対する独立プローブにより、親 close 時にブロック待機中の stream reader が解除されない不具合（failure 30 / exit 91）が検出・不合格判定された履歴がある（PR41修正により解消、不合格の事実を改ざんしない）。
-  - 今回の PR49 head（`71bac0a5193b7016e564388b1ffcd6c3dd60424f`）に対する全 CTest suite、全体build、CLI、Android NDK compile、Android runtime、公開 quiet-shelf 最終 CI、および由来確認は後続 QA に委任されており、未実施・成功済みにしない。本 PR49 は main 宛ての PR であり、未 merge である。
-  - 交換中の stale epoch 動的 fixture、および新交換経路と別 receiver 188 read / CARD 通知の並行専用 fixture は後続 QA として区別し、成功済みにしない。公開 APDU 完成や T=1 全体準拠の断定は行わない。
+  - 今回の PR49 最新head（`df95b45cfc23060210da204393e92adf329178f9`）に対する全 CTest suite、全体build、CLI、Android NDK compile、公開 quiet-shelf 最終 CI、および由来確認は後続 QA に委任されており、未実施・成功済みにしない。本 PR49 は main 宛ての PR であり、未 merge である。全host/規格/NDK/公開CIの先行合格は旧head（`19e5e6b1`）の証拠であり、最新headのCI等を実施済みにしない。後続QAは差分と最終snapshotを確認する。
+  - **Android runtime の扱い:** 前回の文書において「Android runtime を今回の後続 QA に委任した」とあった表記は誤記であり、今回 QA 委任は NDK compile までであって、Android runtime は後続の実機/runtime 工程として区別・訂正する。
+  - 交換中の代表fixture以外の網羅的並行組み合わせや、T=1 全体準拠、公開 APDU 完成、実機検証済みの断定は行わない。
   - 実USB上の物理リソース衝突・物理unplug時の実機DISCONNECTED挙動、実機5製品の固有PID機器設定コマンド・実機TS転送接続・実機固有電源/reset transport/コマンド・実機カードAPDU・Androidランタイム実機動作・性能保証・全製品完成は未測定・未検証。
   - 実機5製品のlock観測source/byte/閾値・校正CNR電力測定・実機tuneコマンド・実機ストリーム転送・機器丸め/RF変換は未接続・未設定（実値・性能SLAの推測なし）。card APDU、daemon IPC、CLI channel/ts/card 実行も未接続。
   - 実機 Android 端末・USB 機器での実機動作確認、実機切断、permission 受渡し動作確認は未実施。架空の実機成功や全 OS 保証は行わない。

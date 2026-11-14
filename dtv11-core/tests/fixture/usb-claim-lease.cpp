@@ -36,6 +36,7 @@ void set_scan_card_transport_drop_reply(bool);
 void set_scan_card_t1_exchange_mode(unsigned);
 void set_scan_card_t1_fault(unsigned);
 void set_scan_card_t1_crc(bool);
+void set_scan_card_t1_stale_reply(bool);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
@@ -2803,6 +2804,237 @@ int public_card_transport()
         return 26;
     }
     set_scan_card_t1_exchange_mode(0);
+    set_scan_card_t1_crc(false);
+
+    auto *const interleave_devices = dtv_get_devices(root);
+    auto *const interleave_receivers = interleave_devices == nullptr
+        ? nullptr : dtv_get_receivers(interleave_devices[0]);
+    dtv_stream *interleave_stream = nullptr;
+    if (interleave_receivers == nullptr || interleave_receivers[1] == nullptr ||
+        dtv_open_stream(interleave_receivers[1], nullptr, &interleave_stream, &error) !=
+            DTV_ERROR_OK || interleave_stream == nullptr) return 28;
+    std::thread interleave_exchange;
+    std::thread interleave_read;
+    std::thread interleave_reset;
+    const auto cleanup_interleave = [&] {
+        dtv_cancel_stream(interleave_stream, &error);
+        dtv_cancel_enclosure(root, &error);
+        if (interleave_read.joinable()) interleave_read.join();
+        if (interleave_exchange.joinable()) interleave_exchange.join();
+        if (interleave_reset.joinable()) interleave_reset.join();
+        (void)dtv_close_stream(interleave_stream, nullptr, &error);
+        dtv_release_stream(interleave_stream);
+    };
+    const dtv_call_options event_call{sizeof(dtv_call_options), 2};
+    bool event_queue_empty = false;
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        dtv_event event{};
+        event.struct_size = sizeof(event);
+        const auto event_result = dtv_wait_event(&event, &event_call, &error);
+        if (event_result == DTV_ERROR_TIMEOUT) {
+            event_queue_empty = true;
+            break;
+        }
+        if (event_result != DTV_ERROR_OK || event.kind == DTV_EVENT_CARD_INSERTED ||
+            event.kind == DTV_EVENT_CARD_REMOVED) {
+            cleanup_interleave();
+            return 47;
+        }
+    }
+    if (!event_queue_empty) {
+        cleanup_interleave();
+        return 48;
+    }
+    const auto initial_card_generation = dtv_get_card_generation(root);
+    set_scan_card_t1_crc(true);
+    set_scan_card_t1_stale_reply(true);
+    set_scan_card_t1_exchange_mode(2);
+    set_scan_card_interleave_phase(1);
+    const auto interleave_output_count = backend->endpoint_submission_count(0x02);
+    const auto interleave_output_start = backend->output_snapshot().size();
+    std::atomic<bool> interleave_exchange_done{false};
+    dtv_internal_result interleave_exchange_result{};
+    dtv::internal::T1BlockResult stale_t1_result{};
+    interleave_exchange = std::thread([&] {
+        interleave_exchange_result = dtv::internal::exchange_public_t1_block(root,
+            dtv::internal::T1BlockRequest{0x00, 0x00, t1_inf}, dtv_timeout{5000, 0},
+            &stale_t1_result);
+        interleave_exchange_done.store(true, std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x02, interleave_output_count + 1)) {
+        cleanup_interleave();
+        return 29;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x02);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        cleanup_interleave();
+        return 30;
+    }
+    const auto notification_submissions = backend->endpoint_submission_count(0x81);
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1) ||
+        !backend->wait_for_endpoint_submissions(0x81, notification_submissions + 1)) {
+        cleanup_interleave();
+        return 31;
+    }
+    const auto absent_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (dtv_get_card_state(root) != DTV_CARD_ABSENT &&
+           std::chrono::steady_clock::now() < absent_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    dtv_event removed_event{};
+    removed_event.struct_size = sizeof(removed_event);
+    const dtv_call_options card_event_call{sizeof(dtv_call_options), 1000};
+    const auto removed_state = dtv_get_card_state(root);
+    const auto removed_generation = dtv_get_card_generation(root);
+    const auto removed_result = dtv_wait_event(&removed_event, &card_event_call, &error);
+    if (removed_state != DTV_CARD_ABSENT ||
+        removed_generation != initial_card_generation + 1 ||
+        removed_result != DTV_ERROR_OK || removed_event.kind != DTV_EVENT_CARD_REMOVED ||
+        interleave_exchange_done.load(std::memory_order_acquire)) {
+        std::fprintf(stderr, "T1 interleave notification state=%u generation=%llu initial=%llu event=%d/%u done=%d phase=%u\n",
+            removed_state, static_cast<unsigned long long>(removed_generation),
+            static_cast<unsigned long long>(initial_card_generation), removed_result,
+            removed_event.kind, interleave_exchange_done.load(std::memory_order_acquire),
+            scan_card_interleave_phase_value());
+        cleanup_interleave();
+        return 32;
+    }
+    std::array<std::uint8_t, 188> interleave_packet{};
+    std::uint64_t interleave_read_size = 0;
+    std::atomic<std::int32_t> interleave_read_result{DTV_ERROR_INTERNAL};
+    dtv_error interleave_read_error{};
+    interleave_read_error.struct_size = sizeof(interleave_read_error);
+    interleave_read = std::thread([&] {
+        const dtv_call_options read_call{sizeof(dtv_call_options), 5000};
+        interleave_read_result.store(dtv_read_stream(interleave_stream, interleave_packet.data(),
+            interleave_packet.size(), &read_call, &interleave_read_size, &interleave_read_error),
+            std::memory_order_release);
+    });
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x82);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        cleanup_interleave();
+        return 33;
+    }
+    interleave_read.join();
+    if (interleave_read_result.load(std::memory_order_acquire) != DTV_ERROR_OK ||
+        interleave_read_size != interleave_packet.size() || interleave_packet[0] != 0x47 ||
+        interleave_packet[1] != 0x81 ||
+        interleave_exchange_done.load(std::memory_order_acquire) ||
+        dtv_get_card_state(root) != DTV_CARD_ABSENT ||
+        scan_card_interleave_phase_value() != 3) {
+        cleanup_interleave();
+        return 34;
+    }
+    const auto stale_reply_submissions = backend->endpoint_submission_count(0x81);
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1) ||
+        !backend->wait_for_endpoint_submissions(0x81, stale_reply_submissions + 1)) {
+        cleanup_interleave();
+        return 36;
+    }
+    interleave_exchange.join();
+    const auto interleave_outputs = backend->output_snapshot();
+    const std::array<unsigned char, 6> interleave_header{0x00, 0x00, 0x03, 0x10, 0x20, 0x30};
+    if (interleave_exchange_result.code != DTV_INTERNAL_RESULT_NOT_READY ||
+        stale_t1_result.raw_block_length != 0 || !stale_t1_result.inf.empty() ||
+        stale_t1_result.io.tx_bytes_done != 8 || stale_t1_result.io.rx_bytes_done != 0 ||
+        stale_t1_result.io.reply_complete || stale_t1_result.io.result_known ||
+        stale_t1_result.io.transport_error.code != DTV_INTERNAL_RESULT_NOT_READY ||
+        backend->endpoint_submission_count(0x02) != interleave_output_count + 1 ||
+        interleave_outputs.size() != interleave_output_start + 1 ||
+        interleave_outputs.back().size() != 8 ||
+        !std::equal(interleave_header.begin(), interleave_header.end(),
+            interleave_outputs.back().begin()) ||
+        scan_card_interleave_phase_value() != 4) {
+        std::fprintf(stderr, "T1 stale result=%d transport=%d raw=%zu inf=%zu tx=%zu rx=%zu known=%d complete=%d out=%u/%zu phase=%u\n",
+            interleave_exchange_result.code, stale_t1_result.io.transport_error.code,
+            stale_t1_result.raw_block_length, stale_t1_result.inf.size(),
+            stale_t1_result.io.tx_bytes_done, stale_t1_result.io.rx_bytes_done,
+            stale_t1_result.io.result_known, stale_t1_result.io.reply_complete,
+            backend->endpoint_submission_count(0x02) - interleave_output_count,
+            interleave_outputs.size() - interleave_output_start,
+            scan_card_interleave_phase_value());
+        cleanup_interleave();
+        return 37;
+    }
+    const auto present_submissions = backend->endpoint_submission_count(0x81);
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1) ||
+        !backend->wait_for_endpoint_submissions(0x81, present_submissions + 1)) {
+        cleanup_interleave();
+        return 39;
+    }
+    const auto present_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (dtv_get_card_state(root) != DTV_CARD_PRESENT &&
+           std::chrono::steady_clock::now() < present_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    dtv_event inserted_event{};
+    inserted_event.struct_size = sizeof(inserted_event);
+    if (dtv_get_card_state(root) != DTV_CARD_PRESENT ||
+        dtv_get_card_generation(root) != initial_card_generation + 2 ||
+        dtv_wait_event(&inserted_event, &card_event_call, &error) != DTV_ERROR_OK ||
+        inserted_event.kind != DTV_EVENT_CARD_INSERTED) {
+        cleanup_interleave();
+        return 40;
+    }
+    set_scan_card_interleave_phase(0);
+    set_scan_card_t1_stale_reply(false);
+    set_scan_card_t1_exchange_mode(0);
+    set_scan_card_t1_crc(true);
+    const auto next_session_reset_output = backend->endpoint_submission_count(0x02) + 1;
+    std::atomic<std::int32_t> next_session_reset_result{DTV_ERROR_INTERNAL};
+    dtv_error next_session_reset_error{};
+    next_session_reset_error.struct_size = sizeof(next_session_reset_error);
+    interleave_reset = std::thread([&] {
+        const std::uint8_t *atr = nullptr;
+        std::uint64_t atr_size = 0;
+        next_session_reset_result.store(dtv_reset_card(root, nullptr, &atr, &atr_size,
+            &next_session_reset_error), std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x02, next_session_reset_output)) {
+        cleanup_interleave();
+        return 41;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x02);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        cleanup_interleave();
+        return 42;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        cleanup_interleave();
+        return 44;
+    }
+    interleave_reset.join();
+    if (next_session_reset_result.load(std::memory_order_acquire) != DTV_ERROR_OK ||
+        next_session_reset_error.code != DTV_ERROR_OK || dtv_get_card_state(root) != DTV_CARD_READY) {
+        cleanup_interleave();
+        return 45;
+    }
+    dtv::internal::T1BlockResult next_session_result{};
+    std::vector<std::vector<unsigned char>> next_session_outputs;
+    if (run_t1_exchange(2, &next_session_result, 1000, &next_session_outputs) !=
+            DTV_INTERNAL_RESULT_OK ||
+        next_session_result.inf != std::vector<unsigned char>{0x90, 0x00} ||
+        next_session_result.io.tx_bytes_done != 8 ||
+        next_session_result.io.rx_bytes_done != 7 ||
+        !next_session_result.io.reply_complete || !next_session_result.io.result_known ||
+        next_session_outputs.size() != 1 ||
+        next_session_outputs[0].size() != 8 ||
+        !std::equal(interleave_header.begin(), interleave_header.end(),
+            next_session_outputs[0].begin()) ||
+        dtv_close_stream(interleave_stream, nullptr, &error) != DTV_CLOSE_CLOSED) {
+        dtv_release_stream(interleave_stream);
+        return 46;
+    }
+    dtv_release_stream(interleave_stream);
     set_scan_card_t1_crc(false);
 
     set_scan_card_transport_drop_reply(true);
