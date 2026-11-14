@@ -762,6 +762,11 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - カードリセット要求は `run_public_card_operation` を経由して `SharedInOwner` のチケット機構で発行される。
   - 同期 USB 待機（`wait_for_reply`）は呼び出し元スレッド（caller）側で行われるため、`SharedInOwner` の worker スレッドはブロックされない。
   - これにより、リセット ACK 待機中であっても、同一エンドポイント上のカード状態通知（`CARD_PRESENT` 等の反映）や、別 receiver の TS 配送（192バイトから188バイトへの変換読取）が並行して妨げられずに進行する。
+- **L3 §6.2 に基づく PENDING close の state getter からの再開・回収:**
+  - `dtv_close_enclosure()` は操作チケット待機中（呼び出し元スレッドの処理中等）にタイムアウトするとスロットを `DTV_CLOSE_PENDING` として一旦戻る。このとき後続のランタイム停止処理（`runtime->stop()`）が未実行のまま残る場合がある。
+  - 利用者が正本 L3 §6.2 の契約に従い `dtv_get_enclosure_close_state()` でポーリングを行う際、従来はランタイムの worker 終了を待つだけで未実行のクローズ処理を再開しなかったため、スレッド終了待ちで PENDING のまま停止する問題があった。
+  - これを解消するため、getter 側においてスロットが `PENDING` の場合、`slot->mutex` を保持しない状態で既存の `dtv_close_enclosure` 継続処理を 1ms タイムアウトで呼び出し、中断していたクローズパイプライン（ランタイム停止・キャンセル・drain・join）を安全に再開・進行させるよう修正した。
+  - 利用者は正本通りの getter-only（`dtv_get_enclosure_close_state()` のみ）を維持し、追加の worker スレッドや別状態機械、新 API を導入することなく、安全に `DTV_CLOSE_CLOSED` への回収が完了する。
 - **後続工程との境界:**
   - 本PR（PR45）で接続されたのは、公開カードリセット（`dtv_reset_card`）、三層機種dispatch、合成reset要求・応答、Core共通ATR完全性/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、および決定51整合である。
   - 公開 `dtv_get_card_atr` のキャッシュ/再取得経路接続、T=1 プロトコル搬送（byte/chunk および完全 block）、Core 共通 T=1 sequence / WTX / chaining、APDU 送信（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回全カード機能完成とはしない。
@@ -799,16 +804,19 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - `git diff --check` 通過。
   - CI・fixture切り分け履歴:
     - TS 同期確立経緯: 初回は 192バイト source を 1 TS 単位だけ注入したため同期 framer が 188バイト変換同期を確立できず公開 read が timeout。5個の 192バイト TS 単位を供給するよう fixture を修正し同期確立・読取成功（既存期待値の変更・skipなし）。
-    - close PENDING の getter-only 回収への修正経緯:
+    - close PENDING の getter-only 停止回収修正の経緯:
       - 旧 head `25b645a25159358eb60c12b2743347c86aadb5c9` の Windows push CI（run 43595306769）で失敗した際、試行として caller 終了同期後に fixture から `dtv_close_enclosure` を再度呼び出す形（commit `65cfd397`）を一度導入した。しかし独立 QA の照合により、PENDING 中に再度 close を呼び出すことは L3 §6.2（クローズ処理中は利用者は `dtv_get_enclosure_close_state()` で状態確認のみを行い、再度クローズを呼んではならない）に違反することが確認された。
-      - これを受け、最新 head（`6849f77df330e84ed55ea945e156b2b7e4fddff9`）において fixture を修正し、caller CANCELLED 確認後は余分な close 再呼出しを行わず、`dtv_get_enclosure_close_state()` のポーリングのみ（getter-only）で `DTV_CLOSE_CLOSED` への回収を待機・確認する契約通りの実装へと整合した（Linux 全24 CTest、`usb_claim_lease_contract` 5回反復 pass、production source は不変）。
-      - なお、旧 Windows push 単独失敗の根本原因は未確定（製品実装不具合と断定せず、Windows 環境におけるタイミング差等の可能性を含め根因未確定として扱う）。
-    - 最終 head の CI 実行状況の区別:
-      - 旧 head `54817505118b69851ed506a8d09898efaaeb2619` では GitHub Actions CI（Linux / Windows push/PR 全ジョブ、run 43596896675, 43596903035）が成功した（旧 head `25b645a` の PR Windows は run 43595311718 で成功）。
-      - 最新 head `6849f77df330e84ed55ea945e156b2b7e4fddff9` の CI（push run 43600730239, PR run 43600733981）は、GitHub Actions のアカウント課金制限（spending limit / billing failure）により step 開始前に全ジョブが非開始（failure_before_steps）となった。これはテストやビルドの失敗ではなく「CI 未実行・非開始」であり、成功と明確に区別して記録する。
+      - 次に fixture 側を getter-only ポーリングへ修正（commit `6849f77`）したが、事前検証用公開 snapshot `0480927d`（push 43602290254, PR 43602294503）の Windows CI において、約 2.2 秒後に `pending reset=21 error=21 close=2` でタイムアウト失敗（22/23 pass）することが判明した。
+      - 原因調査の結果、初回 `dtv_close_enclosure` が操作チケット待機タイムアウトで PENDING へ戻ると、未実行のランタイム停止（`runtime->stop()`）を既存 getter が再開せず worker 終了待ちだけになり、worker が停止せず PENDING に留まる制御フロー欠陥が特定された。
+      - 最新 head（`42ab774861cb21b3376d8cbfc6b524c2ca4b2f19`）において、getter 側から mutex を保持せず 1ms タイムアウトで既存 close 継続処理を呼び出して未実行のランタイム停止を再開・完了させる修正（+10, -4 行）を実施。利用者は getter-only のまま、追加 worker や新 API、fixture 期待値変更なしで正常に回収されるようになった（Linux 全24 CTest、`usb_claim_lease_contract` 5回反復 pass、CLI help 両 entry point pass、NDK r27c static build pass、whitespace error なし）。
+      - なお、古い旧 head における push 失敗 / PR 成功の差異の正確なスケジューリング根本原因は未確定を維持する。
+    - 公開 CI 検証および最新運用の記録:
+      - 最新方針として、CI は `Khronos31/quiet-shelf`（公開リポジトリの完全一致検証ブランチ、PR 1）において同一内容を検証し、private リポジトリ側の請求設定（spending limit）を変更しない運用方針となった。
+      - 公開成功 snapshot `71f248b76c4bcd68cf7cd6462781665479fbd232` は、Core head `42ab7748` と 87 path/mode/blob が完全に一致し、GitHub Actions CI の push run `43604490188` および PR run `43604494561` において Linux 24/24 pass、Windows 23/23 pass（`usb_claim_lease_contract` 含む）、CLI contract pass をすべて達成した。
+      - 旧失敗 snapshot `0480927d`（push 43602290254, PR 43602294503）の失敗記録、旧課金制限による非開始 run（push 43600730239, PR 43600733981）、および旧 head `5481750` の CI 成功（push 43596896675, PR 43596903035）は過去の経緯としてそのまま記録を残す。
 - **未実施事項・過去の不合格履歴:**
   - 独立QA（コミット `4520f4e927c677653c937b337056694c1f668604`）において、PR41修正前 head（`dd9220bbe6aa6f6ed68bd41cd83b539343d22877`）に対する独立プローブにより、親 close 時にブロック待機中の stream reader が解除されない不具合（failure 30 / exit 91）が検出・不合格判定された履歴がある（PR41修正により解消、不合格の事実を改ざんしない）。
-  - 今回の PR45 head（`54817505118b69851ed506a8d09898efaaeb2619`）に対する独立 QA・由来確認は別担当へ委任のため未実施。
+  - 今回の PR45 head（`42ab774861cb21b3376d8cbfc6b524c2ca4b2f19`）に対する独立 QA・由来確認は別担当へ委任のため未実施。
   - 実USB上の物理リソース衝突・物理unplug時の実機DISCONNECTED挙動、実機5製品の固有PID機器設定コマンド・実機TS転送接続・実機固有電源/reset transport/コマンド・実機カードAPDU・Androidランタイム実機動作・性能保証・全製品完成は未測定・未検証。
   - 実機5製品のlock観測source/byte/閾値・校正CNR電力測定・実機tuneコマンド・実機ストリーム転送・機器丸め/RF変換は未接続・未設定（実値・性能SLAの推測なし）。card APDU、daemon IPC、CLI channel/ts/card 実行も未接続。
   - 実機 Android 端末・USB 機器での実機動作確認、実機切断、permission 受渡し動作確認は未実施。架空の実機成功や全 OS 保証は行わない。
