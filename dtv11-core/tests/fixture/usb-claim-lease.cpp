@@ -34,6 +34,9 @@ void set_scan_public_open_case(unsigned);
 void set_scan_card_reply_mode(unsigned);
 void set_scan_card_transport_drop_reply(bool);
 void set_scan_card_t1_exchange_mode(unsigned);
+void set_scan_card_t1_bgt(unsigned, std::uint64_t, std::uint64_t);
+unsigned scan_card_t1_bgt_refresh_count_value();
+void set_scan_card_t1_bgt_send_plan_override(std::uint64_t, std::uint64_t);
 void set_scan_card_t1_fault(unsigned);
 void set_scan_card_t1_crc(bool);
 void set_scan_card_t1_stale_reply(bool);
@@ -2671,6 +2674,73 @@ int public_card_transport()
         backend->output_snapshot().back() != std::vector<unsigned char>(block.begin(), block.end()))
         return 11;
 
+    struct SyntheticBgtClock {
+        std::atomic<std::uint64_t> now_ns{0};
+        std::atomic<std::uint64_t> revision_update_at_ns{0};
+        std::atomic<std::uint64_t> revision_update_bound_ns{5000000};
+        std::atomic<std::uint64_t> revision_update_revision{12};
+        std::atomic<std::uint64_t> plan_override_bound_ns{10000000};
+        std::atomic<std::uint64_t> plan_override_revision{13};
+        std::atomic<std::uint64_t> revision_shrink_at_ns{0};
+        std::atomic<std::uint64_t> revision_shrink_bound_ns{1000000};
+        std::atomic<std::uint64_t> revision_shrink_revision{14};
+        dtv_enclosure *cancel_root = nullptr;
+        bool cancel_on_delay = false;
+    } synthetic_bgt_clock;
+    synthetic_bgt_clock.now_ns.store(static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()),
+        std::memory_order_release);
+    const auto synthetic_now = [](void *user) -> std::uint64_t {
+        auto *clock = static_cast<SyntheticBgtClock *>(user);
+        return clock->now_ns.load(std::memory_order_acquire);
+    };
+    const auto synthetic_delay = [](void *user, std::uint64_t wake_at, std::uint64_t deadline,
+                                    const dtv_cancel *, std::uint32_t *cancelled) {
+        auto *clock = static_cast<SyntheticBgtClock *>(user);
+        if (clock->cancel_on_delay && clock->cancel_root != nullptr) {
+            clock->cancel_on_delay = false;
+            dtv_error error{};
+            error.struct_size = sizeof(error);
+            (void)dtv_cancel_enclosure(clock->cancel_root, &error);
+        }
+        const auto now = clock->now_ns.load(std::memory_order_acquire);
+        if (deadline != UINT64_MAX && wake_at > deadline)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
+        const auto update_at = clock->revision_update_at_ns.load(std::memory_order_acquire);
+        if (update_at != 0 && now < update_at && update_at <= wake_at) {
+            clock->now_ns.store(update_at, std::memory_order_release);
+            clock->revision_update_at_ns.store(0, std::memory_order_release);
+            set_scan_card_t1_bgt(2,
+                clock->revision_update_bound_ns.load(std::memory_order_acquire),
+                clock->revision_update_revision.load(std::memory_order_acquire));
+            set_scan_card_t1_bgt_send_plan_override(
+                clock->plan_override_bound_ns.load(std::memory_order_acquire),
+                clock->plan_override_revision.load(std::memory_order_acquire));
+            if (cancelled != nullptr) *cancelled = 0;
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        }
+        const auto shrink_at = clock->revision_shrink_at_ns.load(std::memory_order_acquire);
+        if (shrink_at != 0 && now < shrink_at && shrink_at <= wake_at) {
+            clock->now_ns.store(shrink_at, std::memory_order_release);
+            clock->revision_shrink_at_ns.store(0, std::memory_order_release);
+            set_scan_card_t1_bgt(2,
+                clock->revision_shrink_bound_ns.load(std::memory_order_acquire),
+                clock->revision_shrink_revision.load(std::memory_order_acquire));
+            if (cancelled != nullptr) *cancelled = 0;
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        }
+        if (wake_at > now) clock->now_ns.store(wake_at, std::memory_order_release);
+        if (cancelled != nullptr) *cancelled = 0;
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    };
+    const dtv_runtime_clock synthetic_clock{&synthetic_bgt_clock, synthetic_now,
+        synthetic_delay, nullptr};
+    dtv::internal::set_public_card_bgt_clock_for_test(&synthetic_clock);
+    struct SyntheticBgtClockReset {
+        ~SyntheticBgtClockReset() { dtv::internal::set_public_card_bgt_clock_for_test(nullptr); }
+    } synthetic_bgt_clock_reset;
+
     const std::array<unsigned char, 3> t1_inf{0x10, 0x20, 0x30};
     std::array<dtv::internal::T1BlockResult, 2> t1_results{};
     const auto run_t1_exchange = [&](unsigned mode, dtv::internal::T1BlockResult *block_result,
@@ -2769,8 +2839,15 @@ int public_card_transport()
     std::vector<std::vector<unsigned char>> apdu_two_output;
     set_scan_card_t1_apdu_mode(true, 0);
     if (run_t1_apdu(1, apdu_one, &apdu_one_result, &apdu_one_output) !=
-            DTV_INTERNAL_RESULT_OK ||
-        run_t1_apdu(2, apdu_two, &apdu_two_result, &apdu_two_output) !=
+            DTV_INTERNAL_RESULT_OK) return 56;
+    const auto bgt_receive_complete = synthetic_now(&synthetic_bgt_clock);
+    set_scan_card_t1_bgt(2, 1000000, 10);
+    const auto bgt_refreshes_before = scan_card_t1_bgt_refresh_count_value();
+    synthetic_bgt_clock.revision_update_at_ns.store(bgt_receive_complete + 22000000 - 1,
+        std::memory_order_release);
+    synthetic_bgt_clock.revision_shrink_at_ns.store(bgt_receive_complete + 220000000 - 1,
+        std::memory_order_release);
+    if (run_t1_apdu(2, apdu_two, &apdu_two_result, &apdu_two_output) !=
             DTV_INTERNAL_RESULT_OK ||
         apdu_one_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
         apdu_two_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
@@ -2789,6 +2866,54 @@ int public_card_transport()
             apdu_two_result.io.tx_bytes_done, apdu_two_result.io.rx_bytes_done);
         return 29;
     }
+    if (synthetic_now(&synthetic_bgt_clock) < bgt_receive_complete + 220000000 ||
+        scan_card_t1_bgt_refresh_count_value() < bgt_refreshes_before + 2) {
+        std::fprintf(stderr, "BGT revision wait elapsed=%llu refresh=%u/%u\n",
+            static_cast<unsigned long long>(synthetic_now(&synthetic_bgt_clock) - bgt_receive_complete),
+            scan_card_t1_bgt_refresh_count_value(), bgt_refreshes_before);
+        return 57;
+    }
+    set_scan_card_t1_bgt(2, 1000000, 15);
+    synthetic_bgt_clock.revision_update_bound_ns.store(5000000, std::memory_order_release);
+    synthetic_bgt_clock.revision_update_revision.store(16, std::memory_order_release);
+    synthetic_bgt_clock.plan_override_bound_ns.store(10000000, std::memory_order_release);
+    synthetic_bgt_clock.plan_override_revision.store(17, std::memory_order_release);
+    synthetic_bgt_clock.revision_update_at_ns.store(
+        synthetic_now(&synthetic_bgt_clock) + 22000000 - 1, std::memory_order_release);
+    const auto outputs_before_deadline = backend->endpoint_submission_count(0x02);
+    dtv::internal::T1ApduResult deadline_result{};
+    const auto deadline_code = run_t1_apdu(2, apdu_one, &deadline_result, nullptr, 150);
+    if (deadline_code != DTV_INTERNAL_RESULT_TIMEOUT ||
+        backend->endpoint_submission_count(0x02) != outputs_before_deadline ||
+        deadline_result.io.tx_bytes_done != 0 || !deadline_result.io.result_known) {
+        std::fprintf(stderr, "BGT plan deadline code=%d out=%u/%u tx=%zu known=%u\n",
+            deadline_code, backend->endpoint_submission_count(0x02), outputs_before_deadline,
+            deadline_result.io.tx_bytes_done, deadline_result.io.result_known);
+        return 62;
+    }
+    const auto check_bgt_rejected = [&](unsigned mode, std::uint64_t bound,
+                                        std::uint64_t revision) {
+        set_scan_card_t1_bgt(mode, bound, revision);
+        const auto outputs_before = backend->endpoint_submission_count(0x02);
+        dtv::internal::T1ApduResult rejected{};
+        const auto code = run_t1_apdu(1, apdu_one, &rejected);
+        return code == DTV_INTERNAL_RESULT_OK ? false
+            : backend->endpoint_submission_count(0x02) == outputs_before &&
+                rejected.io.tx_bytes_done == 0 && rejected.io.result_known;
+    };
+    const auto overflow_bound = (std::numeric_limits<std::uint64_t>::max)() / 22 + 1;
+    const auto unknown_rejected = check_bgt_rejected(0, 0, 18);
+    const auto zero_rejected = check_bgt_rejected(2, 0, 18);
+    const auto overflow_rejected = check_bgt_rejected(2, overflow_bound, 18);
+    const auto same_revision_mismatch = check_bgt_rejected(2, 11000000, 17);
+    const auto revision_rollback = check_bgt_rejected(2, 1000000, 16);
+    if (!unknown_rejected || !zero_rejected || !overflow_rejected ||
+        !same_revision_mismatch || !revision_rollback) {
+        std::fprintf(stderr, "BGT rejected=%u/%u/%u same=%u rollback=%u\n", unknown_rejected,
+            zero_rejected, overflow_rejected, same_revision_mismatch, revision_rollback);
+        return 58;
+    }
+    set_scan_card_t1_bgt(2, 1000000, 18);
     std::array<unsigned char, 33> oversized_apdu{};
     const auto before_oversized = backend->output_snapshot().size();
     dtv::internal::T1ApduResult oversized_result{};
@@ -3422,6 +3547,27 @@ int public_card_transport()
     }
     dtv_release_stream(interleave_stream);
     set_scan_card_t1_crc(false);
+
+    set_scan_card_t1_bgt(2, 500000000, 19);
+    synthetic_bgt_clock.cancel_root = root;
+    synthetic_bgt_clock.cancel_on_delay = true;
+    dtv::internal::set_public_card_bgt_clock_for_test(&synthetic_clock);
+    const auto before_bgt_cancel = backend->endpoint_submission_count(0x02);
+    dtv::internal::T1ApduResult bgt_cancel_result{};
+    const auto bgt_cancel_result_code = dtv::internal::exchange_public_t1_apdu(root, apdu_one,
+        dtv_timeout{30000, 0}, &bgt_cancel_result);
+    synthetic_bgt_clock.cancel_root = nullptr;
+    if (bgt_cancel_result_code.code != DTV_INTERNAL_RESULT_CANCELLED ||
+        backend->endpoint_submission_count(0x02) != before_bgt_cancel ||
+        bgt_cancel_result.io.tx_bytes_done != 0 || !bgt_cancel_result.io.result_known) {
+        std::fprintf(stderr, "BGT cancel result=%d outputs=%u/%u tx=%zu known=%u\n",
+            bgt_cancel_result_code.code, backend->endpoint_submission_count(0x02),
+            before_bgt_cancel, bgt_cancel_result.io.tx_bytes_done,
+            bgt_cancel_result.io.result_known);
+        return 60;
+    }
+    synthetic_bgt_clock.now_ns.fetch_add(20000000000, std::memory_order_acq_rel);
+    set_scan_card_t1_bgt(2, 1000000, 20);
 
     set_scan_card_transport_drop_reply(true);
     reply.clear();

@@ -174,6 +174,7 @@ struct CardByteWrite {
 };
 
 struct CardByteRead {
+    // Capacity zero is reserved for timing-only plan refresh and is never transported.
     std::size_t capacity = 0;
 };
 
@@ -209,9 +210,20 @@ struct CardIoOutcome {
 
 enum class CardTransportMode : std::uint32_t { byte_chunks, complete_block };
 
+enum class CardBgtMode : std::uint32_t { unknown, transport_guarded, bounded_etu };
+
+struct CardBgtCapability {
+    CardBgtMode mode = CardBgtMode::unknown;
+    bool receive_complete_after_last_edge = false;
+    std::uint64_t etu_upper_bound_ns = 0;
+    std::uint64_t revision = 0;
+    std::uint64_t evidence_id = 0;
+};
+
 struct PublicCardTransportPlan {
     PublicOperationPlan operation;
     CardTransportMode mode = CardTransportMode::byte_chunks;
+    CardBgtCapability bgt;
 };
 
 struct PublicTuneRequest {

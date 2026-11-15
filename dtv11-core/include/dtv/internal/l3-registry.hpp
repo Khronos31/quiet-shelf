@@ -74,6 +74,12 @@ public:
     dtv_device *card_reader_device(const dtv_enclosure *) const;
     dtv_internal_result card_transport_context(const dtv_enclosure *,
                                               dtv::spi::CardTransportContext *) const;
+    dtv_internal_result card_t1_bgt_before_send(const dtv_enclosure *,
+        const dtv::spi::CardTransportContext &, const dtv::spi::CardBgtCapability *,
+        std::uint64_t, std::uint64_t *) const;
+    dtv_internal_result card_t1_bgt_receive_complete(const dtv_enclosure *,
+        const dtv::spi::CardTransportContext &, const dtv::spi::CardBgtCapability *,
+        std::uint64_t);
     dtv_internal_result begin_card_t1_session(dtv_enclosure *, std::shared_ptr<void> *,
                                                dtv::spi::CardTransportContext *, bool *, bool *);
     dtv_internal_result finish_card_t1_exchange(dtv_enclosure *,
@@ -178,7 +184,8 @@ dtv_internal_result run_public_operation_for_test(
 dtv_internal_result run_public_card_transport(
     dtv_enclosure *, const dtv::spi::CardTransportOperation &, dtv_timeout,
     std::vector<unsigned char> *, dtv::spi::CardIoOutcome *,
-    std::shared_ptr<void> * = nullptr);
+    std::shared_ptr<void> * = nullptr,
+    std::function<dtv_internal_result(dtv::spi::CardBgtCapability *, dtv_timeout *)> = {});
 void release_public_card_ticket(dtv_enclosure *, std::shared_ptr<void> *);
 struct T1BlockRequest {
     std::uint8_t nad = 0;
@@ -201,6 +208,7 @@ dtv_internal_result exchange_public_t1_block(
     std::shared_ptr<void> * = nullptr, std::span<const unsigned char> = {});
 dtv_internal_result exchange_public_t1_apdu(
     dtv_enclosure *, std::span<const unsigned char>, dtv_timeout, T1ApduResult *);
+void set_public_card_bgt_clock_for_test(const dtv_runtime_clock *);
 std::int32_t run_public_stream_operation(
     dtv_stream *, std::uint32_t, std::span<const unsigned char>, dtv_timeout,
     std::span<unsigned char>, std::size_t *, dtv_error *);

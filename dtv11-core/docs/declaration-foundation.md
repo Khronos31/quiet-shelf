@@ -924,17 +924,48 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
     - 回復後の次APDUが期待どおり `I(0,0)` となり、1回の成功交換分だけsequenceが進むことを確認。
     - complete_block において、R後も重複Iが続くケースで同一Rを3回送信して成功INFなし・UNSUPPORTED・既知進行量でsessionが失効しreset後に再開できること、およびR送信後の応答欠損で100ms caller deadlineにてTIMEOUTとなりINFなし・`result_known=false` でsessionが失効することを確認。
     - 既存のCARD通知、別receiver 188 read、遅延旧応答拒否、reset回復、close取消/PENDING drainの回帰を同一fixture内で確認。
+- **Core私有BGT契約と送信前ガード（PR53、C11中段・採用BGT案A・三状態capability・22 ETU guard・APDU間保持・共有USB解放・無replay・S保留）:**
+  - **位置付けと私有境界:**
+    - Issue 25（コメント6886346683）で採用された案A（Core共通規則＋証拠付きFW保証または完全受信順序保証と安全な実効ETU上界を渡す私有契約）に基づき、S(RESYNCH)着手に先立って共通完成T=1 block交換口（`exchange_public_t1_block`）の送信前に22 ETUのBGT（Block Guard Time）保護を通す私有Core単位（C11中段）である。
+    - 受信R-block再送（PR51）やCore送信Rによる系列回復（PR52）、および将来のS制御において、全I/R/S送信が同じ共通block送信入口を通り、APDU間でもBGT保護が維持される共通構造を確立する。なお、S(RESYNCH)制御自体の実装は保留中である。
+    - 本BGT契約はCore内部の私有搬送契約であり、公開C API（`dtv_transmit_apdu`）の接続完了ではない。公開C宣言、正本、製品SPI（既存operation table/signature）は変更しておらず、公開APDU完成やT=1規格全体準拠と取り違えない。また、実装の私有待機値や上限を新公開契約にしない。
+    - 完成block（`complete_block`）におけるFWのframe/EDC検査保証と物理BGT保証は別概念であり、合成fixtureでの成功は実機ハードウェアにおける物理BGT保証の実証ではない。
+  - **三状態capabilityとreader guard状態:**
+    - **三状態capability:** `PublicCardTransportPlan` にreader私有の `CardBgtCapability` を導入し、以下の三状態を厳密に区別：
+      1. `unknown`: 初期値。BGT保証の証拠なし。
+      2. `transport_guarded`: 証拠ID（evidence ID）付きで物理搬送側がBGT guardを直接保証。
+      3. `bounded_etu`: 完全受信順序保証（`receive_complete_after_last_edge = true`）および安全な実効ETU時間上界（`etu_duration_upper_bound_ns`）を提供。
+    - **reader guard状態と境界失効:** Core内部のRootにconnection epoch、request epoch、完全受信完了時刻、guard期限、capability revision、ETU上界、mode/evidence IDを保持。resetや抜去（epoch更新）発生時は旧境界・旧revisionを失効。
+  - **送信前guard待機とリソース所有・安全規則:**
+    - **22×ETU算術検査とguard待機:**
+      - ISO/IEC 7816-3:2006 §7.1（実効ETU）および§11.2（逆方向文字先頭間22 ETU）に基づき、完全受信完了時刻から `22 × 上界ETU` 経過まで送信を待機（BWT §11.4.3 とは別概念）。
+      - 22倍算のオーバーフロー検査、および未知・0・overflow・revision/evidence不整合の事前検査を実施し、不正時は物理OUT前に拒否（送受信進行量0、結果既知を保持）。
+      - byte/chunk内のfragment間には誤ってguardを挿入せず、block全体の送信前にのみ適用。
+    - **待機中のリソース解放とcaller期限:**
+      - 待機中はAPDUの既存 `CardT1SessionLease` と論理operation ticketを維持してcancel/close検知を可能としつつ、operation admissionを一時解放して共有USB endpoint資源を保持せず、別receiver 188 readやCARD通知の並行進行を阻害しない。
+      - 次block送信時にcaller期限、cancel/close、epochを再検査して再admission。待機中にcaller期限に達した場合は物理OUTを出さずTIMEOUTとしてsessionを失効（APDU全体の自動再送・replayは行わない）。
+    - **実送信operation planのBGT改定検査と未経過guard保護:**
+      - 共通T=1 block送信前のBGT保護において、Core共通の内部before-send hookを追加し、actual operation plan（`complete_block` では実際の `CardT1BlockExchange` plan、`byte_chunks` では最初の `CardByteWrite` plan）のBGT capabilityを検査。
+      - planのoperation outputおよびresource keysを待機前にCore所有vectorへコピーし、待機中に共有USB資源を保持せず、待機完了後にその同一actual planをそのままadmission・物理OUTへ使用（待機後の通常re-planningによるone-shot状態二重消費を回避）。
+      - guard目標時刻に達した時点でplan callbackへ予約済み `CardByteRead{capacity=0}` を渡してBGT metadataをtiming-onlyで再照会（通常transport operationへは渡さない）。
+      - 返却capabilityからrevision・上界・期限を再検査し、上界増加時は完全受信完了時刻を起点に待機期限を再計算・延長。Rootが保持する未経過期限とのmaxを維持し、縮小改定時も未経過期限を短縮しない。更新された上界・時刻値は完了記録（Root）にも反映。
+      - 再照会不能、unknown、同revisionでのmode/evidence変更・上界不整合、およびrevision rollback発生時は物理OUT前に停止（fail-closed、送受信進行量0、結果既知を保持）。
+      - ただし、製品adapterのplan callback副作用やcapacity-zero対応、未確認な全製品の対応、任意瞬間の物理clock変化の安全性までを全面保証するものではない。
+  - **両adapterでの実測実績:**
+    - 合成単調時計を用いたfixtureにおいて、完全受信後22,000,000nsに達するまで次APDU送信を待機すること、byte_chunksからcomplete_blockへのAPDU間guard保持、正しいINFと系列結果を確認。
+    - 実送信plan改定の代表fixtureとして、初期1ms/rev10から旧期限22ms直前に5ms/rev12へ増加し、timing-only再照会を経てactual `CardT1BlockExchange` planが10ms/rev13を返した場合に、guardを受信完了起点220msへ延長し、220ms期限直前の1ms/rev14縮小でも短縮せず220msを維持してOUTし、正しいINFを返すことを確認（通常send plan改定反例を代表fixture化したもの）。
+    - 上界増加後の新期限がcaller deadline（150ms）を超える場合のTIMEOUT（OUTなし、tx=0、結果既知）、unknown・上界0・22倍算overflow・同revision不整合・rollbackの拒否、重複I→R→正常Iの共通send入口通過、および待機中cancel時のCANCELLED回収を確認。
 - **後続工程との境界:**
-  - 本PR（PR52）で接続されたのは、公開カードリセット（`dtv_reset_card`）、取得済み ATR の公開 getter（`dtv_get_card_atr`）、三層機種dispatch、合成reset要求・応答、Core共通ATR構造/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、決定51整合、L3 §6.2 に基づく PENDING close 停止回収、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、Core内部単一I-block APDU交換・session sequence（PR50）、受信R-block再送と単一I-block再送制御（PR51）、および受信I系列不一致に対するCore送信R-blockと系列回復（PR52: 重複Iに対するCore送信Rによるカード応答回復、同一ticket/deadline、重複INF不採用、正常I時のみ一度系列更新、3R上限失効、無replay、reset回復）である。
-  - 不完全/構造不正ブロックやBWTタイムアウトからのR生成、S-block制御/WTX/IFS/RESYNCH回復、I-block連鎖（chaining）、公開APDU送受信API（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset/card transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回公開APDU完成やT=1規格全体準拠、全カード機能完成とはしない。
+  - 本PR（PR53）で接続されたのは、公開カードリセット（`dtv_reset_card`）、取得済み ATR の公開 getter（`dtv_get_card_atr`）、三層機種dispatch、合成reset要求・応答、Core共通ATR構造/TCK検査、返却領域所有・寿命、直列化・二重世代フェンス、決定51整合、L3 §6.2 に基づく PENDING close 停止回収、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、Core内部単一I-block APDU交換・session sequence（PR50）、受信R-block再送と単一I-block再送制御（PR51）、受信I系列不一致に対するCore送信R-blockと系列回復（PR52）、およびCore私有BGT契約と送信前ガード（PR53: 三状態capability、完全受信順序＋実効ETU上界による22 ETU guard、APDU間保持、待機中共有USB解放、checked arithmetic、無replay）である。
+  - S-block制御/WTX/IFS/RESYNCH回復（保留中）、不完全/構造不正ブロックやBWTタイムアウトからのR生成、I-block連鎖（chaining）、公開APDU送受信API（`dtv_transmit_apdu`）、PC/SC、実機5製品固有の電源/reset/card transport/コマンド、実USB機器、Android ランタイム実機動作は本PRの対象外であり後続工程である。今回公開APDU完成やT=1規格全体準拠、全カード機能完成とはしない。
 
 ## CLI接続・既存レガシーとの境界・未実装範囲
 
 - **CLI接続:** 生成された main は、argc/argv を変更せずそのまま既存Coreの `dtv_cli_main` へ渡す。L1の全parserや全subcommandの実装が完了したわけではない。
 - **レガシーとの境界:** 既存のメタデータAPI（`dtv_model_count`, `dtv_model_get`）や旧内部ランタイム（USB、discovery、firmware転送）は残存しているが、本PRで導入された新L3 registryとは分離されている。正本との識別子衝突を回避するため、内部レガシー型・状態名は機械的に改名されている。また、旧来の `UsbContext` 既定コンストラクタによる2-worker常駐経路もレガシー境界として残存している。
 - **未実装・未接続範囲:**
-  - 合成機種における完全rootの公開 open / close / state / release / cancel、1-worker ランタイム、共有 IN 継続受信、有界返信配送、claim 排他予約、共通操作受付・物理scope ticket予約、合成共有INからの公開CARD状態・CARD_INSERTED/REMOVEDイベント接続、安定した公開receiver配列・getter/support・動的宣言確定接点、公開LOCK_ACQUIRED/LOCK_LOSTイベント接続、公開シグナル取得API（`dtv_get_signal` によるロック現在値照会・決定53 reason同期）、公開周波数選局API（`dtv_tune_by_frequency`、合成機種SPI、決定54選局時ロック状態遷移・世代フェンス）、公開チャンネル選局API（`dtv_tune_by_channel`、厳密ASCII文法・決定55整数Hz換算/衛星IF・セレクタ既定/排他）、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream`, `dtv_cancel_stream`, `dtv_close_stream`, `dtv_get_stream_close_state`, `dtv_release_stream`, `dtv_get_dropped_bytes`, `dtv_get_desyncs`, `dtv_set_pid_filter`）、有限188/192バイトTS変換配送（Core TsFramer・製品transform接続）、合成連続ソースにおける決定56連続TSキュー満杯・SLOW_CONSUMER終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、公開カードリセットAPI（`dtv_reset_card`、合成reset、Core共通ATR検査・返却領域所有、直列化・二重世代フェンス、決定51整合、L3 §6.2 getter-only停止回収）、公開ATR getter API（`dtv_get_card_atr`、取得済みATR読み出し、現在値失効と返却領域寿命の分離）、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、Core内部単一I-block APDU交換・session sequence（PR50、C11初段）、受信R-block再送と単一I-block再送制御（PR51、C11中段）、および受信I系列不一致に対するCore送信R-blockと系列回復（PR52、C11中段: 重複Iに対するCore送信Rによるカード応答回復・同一ticket/deadline・重複INF不採用・正常I時のみ一度系列更新・3R上限失効・無replay）は本PRで実資源へ接続完了。
-  - 不完全/構造不正ブロックやBWTタイムアウトからのR生成、S-block制御/WTX/IFS/RESYNCH回復、I-block連鎖（chaining）、公開カードAPDU送受信API（`dtv_transmit_apdu` 等）、PC/SC、および実機校正CNR/電力測定の実装接続。
+  - 合成機種における完全rootの公開 open / close / state / release / cancel、1-worker ランタイム、共有 IN 継続受信、有界返信配送、claim 排他予約、共通操作受付・物理scope ticket予約、合成共有INからの公開CARD状態・CARD_INSERTED/REMOVEDイベント接続、安定した公開receiver配列・getter/support・動的宣言確定接点、公開LOCK_ACQUIRED/LOCK_LOSTイベント接続、公開シグナル取得API（`dtv_get_signal` によるロック現在値照会・決定53 reason同期）、公開周波数選局API（`dtv_tune_by_frequency`、合成機種SPI、決定54選局時ロック状態遷移・世代フェンス）、公開チャンネル選局API（`dtv_tune_by_channel`、厳密ASCII文法・決定55整数Hz換算/衛星IF・セレクタ既定/排他）、公開ストリーム受信API（`dtv_open_stream`, `dtv_read_stream`, `dtv_cancel_stream`, `dtv_close_stream`, `dtv_get_stream_close_state`, `dtv_release_stream`, `dtv_get_dropped_bytes`, `dtv_get_desyncs`, `dtv_set_pid_filter`）、有限188/192バイトTS変換配送（Core TsFramer・製品transform接続）、合成連続ソースにおける決定56連続TSキュー満杯・SLOW_CONSUMER終端接続、決定57に基づく公開PIDフィルタ機器設定・新着選別接続、公開カードリセットAPI（`dtv_reset_card`、合成reset、Core共通ATR検査・返却領域所有、直列化・二重世代フェンス、決定51整合、L3 §6.2 getter-only停止回収）、公開ATR getter API（`dtv_get_card_atr`、取得済みATR読み出し、現在値失効と返却領域寿命の分離）、型付き私有カード搬送境界（PR48）、共通T=1完成block交換口（PR49）、Core内部単一I-block APDU交換・session sequence（PR50、C11初段）、受信R-block再送と単一I-block再送制御（PR51、C11中段）、受信I系列不一致に対するCore送信R-blockと系列回復（PR52、C11中段）、およびCore私有BGT契約と送信前ガード（PR53、C11中段: 案A三状態capability・22 ETU guard・APDU間保持・待機中共有USB解放・checked arithmetic・無replay）は本PRで実資源へ接続完了。
+  - S-block制御/WTX/IFS/RESYNCH回復（保留中）、不完全/構造不正ブロックやBWTタイムアウトからのR生成、I-block連鎖（chaining）、公開カードAPDU送受信API（`dtv_transmit_apdu` 等）、PC/SC、および実機校正CNR/電力測定の実装接続。
   - 実機5製品（PX4, PIX, FS1等）の製品固有open計画・固有identify・初回/継続共有INの実機パラメータ・分類・実機CARD/LOCK通知値・実機受信部宣言・実機ロック判定閾値・実機tuneコマンド/機器丸め/RF変換・実機ストリーム転送/start-stopコマンド/ハードウェア通知フェンス・実機固有PID機器設定コマンド・実機固有電源/reset transport/コマンド。
   - ファームウェア転送 API。
   - daemon / wire API、各製品リポジトリの実装接続。
@@ -989,6 +1020,10 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
       - 次の run で I(1) を I として認識する mask を bit 7 だけに限定していた実装誤りが tx/rx progress で判明し、I PCB の bit 8=0 を判定する mask へ修正。
       - 後続 run で response byte が正しく 33 44 90 00 であることを確認し frame 実数に合わせて rx 期待値を 1 block = 8 bytes へ修正。
       - complete_block helper が R frame 併存時に全出力を command frame 扱いしていたため論理 I/R frame をそれぞれ独立に数える helper へ修正（製品期待値の緩和や skip なし。合成環境・fixture での修正実績であり実機ハードウェア検証済みとは扱わない）。
+    - PR53（Core私有BGT契約と送信前ガード、実送信plan修正）fixture切り分けおよび修正経緯:
+      - 開発中は構文ミスを修正し、focused test で fixture が上界状態を誤って保持していた問題と、合成 clock を system caller deadline へ写像していなかった問題を切り分けて修正。overflow 検査で不正 capability が reader state を汚染しないよう、checked arithmetic 完了後に状態を更新する制御へ修正。
+      - 待機中revision改定修正において、仮想時計と実時計の期限領域のずれ、追加送信による既存APDU系列fixture状態変化、同revision不整合ケースのrevision誤りを切り分けて解消。timing-only再照会による期限延長・縮小時短縮なし・caller deadline超過・不整合拒否を確認。
+      - 実送信plan一貫性修正において、deadline vectorがbyte_chunksを使い意図した通常CardT1BlockExchange plan overrideが発生しなかったfixture routeの選択ミスをcomplete_block routeへ切り替えて解消（製品期待値の緩和や skip なし。合成環境・fixture での修正実績であり実機ハードウェア検証済みとは扱わない）。
   - PR47作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.37秒。reset 前の getter NOT_READY、reset 後の getter バイト列・長さ完全一致、getter 単独での追加 endpoint 出力なし、reset 失敗後の出力クリアと getter NOT_READY、unsupported 筐体での出力クリア、別 receiver signal 進行後の pointer 有効性維持等を確認）、`git diff --check` 通過。
   - PR48作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（2.47秒。既存CARD/receiver/close回帰に加え、byte write/readとcompleted T=1 block往復、送受信byte数、応答欠落時unknown/no-retry、in-flight closeのCANCELLEDとPENDING回収を確認）、全target build 成功（`cmake --build build --parallel 2`）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `e7f6694155cb90d1a0926736ded4d64f83f1ff5b`）。
   - PR49作者検証:
@@ -998,11 +1033,15 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - PR50作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（35.19秒。単一I/I往復、両adapter連続2往復、N(S)=0/1遷移、command別INF、IFSC超過無I/O拒否、誤sequence/R/S/chaining拒否・session無効化・reset後回復、保留中CARD通知/別receiver 188 read/遅延旧応答拒否/close取消を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `e7f28b456e2e4fe6ff1c30155c8093b356994a53`、PR50 OPEN、base `t1-block-20261115`）。
   - PR51作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（61.75秒。両adapterでの `I(0,0) -> R(0) -> I(0,0) -> response` および次 APDU での `I(1,0)` 遷移、complete-block での `N(S)=1` 時の `R(1) -> I(1,0)` 再送と sequence wrap、error indication 1 受理、不正 R・試行限度 3 回停止、初回到達前欠損での再送なし、R 受信後欠損での進行量保持と session 失効、既存 CARD 通知/別 receiver 188 read/遅延旧応答拒否/reset 回復/close 取消回帰を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `f170d710aa74ce54770ea5f50eace1be0e2a4acb`、PR51 OPEN、base `t1-iblock-20261115`）。
   - PR52作者検証: 変更対象 `usb_claim_lease_contract` の build 成功、focused 1/1 pass（82.53秒。両adapterでの重複 `I(0,0)` に対する `R(1, other error) = 00 92 00 92` 送信・正しい `I(1,0)` 応答回収・重複 INF 破棄と正しい INF 返却・次 APDU での `I(0,0)` 遷移、complete-block での 3 回 R 試行上限 UNSUPPORTED 失効と reset 回復、R 送信後応答欠損時の 100ms caller deadline TIMEOUT・INF なし・`result_known=false` 失効、既存 CARD 通知/別 receiver 188 read/遅延旧応答拒否/reset 回復/close 取消回帰を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `91bb24f596a3dfaf316be1071f489f2aa6f81c3a`、PR52 OPEN、base `main`）。
+  - PR53作者検証: 全ターゲットビルド成功（`cmake --build build --parallel 2`）、変更対象 `usb_claim_lease_contract` の focused 1/1 pass（初回 90.82秒、待機中改定修正後 commit `3ec59498` で 100.52秒、実送信plan修正後 commit `87aa42f5fb24fff10b16d871af351cf1b53b9ee4` で 96.50秒。合成単調時計・期限直前のETU上界増加時の220ms待機延長・縮小時短縮なし・新期限超過時TIMEOUT・unknown/上界0/overflow/rollback拒否、重複I→R→正常Iの共通send入口通過、待機中cancel時のOUTなし・CANCELLED回収を確認）、`git diff --check` 通過、GitHub exact-head 照合一致（commit `87aa42f5fb24fff10b16d871af351cf1b53b9ee4`、PR53 OPEN、base `main` `6bc7b12315ed4bbf9f4a6c7a7a9dd33ebeae97a2`）。
 - **未実施事項・過去の不合格履歴:**
-  - 独立QA（コミット `4520f4e927c677653c937b337056694c1f668604`）において、PR41修正前 head（`dd9220bbe6aa6f6ed68bd41cd83b539343d22877`）に対する独立プローブにより、親 close 時にブロック待機中の stream reader が解除されない不具合（failure 30 / exit 91）が検出・不合格判定された履歴がある（PR41修正により解消、不合格の事実を改ざんしない）。
-  - 今回の PR52 head（`91bb24f596a3dfaf316be1071f489f2aa6f81c3a`）に対する全 CTest suite、全体build、CLI、Android NDK compile、公開 quiet-shelf 最終 CI（Linux/Windows 同一 snapshot）、規格独立確認、および由来確認は後続 QA に委任されており、未実施・成功済みにしない。本 PR52 は main を base とする独立 PR であり、未 merge である（先行 PR49, PR50, PR51 は main へ merge 済み）。先行 PR の証拠を PR52 新経路の実測へ読み替えず、最新 head の CI 等を実施済みにしない。後続 QA は差分と最終 snapshot を確認する。
-  - R 送信自体の部分 write、取消 / CARD_REMOVED / epoch 変化を R 待機中に発生させる専用 fixture は未実測であり、成功を主張しない。
-  - 先行 Windows の単発失敗原因（PR50/PR51由来）を推測・断定しない（新しい全組合せ試験要求は作らない）。
+  - 過去の不合格履歴として以下を改ざんせず記録：
+    - PR41修正前 head（`dd9220bb`）に対する独立プローブにより、親 close 時にブロック待機中の stream reader が解除されない不具合（failure 30 / exit 91）が検出・不合格判定された履歴（PR41修正により解消）。
+    - PR53修正前 head（commit `8c2d1f8c7a0ed38a79e49c354ebbc78a9c8021ae`、作者コード `35ed4e2a`）に対する独立QA（成果 `0bf1d145a9da12c560914296a0fe160da01780c7`）において、待機中のETU上界改定（1ms→5ms）時に再照会を行わず旧期限で早期OUTする不具合（failure 62、88ms早期OUT）が検出・不合格判定された履歴（作者コミット `3ec59498` により修正）。
+    - PR53待機中改定修正 head（commit `16478950ff958c72f3e251e084766c0f62f91b21`、作者コード `3ec59498`）に対する独立QA（成果 `00e8b810d5075574197f0649b07d499f692e088b`、`core-20261115-t1-bgt-revision-qa-result.json`）において、timing-only再照会後に取得された実送信 `CardT1BlockExchange` plan が新しいBGT capability（rev13/10ms）を返してもCoreがそれを無視して旧110ms期限でOUTする不具合（failure 63、exit 223、110ms早期OUT）が検出・不合格判定された履歴（今回の作者コミット `87aa42f5` により修正、新修正の独立受入は後続技術QAが実施）。
+  - 今回の PR53 修正 head（`87aa42f5fb24fff10b16d871af351cf1b53b9ee4`）に対する全 CTest suite、Windows CI、Android NDK compile、公開 quiet-shelf 最終 CI（Linux/Windows 同一 snapshot）、規格独立確認、および由来確認は後続技術 QA に委任されており、未実施・成功済みにしない。本 PR53 は main を base とする独立 PR であり、未受入・未 merge である（先行 PR49, PR50, PR51, PR52 は main へ merge 済み、Sは保留）。先行 PR の証拠を PR53 新規経路の実測へ読み替えず、最新 head の CI 等を実施済みにしない。後続 QA は差分と最終 snapshot を確認する。
+  - **未実測事項・制限の明示:** 製品 adapter の plan callback 副作用や capacity-zero timing-only 対応、guard 待機中に connection/request epoch を更新する専用 fixture、guard 待機中に close を呼ぶ専用 PENDING fixture、guard 待機中の別 receiver 188 read / CARD 通知直接同時進行専用 fixture、境界ちょうどの独立 vector は未実測であり、成功を主張しない。また、本合成 fixture は実機物理 BGT 保証の証拠ではなく、未確認な全製品の対応や任意瞬間の物理 clock 変化の安全性までを全面保証するものではない。
+  - 先行 Windows の単発失敗原因（PR50 reset return 10、PR51/52 共通 timeout return 27）を同一原因と推測・断定しない（新しい全組合せ試験要求は作らない）。
   - **Android runtime の扱い:** Android runtime は後続の実機/runtime 工程であり、今回の QA には委任しない（今回 QA 委任は NDK compile まで）。
   - 全てのdeadline/欠損応答raceの専用個別網羅、T=1 全体準拠、公開 APDU 完成、実機検証済みの断定は行わない。
   - 実USB上の物理リソース衝突・物理unplug時の実機DISCONNECTED挙動、実機5製品の固有PID機器設定コマンド・実機TS転送接続・実機固有電源/reset transport/コマンド・実機カードAPDU・Androidランタイム実機動作・性能保証・全製品完成は未測定・未検証。

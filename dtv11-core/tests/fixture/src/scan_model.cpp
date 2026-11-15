@@ -97,6 +97,13 @@ std::atomic<unsigned> scan_card_interleave_phase{0};
 std::atomic<unsigned> scan_card_transport_kind{0};
 std::atomic<bool> scan_card_transport_drop_reply{false};
 std::atomic<unsigned> scan_card_t1_exchange_mode{0};
+std::atomic<unsigned> scan_card_t1_bgt_mode{2};
+std::atomic<std::uint64_t> scan_card_t1_bgt_etu_upper_bound_ns{1000000};
+std::atomic<std::uint64_t> scan_card_t1_bgt_revision{1};
+std::atomic<unsigned> scan_card_t1_bgt_refresh_count{0};
+std::atomic<bool> scan_card_t1_bgt_send_plan_override{false};
+std::atomic<std::uint64_t> scan_card_t1_bgt_send_plan_bound_ns{0};
+std::atomic<std::uint64_t> scan_card_t1_bgt_send_plan_revision{0};
 std::atomic<unsigned> scan_card_t1_fault{0};
 std::atomic<bool> scan_card_t1_apdu_mode{false};
 std::atomic<unsigned> scan_card_t1_apdu_fault{0};
@@ -865,6 +872,28 @@ dtv_internal_result scan_plan_card_transport(
     static thread_local std::array<unsigned char, 1024> read_command{};
     static constexpr std::uint64_t card_resource = 918;
     auto &plan = transport_plan->operation;
+    transport_plan->bgt.mode = static_cast<dtv::spi::CardBgtMode>(
+        scan_card_t1_bgt_mode.load(std::memory_order_acquire));
+    transport_plan->bgt.receive_complete_after_last_edge = true;
+    transport_plan->bgt.etu_upper_bound_ns =
+        scan_card_t1_bgt_etu_upper_bound_ns.load(std::memory_order_acquire);
+    transport_plan->bgt.revision = scan_card_t1_bgt_revision.load(std::memory_order_acquire);
+    const auto *refresh = std::get_if<dtv::spi::CardByteRead>(&request->operation);
+    if (refresh != nullptr && refresh->capacity == 0) {
+        scan_card_t1_bgt_refresh_count.fetch_add(1, std::memory_order_acq_rel);
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    if (std::holds_alternative<dtv::spi::CardT1BlockExchange>(request->operation) &&
+        scan_card_t1_bgt_send_plan_override.exchange(false, std::memory_order_acq_rel)) {
+        transport_plan->bgt.etu_upper_bound_ns =
+            scan_card_t1_bgt_send_plan_bound_ns.load(std::memory_order_acquire);
+        transport_plan->bgt.revision =
+            scan_card_t1_bgt_send_plan_revision.load(std::memory_order_acquire);
+        scan_card_t1_bgt_etu_upper_bound_ns.store(transport_plan->bgt.etu_upper_bound_ns,
+            std::memory_order_release);
+        scan_card_t1_bgt_revision.store(transport_plan->bgt.revision,
+            std::memory_order_release);
+    }
     plan.supported = true;
     plan.ready = scan_public_open_case == 18;
     plan.arguments_valid = true;
@@ -1243,6 +1272,27 @@ void set_scan_card_transport_drop_reply(bool drop)
 void set_scan_card_t1_exchange_mode(unsigned mode)
 {
     scan_card_t1_exchange_mode.store(mode, std::memory_order_release);
+}
+
+void set_scan_card_t1_bgt(unsigned mode, std::uint64_t etu_upper_bound_ns,
+                          std::uint64_t revision)
+{
+    scan_card_t1_bgt_etu_upper_bound_ns.store(etu_upper_bound_ns, std::memory_order_release);
+    scan_card_t1_bgt_revision.store(revision, std::memory_order_release);
+    scan_card_t1_bgt_mode.store(mode, std::memory_order_release);
+}
+
+unsigned scan_card_t1_bgt_refresh_count_value()
+{
+    return scan_card_t1_bgt_refresh_count.load(std::memory_order_acquire);
+}
+
+void set_scan_card_t1_bgt_send_plan_override(std::uint64_t bound_ns,
+                                              std::uint64_t revision)
+{
+    scan_card_t1_bgt_send_plan_bound_ns.store(bound_ns, std::memory_order_release);
+    scan_card_t1_bgt_send_plan_revision.store(revision, std::memory_order_release);
+    scan_card_t1_bgt_send_plan_override.store(true, std::memory_order_release);
 }
 
 void set_scan_card_t1_fault(unsigned fault)

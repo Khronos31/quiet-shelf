@@ -54,6 +54,7 @@ dtv_log_callback log_callback = nullptr;
 void *log_callback_user = nullptr;
 bool log_callback_set = false;
 std::atomic<std::uint32_t> next_public_object_id{1};
+std::atomic<const dtv_runtime_clock *> public_card_bgt_clock_override{nullptr};
 
 std::uint32_t allocate_public_object_id()
 {
@@ -198,6 +199,16 @@ struct EnclosureRegistry::State {
         std::uint64_t card_reader_connection = 0;
         std::timed_mutex card_function_mutex;
         std::mutex card_t1_mutex;
+        std::mutex card_t1_bgt_mutex;
+        bool card_t1_bgt_has_boundary = false;
+        std::uint64_t card_t1_bgt_connection_epoch = 0;
+        std::uint64_t card_t1_bgt_request_epoch = 0;
+        std::uint64_t card_t1_bgt_complete_ns = 0;
+        std::uint64_t card_t1_bgt_not_before_ns = 0;
+        std::uint64_t card_t1_bgt_revision = 0;
+        std::uint64_t card_t1_bgt_etu_upper_bound_ns = 0;
+        std::uint64_t card_t1_bgt_evidence_id = 0;
+        dtv::spi::CardBgtMode card_t1_bgt_mode = dtv::spi::CardBgtMode::unknown;
         std::uint64_t card_request_epoch = 0;
         bool card_t1_session_valid = false;
         std::uint64_t card_t1_connection_epoch = 0;
@@ -1084,6 +1095,134 @@ dtv_internal_result EnclosureRegistry::card_transport_context(
     context->t1_crc = parameters.crc;
     context->t1_ifsc = parameters.ifsc;
     context->t1_ifsd = parameters.ifsd;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRegistry::card_t1_bgt_before_send(
+    const dtv_enclosure *object, const dtv::spi::CardTransportContext &context,
+    const dtv::spi::CardBgtCapability *capability, std::uint64_t now,
+    std::uint64_t *not_before) const
+{
+    if (capability == nullptr || not_before == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    if (capability->mode == dtv::spi::CardBgtMode::unknown || capability->revision == 0 ||
+        (capability->mode == dtv::spi::CardBgtMode::transport_guarded &&
+         capability->evidence_id == 0) ||
+        (capability->mode == dtv::spi::CardBgtMode::bounded_etu &&
+         (!capability->receive_complete_after_last_edge || capability->etu_upper_bound_ns == 0)) ||
+        (capability->mode != dtv::spi::CardBgtMode::transport_guarded &&
+         capability->mode != dtv::spi::CardBgtMode::bounded_etu))
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+    std::shared_ptr<State::Root> root;
+    {
+        std::lock_guard lock(state_->mutex);
+        root = state_->find_root(object);
+        if (!root || root->status != DTV_ENCLOSURE_READY ||
+            root->card_reader_connection != context.connection_epoch ||
+            root->card_request_epoch != context.request_epoch ||
+            root->card_state != DTV_CARD_READY)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
+    }
+    std::lock_guard lock(root->card_t1_bgt_mutex);
+    if (root->card_t1_bgt_has_boundary &&
+        (root->card_t1_bgt_connection_epoch != context.connection_epoch ||
+         root->card_t1_bgt_request_epoch != context.request_epoch)) {
+        root->card_t1_bgt_has_boundary = false;
+        root->card_t1_bgt_revision = 0;
+        root->card_t1_bgt_etu_upper_bound_ns = 0;
+        root->card_t1_bgt_evidence_id = 0;
+        root->card_t1_bgt_not_before_ns = 0;
+        root->card_t1_bgt_mode = dtv::spi::CardBgtMode::unknown;
+    }
+    if (root->card_t1_bgt_revision != 0 &&
+        (capability->revision < root->card_t1_bgt_revision ||
+         (capability->revision == root->card_t1_bgt_revision &&
+          (capability->mode != root->card_t1_bgt_mode ||
+           capability->etu_upper_bound_ns > root->card_t1_bgt_etu_upper_bound_ns ||
+           capability->evidence_id != root->card_t1_bgt_evidence_id))))
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    if (capability->mode == dtv::spi::CardBgtMode::transport_guarded) {
+        root->card_t1_bgt_mode = capability->mode;
+        root->card_t1_bgt_revision = capability->revision;
+        root->card_t1_bgt_etu_upper_bound_ns = 0;
+        root->card_t1_bgt_evidence_id = capability->evidence_id;
+        *not_before = now;
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    auto upper_bound = capability->etu_upper_bound_ns;
+    if (capability->mode == dtv::spi::CardBgtMode::bounded_etu &&
+        upper_bound > (std::numeric_limits<std::uint64_t>::max)() / 22)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+    *not_before = now;
+    if (!root->card_t1_bgt_has_boundary) {
+        root->card_t1_bgt_mode = capability->mode;
+        root->card_t1_bgt_revision = capability->revision;
+        root->card_t1_bgt_etu_upper_bound_ns = upper_bound;
+        root->card_t1_bgt_evidence_id = capability->evidence_id;
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    const auto guard_ns = upper_bound * 22;
+    if (root->card_t1_bgt_complete_ns >
+        (std::numeric_limits<std::uint64_t>::max)() - guard_ns)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+    *not_before = (std::max)(root->card_t1_bgt_not_before_ns,
+        root->card_t1_bgt_complete_ns + guard_ns);
+    root->card_t1_bgt_not_before_ns = *not_before;
+    root->card_t1_bgt_mode = capability->mode;
+    root->card_t1_bgt_revision = capability->revision;
+    root->card_t1_bgt_etu_upper_bound_ns = upper_bound;
+    root->card_t1_bgt_evidence_id = capability->evidence_id;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRegistry::card_t1_bgt_receive_complete(
+    const dtv_enclosure *object, const dtv::spi::CardTransportContext &context,
+    const dtv::spi::CardBgtCapability *capability, std::uint64_t completed_ns)
+{
+    if (capability == nullptr || capability->mode == dtv::spi::CardBgtMode::unknown ||
+        capability->revision == 0 ||
+        (capability->mode == dtv::spi::CardBgtMode::transport_guarded &&
+         capability->evidence_id == 0) ||
+        (capability->mode == dtv::spi::CardBgtMode::bounded_etu &&
+         (!capability->receive_complete_after_last_edge || capability->etu_upper_bound_ns == 0)))
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+    std::shared_ptr<State::Root> root;
+    {
+        std::lock_guard lock(state_->mutex);
+        root = state_->find_root(object);
+        if (!root || root->status != DTV_ENCLOSURE_READY ||
+            root->card_reader_connection != context.connection_epoch ||
+            root->card_request_epoch != context.request_epoch || root->card_state != DTV_CARD_READY)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
+    }
+    std::lock_guard lock(root->card_t1_bgt_mutex);
+    if (root->card_t1_bgt_revision != 0 && capability->revision < root->card_t1_bgt_revision)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    if (root->card_t1_bgt_revision != 0 && capability->revision == root->card_t1_bgt_revision &&
+        (capability->mode != root->card_t1_bgt_mode ||
+         capability->etu_upper_bound_ns > root->card_t1_bgt_etu_upper_bound_ns ||
+         capability->evidence_id != root->card_t1_bgt_evidence_id))
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    auto upper_bound = capability->etu_upper_bound_ns;
+    std::uint64_t not_before = completed_ns;
+    if (capability->mode == dtv::spi::CardBgtMode::bounded_etu) {
+        if (upper_bound > (std::numeric_limits<std::uint64_t>::max)() / 22)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+        const auto guard_ns = upper_bound * 22;
+        if (completed_ns > (std::numeric_limits<std::uint64_t>::max)() - guard_ns)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+        not_before = completed_ns + guard_ns;
+    }
+    root->card_t1_bgt_has_boundary = true;
+    root->card_t1_bgt_connection_epoch = context.connection_epoch;
+    root->card_t1_bgt_request_epoch = context.request_epoch;
+    root->card_t1_bgt_complete_ns = completed_ns;
+    root->card_t1_bgt_not_before_ns = (std::max)(root->card_t1_bgt_not_before_ns,
+        not_before);
+    root->card_t1_bgt_revision = capability->revision;
+    root->card_t1_bgt_etu_upper_bound_ns = upper_bound;
+    root->card_t1_bgt_evidence_id = capability->evidence_id;
+    root->card_t1_bgt_mode = capability->mode;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
@@ -3502,10 +3641,16 @@ dtv_internal_result run_public_operation_for_test(
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
         if (reuse_ticket) {
             if (operation->target_kind != request.target_kind ||
-                operation->target_id != request.target_id ||
-                operation->resource_count != resource_count ||
-                !std::equal(resource_keys.begin(), unique_end, operation->resource_keys.begin()))
+                operation->target_id != request.target_id)
                 return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+            if (operation->resource_count == 0 && !operation->request_submitted) {
+                operation->resource_count = resource_count;
+                std::copy(resource_keys.begin(), unique_end, operation->resource_keys.begin());
+            } else if (operation->resource_count != resource_count ||
+                       !std::equal(resource_keys.begin(), unique_end,
+                           operation->resource_keys.begin())) {
+                return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+            }
         } else {
             operation->target_kind = request.target_kind;
             operation->target_id = request.target_id;
@@ -3580,14 +3725,39 @@ dtv_internal_result run_public_operation_for_test(
         slot->operation_condition.wait_for(lock, std::chrono::milliseconds(2));
     }
     bool ticket_unavailable = false;
+    bool ticket_timed_out = false;
     if (reuse_ticket) {
-        std::lock_guard lock(slot->operation_mutex);
-        ticket_unavailable = operation->cancelled.load(std::memory_order_acquire) ||
-            slot->operation_closing || !operation->admitted;
+        for (;;) {
+            std::unique_lock lock(slot->operation_mutex);
+            if (operation->cancelled.load(std::memory_order_acquire) || slot->operation_closing) {
+                ticket_unavailable = true;
+                break;
+            }
+            if (operation->admitted) break;
+            bool blocked = false;
+            for (const auto &other : slot->operations) {
+                if (!other || other == operation || !operation_conflicts(*operation, *other)) continue;
+                if (other->admitted || other->id < operation->id) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (!blocked) {
+                operation->admitted = true;
+                break;
+            }
+            if (deadline != UINT64_MAX && clock->monotonic_now_ns(clock->user) >= deadline) {
+                ticket_unavailable = true;
+                ticket_timed_out = true;
+                break;
+            }
+            slot->operation_condition.wait_for(lock, std::chrono::milliseconds(2));
+        }
     }
     if (ticket_unavailable) {
         erase_operation();
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+        return dtv_internal_result_make(ticket_timed_out ? DTV_INTERNAL_RESULT_TIMEOUT
+                                                         : DTV_INTERNAL_RESULT_CANCELLED, 0);
     }
 
     if (state.registry.status(object) == DTV_ENCLOSURE_DISCONNECTED) {
@@ -3879,7 +4049,8 @@ std::int32_t run_public_card_operation(
 dtv_internal_result run_public_card_transport(
     dtv_enclosure *enclosure, const dtv::spi::CardTransportOperation &operation,
     dtv_timeout timeout, std::vector<unsigned char> *response,
-    dtv::spi::CardIoOutcome *outcome, std::shared_ptr<void> *retained_ticket)
+    dtv::spi::CardIoOutcome *outcome, std::shared_ptr<void> *retained_ticket,
+    std::function<dtv_internal_result(dtv::spi::CardBgtCapability *, dtv_timeout *)> before_send)
 {
     if (enclosure == nullptr || response == nullptr || outcome == nullptr)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
@@ -3970,6 +4141,14 @@ dtv_internal_result run_public_card_transport(
     }
     plan.output = owned_output;
     plan.resource_keys = owned_resource_keys;
+    if (before_send) {
+        result = before_send(&transport_plan.bgt, &timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) {
+            response->clear();
+            outcome->transport_error = result;
+            return result;
+        }
+    }
     const dtv::spi::PublicOperationRequest public_request{DTV_OP_CARD,
         dtv::spi::PublicOperationTargetKind::card,
         state.registry.enclosure_id(enclosure), {}};
@@ -4011,6 +4190,26 @@ void release_public_card_ticket(dtv_enclosure *enclosure, std::shared_ptr<void> 
         slot->operation_condition.notify_all();
     }
     ticket->reset();
+}
+
+void suspend_public_card_ticket(dtv_enclosure *enclosure, std::shared_ptr<void> *ticket)
+{
+    if (enclosure == nullptr || ticket == nullptr || !*ticket) return;
+    auto &state = public_discovery_state();
+    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
+    {
+        std::lock_guard lock(state.open_mutex);
+        const auto found = state.open_slots.find(enclosure);
+        if (found == state.open_slots.end()) return;
+        slot = found->second;
+    }
+    auto operation = std::static_pointer_cast<PublicDiscoveryState::OpenSlot::OperationControl>(
+        *ticket);
+    {
+        std::lock_guard lock(slot->operation_mutex);
+        operation->admitted = false;
+        slot->operation_condition.notify_all();
+    }
 }
 
 namespace {
@@ -4145,11 +4344,29 @@ dtv_internal_result exchange_public_t1_block(
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
 
     const auto *clock = system_runtime_clock();
-    if (clock == nullptr || clock->monotonic_now_ns == nullptr)
+    if (clock == nullptr || clock->monotonic_now_ns == nullptr || clock->delay_until == nullptr)
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0));
+    const auto *bgt_clock = public_card_bgt_clock_override.load(std::memory_order_acquire);
+    if (bgt_clock == nullptr) bgt_clock = clock;
+    if (bgt_clock->monotonic_now_ns == nullptr || bgt_clock->delay_until == nullptr)
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0));
     auto deadline = deadline_after(clock->monotonic_now_ns(clock->user), timeout.timeout_ms);
     if (timeout.operation_deadline_ns != 0)
         deadline = (std::min)(deadline, timeout.operation_deadline_ns);
+    auto bgt_deadline = deadline;
+    if (public_card_bgt_clock_override.load(std::memory_order_acquire) != nullptr &&
+        deadline != UINT64_MAX) {
+        const auto system_now = clock->monotonic_now_ns(clock->user);
+        const auto bgt_now = bgt_clock->monotonic_now_ns(bgt_clock->user);
+        if (bgt_now > system_now && bgt_now - system_now >
+            (std::numeric_limits<std::uint64_t>::max)() - deadline)
+            return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0));
+        if (bgt_now > system_now) bgt_deadline += bgt_now - system_now;
+        else if (bgt_now < system_now) {
+            const auto offset = system_now - bgt_now;
+            bgt_deadline = offset >= bgt_deadline ? 0 : bgt_deadline - offset;
+        }
+    }
     const auto next_timeout = [&] {
         return remaining_timeout(*clock, deadline);
     };
@@ -4159,17 +4376,161 @@ dtv_internal_result exchange_public_t1_block(
     auto *const ticket = retained_ticket == nullptr ? &local_ticket : retained_ticket;
     const auto fail = [&](dtv_internal_result failure) {
         aggregate.reply_complete = false;
-        if (aggregate.tx_bytes_done != 0 || aggregate.rx_bytes_done != 0)
-            aggregate.result_known = false;
+        aggregate.result_known = aggregate.tx_bytes_done == 0 && aggregate.rx_bytes_done == 0;
         aggregate.transport_error = failure;
         block_result->io = aggregate;
         if (retained_ticket == nullptr) release_public_card_ticket(enclosure, ticket);
         return failure;
     };
+    std::uint64_t not_before = 0;
+    auto current = bgt_clock->monotonic_now_ns(bgt_clock->user);
+    result = public_discovery_state().registry.card_t1_bgt_before_send(enclosure, context,
+        &selection.bgt, current, &not_before);
+    if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
+    for (;;) {
+        if (bgt_deadline != UINT64_MAX && not_before > bgt_deadline)
+            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0));
+        if (deadline != UINT64_MAX && clock->monotonic_now_ns(clock->user) >= deadline)
+            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0));
+        if (current >= not_before) break;
+        std::shared_ptr<PublicDiscoveryState::OpenSlot> current_slot;
+        {
+            auto &state = public_discovery_state();
+            std::lock_guard lock(state.open_mutex);
+            const auto found = state.open_slots.find(enclosure);
+            if (found == state.open_slots.end())
+                return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0));
+            current_slot = found->second;
+        }
+        if (ticket != nullptr && *ticket) {
+            const auto operation = std::static_pointer_cast<
+                PublicDiscoveryState::OpenSlot::OperationControl>(*ticket);
+            if (operation->cancelled.load(std::memory_order_acquire))
+                return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0));
+        }
+        {
+            std::lock_guard lock(current_slot->operation_mutex);
+            if (current_slot->operation_closing)
+                return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0));
+        }
+        dtv::spi::CardTransportContext current_context{};
+        result = public_discovery_state().registry.card_transport_context(enclosure,
+            &current_context);
+        if (result.code != DTV_INTERNAL_RESULT_OK ||
+            current_context.reader != context.reader ||
+            current_context.connection_epoch != context.connection_epoch ||
+            current_context.request_epoch != context.request_epoch)
+            return fail(result.code == DTV_INTERNAL_RESULT_OK
+                ? dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0) : result);
+        const auto poll_at = current > (std::numeric_limits<std::uint64_t>::max)() - 1000000
+            ? not_before : (std::min)(not_before, current + 1000000);
+        std::uint32_t cancelled = 0;
+        result = bgt_clock->delay_until(bgt_clock->user, poll_at, bgt_deadline, nullptr,
+            &cancelled);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
+        if (cancelled != 0)
+            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0));
+        current = bgt_clock->monotonic_now_ns(bgt_clock->user);
+        if (current >= not_before &&
+            selection.bgt.mode == dtv::spi::CardBgtMode::bounded_etu) {
+            auto refresh = probe;
+            refresh.operation = dtv::spi::CardByteRead{0};
+            dtv::spi::PublicCardTransportPlan refreshed{};
+            result = call_callback([&] {
+                return slot->ops->plan_card_transport(instance->context(), &refresh, &refreshed);
+            });
+            if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
+            selection.bgt = refreshed.bgt;
+            current = bgt_clock->monotonic_now_ns(bgt_clock->user);
+            result = public_discovery_state().registry.card_t1_bgt_before_send(enclosure,
+                context, &selection.bgt, current, &not_before);
+            if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
+        }
+    }
+    dtv::spi::CardBgtCapability completed_bgt{};
+    const auto before_send = [&](dtv::spi::CardBgtCapability *capability,
+                                 dtv_timeout *operation_timeout) {
+        if (capability == nullptr || operation_timeout == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+        std::uint64_t not_before = 0;
+        auto current = bgt_clock->monotonic_now_ns(bgt_clock->user);
+        auto wait_result = public_discovery_state().registry.card_t1_bgt_before_send(
+            enclosure, context, capability, current, &not_before);
+        if (wait_result.code != DTV_INTERNAL_RESULT_OK) return wait_result;
+        for (;;) {
+            if (current >= not_before &&
+                capability->mode == dtv::spi::CardBgtMode::bounded_etu) {
+                auto refresh = probe;
+                refresh.operation = dtv::spi::CardByteRead{0};
+                dtv::spi::PublicCardTransportPlan refreshed{};
+                wait_result = call_callback([&] {
+                    return slot->ops->plan_card_transport(instance->context(), &refresh,
+                        &refreshed);
+                });
+                if (wait_result.code != DTV_INTERNAL_RESULT_OK) return wait_result;
+                *capability = refreshed.bgt;
+                current = bgt_clock->monotonic_now_ns(bgt_clock->user);
+                wait_result = public_discovery_state().registry.card_t1_bgt_before_send(
+                    enclosure, context, capability, current, &not_before);
+                if (wait_result.code != DTV_INTERNAL_RESULT_OK) return wait_result;
+            }
+            if (bgt_deadline != UINT64_MAX && not_before > bgt_deadline)
+                return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
+            if (deadline != UINT64_MAX && clock->monotonic_now_ns(clock->user) >= deadline)
+                return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
+            if (current >= not_before) break;
+            std::shared_ptr<PublicDiscoveryState::OpenSlot> current_slot;
+            {
+                auto &state = public_discovery_state();
+                std::lock_guard lock(state.open_mutex);
+                const auto found = state.open_slots.find(enclosure);
+                if (found == state.open_slots.end())
+                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+                current_slot = found->second;
+            }
+            if (ticket != nullptr && *ticket) {
+                const auto operation = std::static_pointer_cast<
+                    PublicDiscoveryState::OpenSlot::OperationControl>(*ticket);
+                if (operation->cancelled.load(std::memory_order_acquire))
+                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+            }
+            {
+                std::lock_guard lock(current_slot->operation_mutex);
+                if (current_slot->operation_closing)
+                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+            }
+            dtv::spi::CardTransportContext current_context{};
+            wait_result = public_discovery_state().registry.card_transport_context(enclosure,
+                &current_context);
+            if (wait_result.code != DTV_INTERNAL_RESULT_OK ||
+                current_context.reader != context.reader ||
+                current_context.connection_epoch != context.connection_epoch ||
+                current_context.request_epoch != context.request_epoch)
+                return wait_result.code == DTV_INTERNAL_RESULT_OK
+                    ? dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0)
+                    : wait_result;
+            if (deadline != UINT64_MAX && clock->monotonic_now_ns(clock->user) >= deadline)
+                return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
+            const auto poll_at = current > (std::numeric_limits<std::uint64_t>::max)() - 1000000
+                ? not_before : (std::min)(not_before, current + 1000000);
+            std::uint32_t cancelled = 0;
+            wait_result = bgt_clock->delay_until(bgt_clock->user, poll_at, bgt_deadline,
+                nullptr, &cancelled);
+            if (wait_result.code != DTV_INTERNAL_RESULT_OK) return wait_result;
+            if (cancelled != 0)
+                return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+            current = bgt_clock->monotonic_now_ns(bgt_clock->user);
+        }
+        completed_bgt = *capability;
+        *operation_timeout = remaining_timeout(*clock, deadline);
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    };
+    std::function<dtv_internal_result(dtv::spi::CardBgtCapability *, dtv_timeout *)>
+        before_first_send = before_send;
     if (selection.mode == dtv::spi::CardTransportMode::complete_block) {
         result = run_public_card_transport(enclosure,
             dtv::spi::CardT1BlockExchange{outgoing, response_capacity}, next_timeout(),
-            &response, &aggregate, ticket);
+            &response, &aggregate, ticket, before_first_send);
         if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
         aggregate.reply_complete = true;
         aggregate.result_known = true;
@@ -4177,12 +4538,17 @@ dtv_internal_result exchange_public_t1_block(
             response[2] > context.t1_ifsd)
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
     } else {
+        bool before_send_pending = true;
         const auto write_part = [&](std::span<const unsigned char> bytes) {
             if (bytes.empty()) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
             std::vector<unsigned char> ack;
             dtv::spi::CardIoOutcome step{};
             auto step_result = run_public_card_transport(enclosure,
-                dtv::spi::CardByteWrite{bytes}, next_timeout(), &ack, &step, ticket);
+                dtv::spi::CardByteWrite{bytes}, next_timeout(), &ack, &step, ticket,
+                before_send_pending ? before_first_send :
+                    std::function<dtv_internal_result(
+                        dtv::spi::CardBgtCapability *, dtv_timeout *)>{});
+            if (step_result.code == DTV_INTERNAL_RESULT_OK) before_send_pending = false;
             aggregate.tx_bytes_done += step_result.code == DTV_INTERNAL_RESULT_OK
                 ? bytes.size() : (std::min)(bytes.size(), step.tx_bytes_done);
             aggregate.result_known = aggregate.result_known && step.result_known;
@@ -4254,6 +4620,10 @@ dtv_internal_result exchange_public_t1_block(
     aggregate.result_known = true;
     aggregate.transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     block_result->io = aggregate;
+    result = public_discovery_state().registry.card_t1_bgt_receive_complete(enclosure,
+        context, &completed_bgt, bgt_clock->monotonic_now_ns(bgt_clock->user));
+    if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
+    suspend_public_card_ticket(enclosure, ticket);
     if (retained_ticket == nullptr) release_public_card_ticket(enclosure, ticket);
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
@@ -4282,7 +4652,7 @@ dtv_internal_result exchange_public_t1_apdu(
     if (command.size() > context.t1_ifsc || command.size() > 254)
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
     const auto *clock = system_runtime_clock();
-    if (clock == nullptr || clock->monotonic_now_ns == nullptr)
+    if (clock == nullptr || clock->monotonic_now_ns == nullptr || clock->delay_until == nullptr)
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0));
     auto deadline = deadline_after(clock->monotonic_now_ns(clock->user), timeout.timeout_ms);
     if (timeout.operation_deadline_ns != 0)
@@ -4302,6 +4672,20 @@ dtv_internal_result exchange_public_t1_apdu(
         return reject(exception_result());
     }
     std::shared_ptr<void> ticket;
+    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
+    {
+        auto &state = public_discovery_state();
+        std::lock_guard lock(state.open_mutex);
+        const auto found = state.open_slots.find(enclosure);
+        if (found == state.open_slots.end())
+            return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0));
+        slot = found->second;
+    }
+    dtv_internal_result ticket_result{};
+    auto operation = acquire_public_card_ticket(slot, registry.enclosure_id(enclosure),
+        *clock, deadline, &ticket_result);
+    if (!operation) return reject(ticket_result);
+    ticket = std::move(operation);
     dtv::spi::CardIoOutcome aggregate{};
     const auto finish = [&](dtv_internal_result failure) {
         apdu_result->io = aggregate;
@@ -6914,6 +7298,11 @@ extern "C" int32_t dtv_cancel_enclosure(dtv_enclosure *object, dtv_error *error)
     if (!opening) cancel_open_operations(slot, false);
     set_public_error(error, DTV_ERROR_OK);
     return DTV_ERROR_OK;
+}
+
+void set_public_card_bgt_clock_for_test(const dtv_runtime_clock *clock)
+{
+    public_card_bgt_clock_override.store(clock, std::memory_order_release);
 }
 
 }
