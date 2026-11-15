@@ -101,6 +101,24 @@ struct PublicOpenPacket {
 enum class PublicOpenMessageKind { ignore, notification, control_reply, source_chunk, source_end };
 enum class PublicOpenNotificationKind { none, card_state, receiver_lock };
 
+enum class CardT1BwtObservation : std::uint32_t { unavailable, first_character, absence_confirmed };
+
+struct CardT1BwtEvidence {
+    CardT1BwtObservation observation = CardT1BwtObservation::unavailable;
+    std::uint64_t host_transaction_id = 0;
+    std::uint64_t card_transaction_id = 0;
+    std::uint64_t host_last_character_edge_ns = 0;
+    std::uint64_t card_first_character_edge_ns = 0;
+    std::uint64_t absence_observed_through_ns = 0;
+    std::uint64_t clock_domain = 0;
+    std::uint64_t error_bound_ns = 0;
+    bool error_bound_known = false;
+    std::uint64_t evidence_id = 0;
+    std::uint64_t revision = 0;
+    std::uint64_t connection_epoch = 0;
+    std::uint64_t request_epoch = 0;
+};
+
 struct PublicOpenMessage {
     PublicOpenMessageKind kind = PublicOpenMessageKind::ignore;
     PublicOpenNotificationKind notification_kind = PublicOpenNotificationKind::none;
@@ -113,6 +131,7 @@ struct PublicOpenMessage {
     std::uint32_t receiver_index = 0;
     std::uint32_t lock_state = 0;
     std::span<const unsigned char> payload;
+    CardT1BwtEvidence t1_bwt;
 };
 
 struct PublicStreamRequest {
@@ -145,6 +164,9 @@ struct PublicOpenSession {
     dtv_internal_result (*generation_for_handle)(void *, std::size_t,
                                                   std::uint64_t *) = nullptr;
     dtv_internal_result (*abandon_reply)(void *, std::uint64_t) = nullptr;
+    dtv_internal_result (*wait_reply_with_t1_bwt)(void *, std::uint64_t,
+        const std::atomic<bool> *, dtv_timeout, PublicOpenWaitResult *,
+        std::span<unsigned char>, std::size_t *, CardT1BwtEvidence *) = nullptr;
 };
 
 enum class PublicOperationTargetKind : std::uint32_t { enclosure, receiver, card, stream };
@@ -193,11 +215,23 @@ struct CardTransportContext {
     bool t1_crc = false;
     std::uint8_t t1_ifsc = 32;
     std::uint8_t t1_ifsd = 32;
+    std::uint16_t t1_bwi = 4;
+    std::uint16_t t1_f = 372;
+    std::uint16_t t1_d = 1;
 };
 
 struct CardTransportRequest {
     CardTransportContext context;
     CardTransportOperation operation;
+};
+
+struct CardT1BwtCapability {
+    std::uint64_t card_clock_hz = 0;
+    std::uint64_t clock_domain = 0;
+    std::uint64_t error_bound_ns = 0;
+    bool error_bound_known = false;
+    std::uint64_t revision = 0;
+    std::uint64_t evidence_id = 0;
 };
 
 struct CardIoOutcome {
@@ -206,6 +240,11 @@ struct CardIoOutcome {
     bool reply_complete = false;
     bool result_known = true;
     dtv_internal_result transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    std::uint64_t operation_transaction_id = 0;
+    std::uint64_t response_transaction_id = 0;
+    CardT1BwtEvidence t1_bwt;
+    bool t1_bwt_timeout = false;
+    CardT1BwtCapability t1_bwt_capability;
 };
 
 enum class CardTransportMode : std::uint32_t { byte_chunks, complete_block };
@@ -232,6 +271,7 @@ struct PublicCardTransportPlan {
     CardTransportMode mode = CardTransportMode::byte_chunks;
     CardBgtCapability bgt;
     CardT1ReceiveCapacity receive_capacity;
+    CardT1BwtCapability t1_bwt;
 };
 
 struct PublicTuneRequest {

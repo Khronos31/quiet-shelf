@@ -200,6 +200,7 @@ struct T1BlockResult {
     std::uint8_t pcb = 0;
     std::vector<unsigned char> inf;
     std::size_t raw_block_length = 0;
+    bool bwt_timeout = false;
     dtv::spi::CardIoOutcome io;
 };
 struct T1ApduResult {

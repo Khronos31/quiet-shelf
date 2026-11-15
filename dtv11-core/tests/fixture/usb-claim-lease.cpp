@@ -34,6 +34,7 @@ void set_scan_public_open_case(unsigned);
 void set_scan_card_reply_mode(unsigned);
 void set_scan_card_transport_drop_reply(bool);
 void set_scan_card_t1_exchange_mode(unsigned);
+void set_scan_card_t1_bwt_mode(unsigned);
 void set_scan_card_t1_bgt(unsigned, std::uint64_t, std::uint64_t);
 unsigned scan_card_t1_bgt_refresh_count_value();
 void set_scan_card_t1_bgt_send_plan_override(std::uint64_t, std::uint64_t);
@@ -3059,10 +3060,114 @@ int public_card_transport()
     const auto host_i_zero_lrc = encode_t1_lrc_frame(0x00, apdu_one);
     const auto host_r_one_lrc = encode_t1_lrc_frame(0x90, {});
     const auto host_i_one_lrc = encode_t1_lrc_frame(0x40, apdu_two);
+    const auto host_r_zero_lrc = encode_t1_lrc_frame(0x82, {});
     const auto host_ifs_result = std::vector<unsigned char>{
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
         0x90, 0x00, 0x62, 0x83};
     set_scan_card_t1_bgt(2, 1000000, 18);
+    for (const auto mode : {1u, 2u}) {
+        for (const auto bwt_mode : {1u, 2u, 3u}) {
+            if (!reset_t1_session()) return 200;
+            set_scan_card_t1_receive_capacity(false, 0, 0, 0);
+            set_scan_card_t1_bwt_mode(bwt_mode);
+            set_scan_card_t1_apdu_mode(true, 0);
+            dtv::internal::T1ApduResult recovered{};
+            std::vector<std::vector<unsigned char>> output;
+            const auto recovered_code = run_t1_apdu(mode, apdu_one, &recovered, &output, 5000);
+            if (recovered_code != DTV_INTERNAL_RESULT_OK ||
+                recovered.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+                !recovered.io.reply_complete || !recovered.io.result_known ||
+                !same_apdu_frame_sent(mode, output, host_i_zero_lrc, apdu_one, 1) ||
+                !same_r_frame_sent(mode, output, host_r_zero_lrc,
+                    bwt_mode == 1 ? 1 : bwt_mode == 2 ? 2 : 0)) {
+                std::fprintf(stderr, "BWT recovery mode=%u bwt=%u result=%d response=%zu tx=%zu rx=%zu known=%u complete=%u outputs=%zu\n",
+                    mode, bwt_mode, recovered_code, recovered.response.size(),
+                    recovered.io.tx_bytes_done, recovered.io.rx_bytes_done,
+                    recovered.io.result_known, recovered.io.reply_complete, output.size());
+                return 201;
+            }
+            set_scan_card_t1_bwt_mode(0);
+            dtv::internal::T1ApduResult next{};
+            if (run_t1_apdu(mode, apdu_two, &next) != DTV_INTERNAL_RESULT_OK ||
+                next.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+                !next.io.reply_complete || !next.io.result_known) return 202;
+        }
+    }
+    for (const auto mode : {1u, 2u}) {
+        for (const auto bwt_mode : {4u, 5u, 6u, 7u}) {
+            if (!reset_t1_session()) return 203;
+            set_scan_card_t1_receive_capacity(false, 0, 0, 0);
+            set_scan_card_t1_bwt_mode(bwt_mode);
+            set_scan_card_t1_apdu_mode(true, 0);
+            dtv::internal::T1ApduResult rejected{};
+            std::vector<std::vector<unsigned char>> output;
+            const auto rejected_code = run_t1_apdu(mode, apdu_one, &rejected, &output, 5000);
+            if (rejected_code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+                rejected.io.reply_complete) {
+                std::fprintf(stderr, "BWT capability mode=%u bwt=%u result=%d tx=%zu rx=%zu known=%u complete=%u outputs=%zu\n",
+                    mode, bwt_mode, rejected_code, rejected.io.tx_bytes_done,
+                    rejected.io.rx_bytes_done, rejected.io.result_known,
+                    rejected.io.reply_complete, output.size());
+                return 204;
+            }
+            if (bwt_mode == 6) {
+                if (rejected.io.tx_bytes_done == 0 || rejected.io.result_known ||
+                    !same_apdu_frame_sent(mode, output, host_i_zero_lrc, apdu_one, 1)) {
+                    std::fprintf(stderr, "BWT boundary mode=%u result=%d tx=%zu rx=%zu known=%u outputs=%zu\n",
+                        mode, rejected_code, rejected.io.tx_bytes_done,
+                        rejected.io.rx_bytes_done, rejected.io.result_known, output.size());
+                    return 204;
+                }
+            } else if (rejected.io.tx_bytes_done != 0 || !rejected.io.result_known ||
+                !output.empty()) {
+                std::fprintf(stderr, "BWT unavailable mode=%u bwt=%u result=%d tx=%zu rx=%zu known=%u outputs=%zu\n",
+                    mode, bwt_mode, rejected_code, rejected.io.tx_bytes_done,
+                    rejected.io.rx_bytes_done, rejected.io.result_known, output.size());
+                return 204;
+            }
+            set_scan_card_t1_bwt_mode(0);
+        }
+    }
+    for (const auto mode : {1u, 2u}) {
+        if (!reset_t1_session()) return 205;
+        set_scan_card_t1_receive_capacity(false, 0, 0, 0);
+        set_scan_card_t1_bwt_mode(0);
+        set_scan_card_t1_apdu_mode(true, 18);
+        dtv::internal::T1ApduResult chained{};
+        std::vector<std::vector<unsigned char>> chain_output;
+        if (run_t1_apdu(mode, apdu_one, &chained, &chain_output) != DTV_INTERNAL_RESULT_OK ||
+            chained.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00}) return 205;
+        set_scan_card_t1_apdu_mode(true, 50);
+        set_scan_card_t1_bwt_mode(1);
+        dtv::internal::T1ApduResult divergent{};
+        std::vector<std::vector<unsigned char>> divergent_output;
+        const auto divergent_code = run_t1_apdu(mode, apdu_two, &divergent,
+            &divergent_output);
+        const auto expected_nr_zero = same_r_frame_sent(mode, divergent_output,
+            host_r_zero_lrc, 1);
+        if (divergent_code != DTV_INTERNAL_RESULT_OK || !expected_nr_zero ||
+            !same_apdu_frame_sent(mode, divergent_output, host_i_one_lrc, apdu_two, 1) ||
+            divergent.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            !divergent.io.reply_complete || !divergent.io.result_known) {
+            std::fprintf(stderr, "BWT divergent-sequence mode=%u code=%d response=%zu known=%u complete=%u expected_R_NR0=%u tx=%zu rx=%zu outputs=",
+                mode, divergent_code, divergent.response.size(), divergent.io.result_known,
+                divergent.io.reply_complete, expected_nr_zero, divergent.io.tx_bytes_done,
+                divergent.io.rx_bytes_done);
+            for (const auto &frame : divergent_output) {
+                std::fprintf(stderr, "[");
+                for (const auto byte : frame) std::fprintf(stderr, "%02x", byte);
+                std::fprintf(stderr, "]");
+            }
+            std::fprintf(stderr, "\n");
+            return 206;
+        }
+        set_scan_card_t1_bwt_mode(0);
+        set_scan_card_t1_apdu_mode(true, 50);
+        dtv::internal::T1ApduResult next{};
+        if (run_t1_apdu(mode, apdu_two, &next) != DTV_INTERNAL_RESULT_OK ||
+            next.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+            !next.io.reply_complete || !next.io.result_known) return 207;
+    }
     for (const auto mode : {1u, 2u}) {
         if (!reset_t1_session()) return 170;
         set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 1, 1601);
