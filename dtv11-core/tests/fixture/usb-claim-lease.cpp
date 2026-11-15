@@ -3055,12 +3055,225 @@ int public_card_transport()
         frame.push_back(static_cast<unsigned char>(crc >> 8));
         return frame;
     };
+    const auto same_wtx_frame_sent = [&](unsigned mode,
+        const std::vector<std::vector<unsigned char>> &sent,
+        const std::vector<unsigned char> &frame, std::size_t expected_frames) {
+        if (mode == 2) {
+            return std::count(sent.begin(), sent.end(), frame) ==
+                static_cast<std::ptrdiff_t>(expected_frames);
+        }
+        std::vector<std::size_t> headers;
+        for (std::size_t index = 0; index < sent.size(); ++index) {
+            if (sent[index] == std::vector<unsigned char>{0x00, frame[1], frame[2]})
+                headers.push_back(index);
+        }
+        if (headers.size() != expected_frames) return false;
+        return std::all_of(headers.begin(), headers.end(), [&](const auto index) {
+            return index + 2 < sent.size() &&
+                sent[index + 1] == std::vector<unsigned char>(frame.begin() + 3,
+                    frame.end() - 1) &&
+                sent[index + 2] == std::vector<unsigned char>{frame.back()};
+        });
+    };
     const std::array<unsigned char, 1> host_ifs_value{0x10};
     const auto host_ifs_request_lrc = encode_t1_lrc_frame(0xc1, host_ifs_value);
     const auto host_i_zero_lrc = encode_t1_lrc_frame(0x00, apdu_one);
     const auto host_r_one_lrc = encode_t1_lrc_frame(0x90, {});
     const auto host_i_one_lrc = encode_t1_lrc_frame(0x40, apdu_two);
     const auto host_r_zero_lrc = encode_t1_lrc_frame(0x82, {});
+    for (const auto mode : {1u, 2u}) {
+        set_scan_card_t1_crc(mode == 2);
+        if (!reset_t1_session()) return 220;
+        set_scan_card_t1_apdu_mode(true, 51);
+        const auto host_i_lrc = mode == 1 ? encode_t1_lrc_frame(0x00, apdu_one)
+                                          : encode_t1_crc_frame(0x00, apdu_one);
+        const std::array<unsigned char, 1> wtx_value{2};
+        const auto host_wtx = mode == 1 ? encode_t1_lrc_frame(0xe3, wtx_value)
+                                        : encode_t1_crc_frame(0xe3, wtx_value);
+        const std::array<unsigned char, 4> wtx_response{0x11, 0x22, 0x90, 0x00};
+        const auto wtx_receive_bytes = (mode == 1 ? encode_t1_lrc_frame(0xc3, wtx_value)
+                                                  : encode_t1_crc_frame(0xc3, wtx_value)).size() +
+            (mode == 1 ? encode_t1_lrc_frame(0x00, wtx_response)
+                       : encode_t1_crc_frame(0x00, wtx_response)).size();
+        dtv::internal::T1ApduResult wtx_result{};
+        std::vector<std::vector<unsigned char>> wtx_output;
+        const auto wtx_code = run_t1_apdu(mode, apdu_one, &wtx_result, &wtx_output);
+        if (wtx_code != DTV_INTERNAL_RESULT_OK ||
+            wtx_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            !wtx_result.io.reply_complete || !wtx_result.io.result_known ||
+            wtx_result.io.tx_bytes_done != host_i_lrc.size() + host_wtx.size() ||
+            wtx_result.io.rx_bytes_done != wtx_receive_bytes ||
+            !same_apdu_frame_sent(mode, wtx_output, host_i_lrc, apdu_one, 1) ||
+            !same_wtx_frame_sent(mode, wtx_output, host_wtx, 1)) {
+            std::fprintf(stderr, "WTX mode=%u code=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+                mode, wtx_code, wtx_result.io.transport_error.code,
+                wtx_result.response.size(), wtx_result.io.tx_bytes_done,
+                wtx_result.io.rx_bytes_done, wtx_result.io.result_known,
+                wtx_result.io.reply_complete, wtx_output.size());
+            for (const auto &packet : wtx_output) {
+                std::fprintf(stderr, "wtx packet:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 221;
+        }
+        set_scan_card_t1_apdu_mode(true, 50);
+        dtv::internal::T1ApduResult next_wtx_result{};
+        if (run_t1_apdu(mode, apdu_two, &next_wtx_result) != DTV_INTERNAL_RESULT_OK ||
+            next_wtx_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00})
+            return 222;
+        if (!reset_t1_session()) return 223;
+        set_scan_card_t1_apdu_mode(true, 52);
+        dtv::internal::T1ApduResult repeated_wtx_result{};
+        std::vector<std::vector<unsigned char>> repeated_wtx_output;
+        const auto repeated_host_wtx = mode == 1 ? encode_t1_lrc_frame(0xe3, wtx_value)
+                                                  : encode_t1_crc_frame(0xe3, wtx_value);
+        if (run_t1_apdu(mode, apdu_one, &repeated_wtx_result, &repeated_wtx_output) !=
+                DTV_INTERNAL_RESULT_OK ||
+            repeated_wtx_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            !repeated_wtx_result.io.reply_complete || !repeated_wtx_result.io.result_known ||
+            repeated_wtx_result.io.tx_bytes_done != host_i_lrc.size() +
+                2 * repeated_host_wtx.size() ||
+            repeated_wtx_result.io.rx_bytes_done != wtx_receive_bytes +
+                (mode == 1 ? encode_t1_lrc_frame(0xc3, wtx_value)
+                           : encode_t1_crc_frame(0xc3, wtx_value)).size() ||
+            !same_wtx_frame_sent(mode, repeated_wtx_output, repeated_host_wtx, 2)) return 224;
+        if (!reset_t1_session()) return 226;
+        set_scan_card_t1_apdu_mode(true, 54);
+        dtv::internal::T1ApduResult wtx_timeout_result{};
+        std::vector<std::vector<unsigned char>> wtx_timeout_output;
+        const auto wtx_timeout_code = run_t1_apdu(mode, apdu_one, &wtx_timeout_result,
+            &wtx_timeout_output);
+        const auto host_r_zero = mode == 1 ? encode_t1_lrc_frame(0x82, {})
+                                           : encode_t1_crc_frame(0x82, {});
+        if (wtx_timeout_code != DTV_INTERNAL_RESULT_OK ||
+            wtx_timeout_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            wtx_timeout_result.io.tx_bytes_done != host_i_lrc.size() + host_wtx.size() +
+                host_r_zero.size() || wtx_timeout_result.io.rx_bytes_done != wtx_receive_bytes ||
+            !wtx_timeout_result.io.reply_complete || !wtx_timeout_result.io.result_known ||
+            !same_apdu_frame_sent(mode, wtx_timeout_output, host_i_lrc, apdu_one, 1) ||
+            !same_wtx_frame_sent(mode, wtx_timeout_output, host_wtx, 1) ||
+            !same_r_frame_sent(mode, wtx_timeout_output, host_r_zero, 1)) return 227;
+        if (!reset_t1_session()) return 228;
+        set_scan_card_t1_apdu_mode(true, 53);
+        dtv::internal::T1ApduResult invalid_wtx_result{};
+        std::vector<std::vector<unsigned char>> invalid_wtx_output;
+        const auto invalid_wtx_code = run_t1_apdu(mode, apdu_one, &invalid_wtx_result,
+            &invalid_wtx_output);
+        if (invalid_wtx_code == DTV_INTERNAL_RESULT_OK ||
+            !invalid_wtx_result.response.empty() || invalid_wtx_result.io.result_known ||
+            invalid_wtx_result.io.reply_complete ||
+            !same_apdu_frame_sent(mode, invalid_wtx_output, host_i_lrc, apdu_one, 1) ||
+            !same_wtx_frame_sent(mode, invalid_wtx_output, host_wtx, 0)) {
+            std::fprintf(stderr, "invalid WTX mode=%u code=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+                mode, invalid_wtx_code, invalid_wtx_result.io.transport_error.code,
+                invalid_wtx_result.response.size(), invalid_wtx_result.io.tx_bytes_done,
+                invalid_wtx_result.io.rx_bytes_done, invalid_wtx_result.io.result_known,
+                invalid_wtx_result.io.reply_complete, invalid_wtx_output.size());
+            for (const auto &packet : invalid_wtx_output) {
+                std::fprintf(stderr, "invalid WTX packet:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 229;
+        }
+    }
+    if (!reset_t1_session()) return 234;
+    set_scan_card_t1_bwt_mode(0);
+    set_scan_card_t1_apdu_mode(true, 55);
+    dtv::internal::T1ApduResult delayed_wtx_result{};
+    std::vector<std::vector<unsigned char>> delayed_wtx_output;
+    const auto delayed_wtx_code = run_t1_apdu(2, apdu_one, &delayed_wtx_result,
+        &delayed_wtx_output, 5000);
+    const auto delayed_host_i = encode_t1_crc_frame(0x00, apdu_one);
+    const std::array<unsigned char, 1> delayed_wtx_value{2};
+    const auto delayed_host_wtx = encode_t1_crc_frame(0xe3, delayed_wtx_value);
+    const std::array<unsigned char, 4> delayed_wtx_response{0x11, 0x22, 0x90, 0x00};
+    const auto delayed_wtx_receive_bytes = encode_t1_crc_frame(0xc3,
+        delayed_wtx_value).size() + encode_t1_crc_frame(0x00, delayed_wtx_response).size();
+    if (delayed_wtx_code != DTV_INTERNAL_RESULT_OK ||
+        delayed_wtx_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        delayed_wtx_result.io.tx_bytes_done != delayed_host_i.size() + delayed_host_wtx.size() ||
+        !delayed_wtx_result.io.reply_complete || !delayed_wtx_result.io.result_known ||
+        !same_apdu_frame_sent(2, delayed_wtx_output, delayed_host_i, apdu_one, 1) ||
+        !same_wtx_frame_sent(2, delayed_wtx_output, delayed_host_wtx, 1)) return 235;
+    if (!reset_t1_session()) return 236;
+    set_scan_card_t1_apdu_mode(true, 56);
+    dtv::internal::T1ApduResult invalid_wtx_epoch_result{};
+    std::vector<std::vector<unsigned char>> invalid_wtx_epoch_output;
+    const auto invalid_wtx_epoch_code = run_t1_apdu(2, apdu_one,
+        &invalid_wtx_epoch_result, &invalid_wtx_epoch_output);
+    if (invalid_wtx_epoch_code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+        !invalid_wtx_epoch_result.response.empty() ||
+        invalid_wtx_epoch_result.io.result_known ||
+        invalid_wtx_epoch_result.io.reply_complete ||
+        invalid_wtx_epoch_result.io.tx_bytes_done != delayed_host_i.size() +
+            delayed_host_wtx.size() ||
+        invalid_wtx_epoch_result.io.rx_bytes_done != delayed_wtx_receive_bytes ||
+        !same_apdu_frame_sent(2, invalid_wtx_epoch_output, delayed_host_i, apdu_one, 1) ||
+        !same_wtx_frame_sent(2, invalid_wtx_epoch_output, delayed_host_wtx, 1)) return 237;
+    set_scan_card_t1_bgt(2, 1000000, 202);
+    if (!reset_t1_session()) return 238;
+    set_scan_card_t1_apdu_mode(true, 57);
+    dtv::internal::T1ApduResult caller_deadline_wtx_result{};
+    std::vector<std::vector<unsigned char>> caller_deadline_wtx_output;
+    const auto caller_deadline_wtx_code = run_t1_apdu(2, apdu_one,
+        &caller_deadline_wtx_result, &caller_deadline_wtx_output, 100);
+    if (caller_deadline_wtx_code != DTV_INTERNAL_RESULT_TIMEOUT ||
+        !caller_deadline_wtx_result.response.empty() ||
+        caller_deadline_wtx_result.io.tx_bytes_done != delayed_host_i.size() ||
+        caller_deadline_wtx_result.io.rx_bytes_done !=
+            encode_t1_crc_frame(0xc3, delayed_wtx_value).size() ||
+        caller_deadline_wtx_result.io.result_known ||
+        caller_deadline_wtx_result.io.reply_complete ||
+        !same_apdu_frame_sent(2, caller_deadline_wtx_output, delayed_host_i, apdu_one, 1) ||
+        !same_wtx_frame_sent(2, caller_deadline_wtx_output, delayed_host_wtx, 0)) {
+        std::fprintf(stderr, "WTX caller deadline code=%d transport=%d tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+            caller_deadline_wtx_code, caller_deadline_wtx_result.io.transport_error.code,
+            caller_deadline_wtx_result.io.tx_bytes_done,
+            caller_deadline_wtx_result.io.rx_bytes_done,
+            caller_deadline_wtx_result.io.result_known,
+            caller_deadline_wtx_result.io.reply_complete,
+            caller_deadline_wtx_output.size());
+        for (const auto &packet : caller_deadline_wtx_output) {
+            std::fprintf(stderr, "WTX deadline packet:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        return 239;
+    }
+    set_scan_card_t1_bgt(2, 1000000, 205);
+    if (!reset_t1_session()) return 230;
+    set_scan_card_t1_apdu_mode(true, 51);
+    dtv::internal::T1ApduResult partial_wtx_out_result{};
+    std::vector<std::vector<unsigned char>> partial_wtx_out;
+    const auto partial_wtx_out_code = run_t1_apdu(2, apdu_one,
+        &partial_wtx_out_result, &partial_wtx_out, 1000, nullptr, nullptr, 2);
+    if (partial_wtx_out_code != DTV_INTERNAL_RESULT_USB_IO ||
+        !partial_wtx_out_result.response.empty() ||
+        partial_wtx_out_result.io.tx_bytes_done != 11 ||
+        partial_wtx_out_result.io.result_known || partial_wtx_out_result.io.reply_complete)
+        return 231;
+    if (!reset_t1_session()) return 232;
+    set_scan_card_t1_bgt(2, 1000000000, 200);
+    set_scan_card_t1_apdu_mode(true, 51);
+    dtv::internal::T1ApduResult cancelled_wtx_result{};
+    std::vector<std::vector<unsigned char>> cancelled_wtx_output;
+    const auto cancelled_wtx_code = run_t1_apdu(2, apdu_one, &cancelled_wtx_result,
+        &cancelled_wtx_output, 30000, nullptr, nullptr, 0, 1);
+    synthetic_bgt_clock.cancel_root = nullptr;
+    synthetic_bgt_clock.cancel_on_delay = false;
+    const std::array<unsigned char, 1> cancelled_wtx_value{2};
+    if (cancelled_wtx_code != DTV_INTERNAL_RESULT_CANCELLED ||
+        !cancelled_wtx_result.response.empty() ||
+        cancelled_wtx_result.io.tx_bytes_done != 9 ||
+        cancelled_wtx_result.io.result_known || cancelled_wtx_result.io.reply_complete ||
+        !same_apdu_frame_sent(2, cancelled_wtx_output,
+            encode_t1_crc_frame(0x00, apdu_one), apdu_one, 1) ||
+        !same_wtx_frame_sent(2, cancelled_wtx_output,
+            encode_t1_crc_frame(0xe3, cancelled_wtx_value), 0)) return 233;
+    set_scan_card_t1_crc(false);
+    if (!reset_t1_session()) return 225;
     const auto host_ifs_result = std::vector<unsigned char>{
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
         0x90, 0x00, 0x62, 0x83};
@@ -3401,7 +3614,7 @@ int public_card_transport()
             negotiated_ifs, 1) || ifs_crc_result.io.tx_bytes_done != 15 ||
         ifs_crc_result.io.rx_bytes_done != 15) return 124;
     set_scan_card_t1_crc(false);
-    for (const auto fault : {31u, 32u, 33u, 34u, 35u}) {
+    for (const auto fault : {31u, 32u, 33u, 34u, 53u}) {
         if (!reset_t1_session()) return 125;
         set_scan_card_t1_apdu_mode(true, fault);
         dtv::internal::T1ApduResult invalid_ifs_result{};
@@ -3410,8 +3623,14 @@ int public_card_transport()
             &invalid_ifs_result, &invalid_ifs_output);
         if (invalid_ifs_code == DTV_INTERNAL_RESULT_OK ||
             !invalid_ifs_result.response.empty() || invalid_ifs_result.io.result_known ||
-            invalid_ifs_result.io.reply_complete || invalid_ifs_output.size() != 1)
+            invalid_ifs_result.io.reply_complete || invalid_ifs_output.size() != 1) {
+            std::fprintf(stderr, "invalid IFS fault=%u code=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+                fault, invalid_ifs_code, invalid_ifs_result.io.transport_error.code,
+                invalid_ifs_result.response.size(), invalid_ifs_result.io.tx_bytes_done,
+                invalid_ifs_result.io.rx_bytes_done, invalid_ifs_result.io.result_known,
+                invalid_ifs_result.io.reply_complete, invalid_ifs_output.size());
             return 126;
+        }
     }
     if (!reset_t1_session()) return 127;
     set_scan_card_t1_apdu_mode(true, 37);

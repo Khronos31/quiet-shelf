@@ -114,6 +114,7 @@ std::atomic<unsigned> scan_card_t1_apdu_ack_count{0};
 std::atomic<unsigned> scan_card_t1_apdu_ack_trace{0};
 std::atomic<bool> scan_card_t1_apdu_drop_r_reply{false};
 std::atomic<unsigned> scan_card_t1_apdu_reply_count{0};
+std::atomic<unsigned> scan_card_t1_wtx_exchange_count{0};
 std::atomic<unsigned> scan_card_t1_bwt_mode{0};
 std::atomic<unsigned> scan_card_t1_bwt_timeout_count{0};
 std::atomic<bool> scan_card_t1_bwt_decided{false};
@@ -183,7 +184,59 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
         bool duplicate_i_block = false;
         bool send_r_block = fault == 9;
         unsigned error_code = 0;
-        if (fault >= 40 && request[1] == 0xc1) {
+        if ((fault == 51 || fault == 52 || fault == 55 || fault == 56 || fault == 57) &&
+            request[1] == 0xe3) {
+            const auto exchange_count = scan_card_t1_wtx_exchange_count.fetch_add(1,
+                std::memory_order_acq_rel) + 1;
+            if (fault == 52 && exchange_count == 1) {
+                pcb = 0xc3;
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(1);
+                scan_card_t1_reply.push_back(2);
+            } else {
+                pcb = scan_card_t1_apdu_response_sequence.load(std::memory_order_acquire)
+                    ? 0x40 : 0x00;
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(4);
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(),
+                    {0x11, 0x22, 0x90, 0x00});
+                scan_card_t1_apdu_response_sequence.store(pcb == 0,
+                    std::memory_order_release);
+            }
+        } else if ((fault == 51 || fault == 52 || fault == 55 || fault == 56 || fault == 57) &&
+                   (request[1] & 0x80) == 0) {
+            scan_card_t1_wtx_exchange_count.store(0, std::memory_order_release);
+            pcb = 0xc3;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(1);
+            scan_card_t1_reply.push_back(2);
+        } else if (fault == 53 && (request[1] & 0x80) == 0) {
+            pcb = 0xc3;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(1);
+            scan_card_t1_reply.push_back(0);
+        } else if (fault == 54 && request[1] == 0xe3) {
+            pcb = scan_card_t1_apdu_response_sequence.load(std::memory_order_acquire)
+                ? 0x40 : 0x00;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(4);
+            scan_card_t1_reply.insert(scan_card_t1_reply.end(),
+                {0x11, 0x22, 0x90, 0x00});
+        } else if (fault == 54 && (request[1] & 0xc0) == 0x80) {
+            pcb = scan_card_t1_apdu_response_sequence.load(std::memory_order_acquire)
+                ? 0x40 : 0x00;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(4);
+            scan_card_t1_reply.insert(scan_card_t1_reply.end(),
+                {0x11, 0x22, 0x90, 0x00});
+            scan_card_t1_apdu_response_sequence.store(pcb == 0,
+                std::memory_order_release);
+        } else if (fault == 54 && (request[1] & 0x80) == 0) {
+            pcb = 0xc3;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(1);
+            scan_card_t1_reply.push_back(2);
+        } else if (fault >= 40 && request[1] == 0xc1) {
             scan_card_t1_apdu_ifs_negotiated.store(true, std::memory_order_release);
             scan_card_t1_host_ifs_chain_state.store(0, std::memory_order_release);
             if (fault == 45)
@@ -760,7 +813,7 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
                          : 200 + kind);
         message->generation = packet->generation;
         message->payload = std::span<const unsigned char>(reply).first(size);
-        if (kind >= 4) {
+        if (kind == 4 || kind == 5) {
             const auto bwt_mode = scan_card_t1_bwt_mode.load(std::memory_order_acquire);
             const auto outgoing_is_r =
                 (scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) & 0xc0) == 0x80;
@@ -800,6 +853,36 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
                 scan_card_t1_connection_epoch.load(std::memory_order_acquire);
             message->t1_bwt.request_epoch =
                 scan_card_t1_request_epoch.load(std::memory_order_acquire);
+            const auto apdu_fault = scan_card_t1_apdu_fault.load(std::memory_order_acquire);
+            if (apdu_fault == 57 &&
+                scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0x00) {
+                scan_card_t1_bgt_etu_upper_bound_ns.store(1000000000,
+                    std::memory_order_release);
+                scan_card_t1_bgt_revision.store(204, std::memory_order_release);
+            }
+            const auto wtx_timeout = apdu_fault == 54 &&
+                scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0xe3;
+            if (wtx_timeout) {
+                message->payload = std::span<const unsigned char>(reply).first(0);
+                message->t1_bwt.observation = dtv::spi::CardT1BwtObservation::absence_confirmed;
+                message->t1_bwt.host_last_character_edge_ns = 2000000000;
+                message->t1_bwt.absence_observed_through_ns = 7000000000;
+            } else if ((apdu_fault == 51 || apdu_fault == 52 || apdu_fault == 56) &&
+                scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0xe3) {
+                const auto exchange_count = scan_card_t1_wtx_exchange_count.load(
+                    std::memory_order_acquire);
+                message->t1_bwt.host_last_character_edge_ns = exchange_count == 1
+                    ? 2000000000 : 4000000000;
+                message->t1_bwt.card_first_character_edge_ns = apdu_fault == 52 &&
+                    exchange_count == 1 ? 2001000000 :
+                    (exchange_count == 1 ? 4859005000 : 6859005000);
+            }
+            if (apdu_fault == 56 &&
+                scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0xe3)
+                ++message->t1_bwt.request_epoch;
+            if (apdu_fault == 55 &&
+                scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0x00)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
         }
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
@@ -1650,6 +1733,7 @@ void reset_scan_card_t1_apdu_sequence()
 {
     scan_card_t1_apdu_response_sequence.store(false, std::memory_order_release);
     scan_card_t1_apdu_chain_index.store(0, std::memory_order_release);
+    scan_card_t1_wtx_exchange_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_ifs_requested.store(false, std::memory_order_release);
     scan_card_t1_apdu_ifs_negotiated.store(false, std::memory_order_release);
     scan_card_t1_host_ifs_chain_state.store(0, std::memory_order_release);
@@ -1672,6 +1756,9 @@ void set_scan_card_t1_apdu_mode(bool enabled, unsigned fault)
     scan_card_t1_apdu_ifs_negotiated.store(false, std::memory_order_release);
     if (fault >= 22 && fault <= 26)
         scan_card_t1_apdu_response_sequence.store(false, std::memory_order_release);
+    if (fault == 51 || fault == 52 || fault == 56)
+        scan_card_t1_apdu_response_sequence.store(false, std::memory_order_release);
+    scan_card_t1_wtx_exchange_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_reply_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_mode.store(enabled, std::memory_order_release);
 }
