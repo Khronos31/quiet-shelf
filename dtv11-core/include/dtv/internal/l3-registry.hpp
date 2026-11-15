@@ -83,7 +83,7 @@ public:
     dtv_internal_result begin_card_t1_session(dtv_enclosure *, std::shared_ptr<void> *,
                                                dtv::spi::CardTransportContext *, bool *, bool *);
     dtv_internal_result finish_card_t1_exchange(dtv_enclosure *,
-        const dtv::spi::CardTransportContext &, bool, bool);
+        const dtv::spi::CardTransportContext &, bool, bool, std::uint8_t);
     void invalidate_card_t1_session(dtv_enclosure *,
         const dtv::spi::CardTransportContext &);
     dtv_internal_result begin_card_reset(dtv_enclosure *, std::shared_ptr<void> *,

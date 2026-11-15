@@ -115,6 +115,8 @@ std::atomic<unsigned> scan_card_t1_apdu_ack_trace{0};
 std::atomic<bool> scan_card_t1_apdu_drop_r_reply{false};
 std::atomic<unsigned> scan_card_t1_apdu_reply_count{0};
 std::atomic<unsigned char> scan_card_t1_apdu_pending_ins{0};
+std::atomic<bool> scan_card_t1_apdu_ifs_requested{false};
+std::atomic<bool> scan_card_t1_apdu_ifs_negotiated{false};
 std::atomic<bool> scan_card_t1_crc{false};
 std::atomic<bool> scan_card_t1_stale_reply{false};
 std::atomic<std::uint64_t> scan_card_t1_transaction{300};
@@ -159,7 +161,59 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
         bool duplicate_i_block = false;
         bool send_r_block = fault == 9;
         unsigned error_code = 0;
-        if (fault >= 22 && fault <= 26) {
+        if (fault >= 30) {
+            if (request[1] == 0xe1) {
+                scan_card_t1_apdu_ifs_negotiated.store(true, std::memory_order_release);
+                if (fault == 36)
+                    scan_card_transport_drop_reply.store(true, std::memory_order_release);
+                pcb = scan_card_t1_apdu_response_sequence.load(std::memory_order_acquire)
+                    ? 0x40 : 0x00;
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(4);
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(),
+                    {0x11, 0x22, 0x90, 0x00});
+                scan_card_t1_apdu_response_sequence.store(pcb == 0,
+                    std::memory_order_release);
+            } else if ((request[1] & 0xc0) == 0x80) {
+                pcb = static_cast<unsigned char>(0x80 |
+                    (((request[1] & 0x40) == 0) ? 0x10 : 0));
+                const auto ack_index = scan_card_t1_apdu_ack_count.fetch_add(1,
+                    std::memory_order_acq_rel);
+                if (ack_index < 32 && (pcb & 0x10) != 0)
+                    scan_card_t1_apdu_ack_trace.fetch_or(1u << ack_index,
+                        std::memory_order_acq_rel);
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(0);
+            } else if (!scan_card_t1_apdu_ifs_negotiated.load(std::memory_order_acquire) &&
+                       !scan_card_t1_apdu_ifs_requested.exchange(true,
+                           std::memory_order_acq_rel)) {
+                pcb = fault == 33 ? 0xe1 : fault == 35 ? 0xc3 : 0xc1;
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(fault == 34 ? 2 : 1);
+                scan_card_t1_reply.push_back(fault == 31 ? 0 : fault == 32 ? 0xff : 0x10);
+                if (fault == 34) scan_card_t1_reply.push_back(0x11);
+            } else if ((request[1] & 0x20) != 0) {
+                pcb = static_cast<unsigned char>(0x80 |
+                    (((request[1] & 0x40) == 0) ? 0x10 : 0));
+                const auto ack_index = scan_card_t1_apdu_ack_count.fetch_add(1,
+                    std::memory_order_acq_rel);
+                if (ack_index < 32 && (pcb & 0x10) != 0)
+                    scan_card_t1_apdu_ack_trace.fetch_or(1u << ack_index,
+                        std::memory_order_acq_rel);
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(0);
+            } else {
+                pcb = scan_card_t1_apdu_response_sequence.load(std::memory_order_acquire)
+                    ? 0x40 : 0x00;
+                scan_card_t1_reply.push_back(pcb);
+                scan_card_t1_reply.push_back(4);
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(),
+                    {0x11, 0x22, 0x90, 0x00});
+                scan_card_t1_apdu_response_sequence.store(pcb == 0,
+                    std::memory_order_release);
+            }
+            scan_card_t1_reply[2] = static_cast<unsigned char>(scan_card_t1_reply.size() - 3);
+        } else if (fault >= 22 && fault <= 26) {
             const auto is_r_block = (request[1] & 0xc0) == 0x80;
             const auto more_command = !is_r_block && (request[1] & 0x20) != 0;
             if (more_command) {
@@ -325,6 +379,8 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
     if (fault == 1) scan_card_t1_reply.pop_back();
     else if (fault == 2) scan_card_t1_reply.push_back(0x55);
     else if (fault == 3) scan_card_t1_reply.back() ^= 0x01;
+    if (scan_card_t1_apdu_fault.load(std::memory_order_acquire) == 37)
+        scan_card_t1_reply.back() ^= 0x01;
     scan_card_t1_reply_offset = 0;
 }
 
@@ -1398,6 +1454,8 @@ void reset_scan_card_t1_apdu_sequence()
 {
     scan_card_t1_apdu_response_sequence.store(false, std::memory_order_release);
     scan_card_t1_apdu_chain_index.store(0, std::memory_order_release);
+    scan_card_t1_apdu_ifs_requested.store(false, std::memory_order_release);
+    scan_card_t1_apdu_ifs_negotiated.store(false, std::memory_order_release);
 }
 
 void set_scan_card_t1_fault(unsigned fault)
@@ -1413,6 +1471,8 @@ void set_scan_card_t1_apdu_mode(bool enabled, unsigned fault)
     scan_card_t1_apdu_chain_index.store(0, std::memory_order_release);
     scan_card_t1_apdu_ack_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_ack_trace.store(0, std::memory_order_release);
+    scan_card_t1_apdu_ifs_requested.store(false, std::memory_order_release);
+    scan_card_t1_apdu_ifs_negotiated.store(false, std::memory_order_release);
     if (fault >= 22 && fault <= 26)
         scan_card_t1_apdu_response_sequence.store(false, std::memory_order_release);
     scan_card_t1_apdu_reply_count.store(0, std::memory_order_release);
