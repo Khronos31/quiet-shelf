@@ -44,6 +44,7 @@ void set_scan_card_t1_fault(unsigned);
 void set_scan_card_t1_crc(bool);
 void set_scan_card_t1_stale_reply(bool);
 void set_scan_card_t1_apdu_mode(bool, unsigned);
+void set_scan_card_t1_receive_capacity(bool, std::size_t, std::uint64_t, std::uint64_t);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
@@ -3053,6 +3054,183 @@ int public_card_transport()
         frame.push_back(static_cast<unsigned char>(crc >> 8));
         return frame;
     };
+    const std::array<unsigned char, 1> host_ifs_value{0x10};
+    const auto host_ifs_request_lrc = encode_t1_lrc_frame(0xc1, host_ifs_value);
+    const auto host_i_zero_lrc = encode_t1_lrc_frame(0x00, apdu_one);
+    const auto host_r_one_lrc = encode_t1_lrc_frame(0x90, {});
+    const auto host_i_one_lrc = encode_t1_lrc_frame(0x40, apdu_two);
+    const auto host_ifs_result = std::vector<unsigned char>{
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        0x90, 0x00, 0x62, 0x83};
+    set_scan_card_t1_bgt(2, 1000000, 18);
+    for (const auto mode : {1u, 2u}) {
+        if (!reset_t1_session()) return 170;
+        set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 1, 1601);
+        set_scan_card_t1_apdu_mode(true, 40);
+        dtv::internal::T1ApduResult result{};
+        std::vector<std::vector<unsigned char>> output;
+        std::vector<std::uint64_t> submit_times;
+        std::vector<std::uint64_t> input_complete_times;
+        if (run_t1_apdu(mode, apdu_one, &result, &output, 1000,
+                &submit_times, &input_complete_times) != DTV_INTERNAL_RESULT_OK ||
+            result.response != host_ifs_result || result.io.tx_bytes_done != 17 ||
+            result.io.rx_bytes_done != 33 || !result.io.reply_complete ||
+            !result.io.result_known ||
+            !same_apdu_frame_sent(mode, output, host_ifs_request_lrc,
+                host_ifs_value, 1) ||
+            !same_apdu_frame_sent(mode, output, host_i_zero_lrc, apdu_one, 1) ||
+            !same_r_frame_sent(mode, output, host_r_one_lrc, 1)) return 171;
+        const auto command_header = mode == 2
+            ? std::find(output.begin(), output.end(), host_i_zero_lrc)
+            : std::find(output.begin(), output.end(),
+                std::vector<unsigned char>{0x00, 0x00, 0x04});
+        const auto r_header = mode == 2
+            ? std::find(output.begin(), output.end(), host_r_one_lrc)
+            : std::find(output.begin(), output.end(),
+                std::vector<unsigned char>{0x00, 0x90, 0x00});
+        const auto command_index = static_cast<std::size_t>(command_header - output.begin());
+        const auto r_index = static_cast<std::size_t>(r_header - output.begin());
+        if (command_header == output.end() || r_header == output.end() ||
+            command_index == 0 || r_index == 0 ||
+            command_index >= submit_times.size() || r_index >= submit_times.size() ||
+            command_index - 1 >= input_complete_times.size() ||
+            r_index - 1 >= input_complete_times.size() ||
+            submit_times[command_index] < input_complete_times[command_index - 1] + 22000000 ||
+            submit_times[r_index] < input_complete_times[r_index - 1] + 22000000)
+            return 172;
+        dtv::internal::T1ApduResult next_result{};
+        std::vector<std::vector<unsigned char>> next_output;
+        if (run_t1_apdu(mode, apdu_two, &next_result, &next_output) !=
+                DTV_INTERNAL_RESULT_OK ||
+            next_result.response != std::vector<unsigned char>{0x90, 0x00} ||
+            !same_apdu_frame_sent(mode, next_output, host_i_one_lrc, apdu_two, 1) ||
+            std::any_of(next_output.begin(), next_output.end(), [](const auto &sent) {
+                return sent.size() >= 2 && sent[1] == 0xc1;
+            })) return 173;
+    }
+    set_scan_card_t1_crc(true);
+    if (!reset_t1_session()) return 174;
+    set_scan_card_t1_receive_capacity(true, 3 + 16 + 2, 2, 1602);
+    set_scan_card_t1_apdu_mode(true, 40);
+    dtv::internal::T1ApduResult host_ifs_crc_result{};
+    std::vector<std::vector<unsigned char>> host_ifs_crc_output;
+    const auto host_ifs_request_crc = encode_t1_crc_frame(0xc1, host_ifs_value);
+    if (run_t1_apdu(2, apdu_one, &host_ifs_crc_result, &host_ifs_crc_output) !=
+            DTV_INTERNAL_RESULT_OK ||
+        host_ifs_crc_result.response != host_ifs_result ||
+        host_ifs_crc_result.io.tx_bytes_done != 20 ||
+        host_ifs_crc_result.io.rx_bytes_done != 36 ||
+        !same_apdu_frame_sent(2, host_ifs_crc_output, host_ifs_request_crc,
+            host_ifs_value, 1)) return 175;
+    set_scan_card_t1_crc(false);
+    for (const auto fault : {41u, 42u, 43u, 44u, 46u, 47u, 48u}) {
+        if (!reset_t1_session()) return 176;
+        set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 3, 1603);
+        set_scan_card_t1_apdu_mode(true, fault);
+        dtv::internal::T1ApduResult malformed_result{};
+        std::vector<std::vector<unsigned char>> malformed_output;
+        const auto code = run_t1_apdu(2, apdu_one, &malformed_result,
+            &malformed_output);
+        if ((fault == 43 ? code == DTV_INTERNAL_RESULT_OK
+                         : code != DTV_INTERNAL_RESULT_USB_IO) ||
+            !malformed_result.response.empty() ||
+            !malformed_result.io.result_known || malformed_result.io.reply_complete ||
+            malformed_result.io.tx_bytes_done != 5 ||
+            malformed_result.io.rx_bytes_done != (fault == 43 ? 0u : 5u) ||
+            malformed_output.size() != 1 ||
+            std::any_of(malformed_output.begin(), malformed_output.end(), [](const auto &sent) {
+                return sent.size() >= 2 && sent[1] == 0x00;
+            })) return 177;
+    }
+    if (!reset_t1_session()) return 178;
+    set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 4, 1604);
+    set_scan_card_t1_apdu_mode(true, 45);
+    dtv_internal_result_code missing_host_ifs_code = DTV_INTERNAL_RESULT_OK;
+    dtv::internal::T1ApduResult missing_host_ifs_result{};
+    std::vector<std::vector<unsigned char>> missing_host_ifs_output;
+    missing_host_ifs_code = static_cast<dtv_internal_result_code>(run_t1_apdu(2,
+        apdu_one, &missing_host_ifs_result, &missing_host_ifs_output, 150));
+    set_scan_card_transport_drop_reply(false);
+    if (missing_host_ifs_code != DTV_INTERNAL_RESULT_TIMEOUT ||
+        !missing_host_ifs_result.response.empty() ||
+        !missing_host_ifs_result.io.result_known ||
+        missing_host_ifs_result.io.tx_bytes_done != 5 ||
+        missing_host_ifs_output.size() != 1) return 179;
+    if (!reset_t1_session()) return 180;
+    set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 5, 1605);
+    set_scan_card_t1_apdu_mode(true, 0);
+    dtv::internal::T1ApduResult partial_host_ifs_result{};
+    std::vector<std::vector<unsigned char>> partial_host_ifs_output;
+    const auto partial_host_ifs_code = run_t1_apdu(2, apdu_one,
+        &partial_host_ifs_result, &partial_host_ifs_output, 1000,
+        nullptr, nullptr, 1);
+    if (partial_host_ifs_code != DTV_INTERNAL_RESULT_USB_IO ||
+        !partial_host_ifs_result.response.empty() ||
+        !partial_host_ifs_result.io.result_known ||
+        partial_host_ifs_result.io.reply_complete ||
+        partial_host_ifs_result.io.tx_bytes_done != 2 ||
+        partial_host_ifs_output.size() != 1) return 181;
+    if (!reset_t1_session()) return 182;
+    set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 6, 1606);
+    set_scan_card_t1_apdu_mode(true, 40);
+    dtv::internal::T1ApduResult cancelled_host_ifs_result{};
+    std::vector<std::vector<unsigned char>> cancelled_host_ifs_output;
+    const auto cancelled_host_ifs_code = run_t1_apdu(2, apdu_one,
+        &cancelled_host_ifs_result, &cancelled_host_ifs_output, 1000,
+        nullptr, nullptr, 0, 1);
+    synthetic_bgt_clock.cancel_root = nullptr;
+    synthetic_bgt_clock.cancel_on_delay = false;
+    if (cancelled_host_ifs_code != DTV_INTERNAL_RESULT_CANCELLED ||
+        !cancelled_host_ifs_result.response.empty() ||
+        !cancelled_host_ifs_result.io.result_known ||
+        cancelled_host_ifs_result.io.reply_complete ||
+        cancelled_host_ifs_result.io.tx_bytes_done != 5 ||
+        cancelled_host_ifs_output.size() != 1) return 183;
+    if (!reset_t1_session()) return 184;
+    set_scan_card_t1_receive_capacity(true, 3 + 16 + 1, 7, 1607);
+    set_scan_card_t1_apdu_mode(true, 49);
+    dtv::internal::T1ApduResult oversized_host_ifs_result{};
+    std::vector<std::vector<unsigned char>> oversized_host_ifs_output;
+    const auto oversized_host_ifs_code = run_t1_apdu(2, apdu_one,
+        &oversized_host_ifs_result, &oversized_host_ifs_output);
+    if (oversized_host_ifs_code == DTV_INTERNAL_RESULT_OK ||
+        !oversized_host_ifs_result.response.empty() ||
+        oversized_host_ifs_result.io.result_known ||
+        oversized_host_ifs_result.io.reply_complete ||
+        oversized_host_ifs_result.io.tx_bytes_done != 13 ||
+        oversized_host_ifs_output.size() != 2) return 185;
+    set_scan_card_t1_receive_capacity(false, 0, 0, 0);
+    if (!reset_t1_session()) return 186;
+    set_scan_card_t1_apdu_mode(true, 0);
+    dtv::internal::T1ApduResult unknown_capacity_result{};
+    std::vector<std::vector<unsigned char>> unknown_capacity_output;
+    if (run_t1_apdu(2, apdu_one, &unknown_capacity_result,
+            &unknown_capacity_output) != DTV_INTERNAL_RESULT_OK ||
+        std::any_of(unknown_capacity_output.begin(), unknown_capacity_output.end(),
+            [](const auto &sent) { return sent.size() >= 2 && sent[1] == 0xc1; }))
+        return 187;
+    if (!reset_t1_session()) return 188;
+    set_scan_card_t1_receive_capacity(true, 3 + 32 + 1, 8, 1608);
+    dtv::internal::T1ApduResult large_capacity_result{};
+    std::vector<std::vector<unsigned char>> large_capacity_output;
+    if (run_t1_apdu(2, apdu_one, &large_capacity_result,
+            &large_capacity_output) != DTV_INTERNAL_RESULT_OK ||
+        std::any_of(large_capacity_output.begin(), large_capacity_output.end(),
+            [](const auto &sent) { return sent.size() >= 2 && sent[1] == 0xc1; }))
+        return 189;
+    if (!reset_t1_session()) return 190;
+    set_scan_card_t1_receive_capacity(true, 4, 9, 1609);
+    dtv::internal::T1ApduResult invalid_capacity_result{};
+    std::vector<std::vector<unsigned char>> invalid_capacity_output;
+    const auto invalid_capacity_code = run_t1_apdu(2, apdu_one,
+        &invalid_capacity_result, &invalid_capacity_output);
+    if (invalid_capacity_code == DTV_INTERNAL_RESULT_OK ||
+        !invalid_capacity_result.response.empty() ||
+        !invalid_capacity_result.io.result_known ||
+        invalid_capacity_result.io.tx_bytes_done != 0 ||
+        invalid_capacity_result.io.rx_bytes_done != 0 ||
+        !invalid_capacity_output.empty()) return 191;
+    set_scan_card_t1_receive_capacity(false, 0, 0, 0);
     const std::array<unsigned char, 1> negotiated_ifs{0x10};
     const auto ifs_response_frame = encode_t1_lrc_frame(0xe1, negotiated_ifs);
     std::array<unsigned char, 33> ifs_chained_command{};

@@ -216,6 +216,7 @@ struct EnclosureRegistry::State {
         bool card_t1_send_sequence = false;
         bool card_t1_receive_sequence = false;
         std::uint8_t card_t1_ifsc = 0;
+        std::uint8_t card_t1_ifsd = 0;
         std::vector<std::uint8_t> card_atr;
         std::uint64_t card_atr_connection_epoch = 0;
         std::uint64_t card_atr_request_epoch = 0;
@@ -1095,7 +1096,7 @@ dtv_internal_result EnclosureRegistry::card_transport_context(
     context->t1_selected = parameters.selected;
     context->t1_crc = parameters.crc;
     context->t1_ifsc = root->card_t1_ifsc;
-    context->t1_ifsd = parameters.ifsd;
+    context->t1_ifsd = root->card_t1_ifsd;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
@@ -1264,9 +1265,9 @@ dtv_internal_result EnclosureRegistry::begin_card_t1_session(
 
 dtv_internal_result EnclosureRegistry::finish_card_t1_exchange(
     dtv_enclosure *object, const dtv::spi::CardTransportContext &context,
-    bool send_sequence, bool receive_sequence, std::uint8_t ifsc)
+    bool send_sequence, bool receive_sequence, std::uint8_t ifsc, std::uint8_t ifsd)
 {
-    if (ifsc == 0 || ifsc > 254)
+    if (ifsc == 0 || ifsc > 254 || ifsd == 0 || ifsd > 254)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     std::lock_guard lock(state_->mutex);
     const auto root = state_->find_root(object);
@@ -1279,6 +1280,24 @@ dtv_internal_result EnclosureRegistry::finish_card_t1_exchange(
     root->card_t1_send_sequence = send_sequence;
     root->card_t1_receive_sequence = receive_sequence;
     root->card_t1_ifsc = ifsc;
+    root->card_t1_ifsd = ifsd;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRegistry::update_card_t1_ifsd(
+    dtv_enclosure *object, const dtv::spi::CardTransportContext &context, std::uint8_t ifsd)
+{
+    if (ifsd == 0 || ifsd > 254)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    std::lock_guard lock(state_->mutex);
+    const auto root = state_->find_root(object);
+    if (!root || root->status != DTV_ENCLOSURE_READY ||
+        root->card_reader_connection != context.connection_epoch ||
+        root->card_request_epoch != context.request_epoch || root->card_state != DTV_CARD_READY ||
+        !root->card_t1_session_valid || root->card_t1_connection_epoch != context.connection_epoch ||
+        root->card_t1_request_epoch != context.request_epoch)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
+    root->card_t1_ifsd = ifsd;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
@@ -1291,6 +1310,7 @@ void EnclosureRegistry::invalidate_card_t1_session(
         root->card_t1_request_epoch == context.request_epoch) {
         root->card_t1_session_valid = false;
         root->card_t1_ifsc = 0;
+        root->card_t1_ifsd = 0;
     }
 }
 
@@ -1324,6 +1344,7 @@ dtv_internal_result EnclosureRegistry::begin_card_reset(
     root->card_state = DTV_CARD_UNKNOWN;
     root->card_t1_session_valid = false;
     root->card_t1_ifsc = 0;
+    root->card_t1_ifsd = 0;
     ++root->card_request_epoch;
     if (root->card_request_epoch == 0) ++root->card_request_epoch;
     *lease = std::move(held);
@@ -1382,6 +1403,7 @@ dtv_internal_result EnclosureRegistry::finish_card_reset(
     const auto parameters = card_atr_t1_parameters(root->card_atr);
     root->card_t1_session_valid = parameters.selected;
     root->card_t1_ifsc = parameters.selected ? parameters.ifsc : 0;
+    root->card_t1_ifsd = parameters.selected ? parameters.ifsd : 0;
     root->card_t1_connection_epoch = connection_epoch;
     root->card_t1_request_epoch = request_epoch;
     root->card_t1_send_sequence = false;
@@ -1855,6 +1877,7 @@ dtv_internal_result EnclosureRegistry::observe_card_state(dtv_enclosure *object,
         if (root->card_request_epoch == 0) ++root->card_request_epoch;
         root->card_t1_session_valid = false;
         root->card_t1_ifsc = 0;
+        root->card_t1_ifsd = 0;
     }
     root->card_state = card_state;
     if (event_kind == 0) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
@@ -4060,7 +4083,8 @@ dtv_internal_result run_public_card_transport(
     dtv_enclosure *enclosure, const dtv::spi::CardTransportOperation &operation,
     dtv_timeout timeout, std::vector<unsigned char> *response,
     dtv::spi::CardIoOutcome *outcome, std::shared_ptr<void> *retained_ticket,
-    std::function<dtv_internal_result(dtv::spi::CardBgtCapability *, dtv_timeout *)> before_send)
+    std::function<dtv_internal_result(dtv::spi::CardBgtCapability *, dtv_timeout *)> before_send,
+    const dtv::spi::CardT1ReceiveCapacity *expected_receive_capacity)
 {
     if (enclosure == nullptr || response == nullptr || outcome == nullptr)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
@@ -4127,6 +4151,16 @@ dtv_internal_result run_public_card_transport(
         return slot->ops->plan_card_transport(instance->context(), &request, &transport_plan);
     });
     if (result.code != DTV_INTERNAL_RESULT_OK) {
+        outcome->transport_error = result;
+        return result;
+    }
+    if (expected_receive_capacity != nullptr &&
+        (transport_plan.receive_capacity.known != expected_receive_capacity->known ||
+         transport_plan.receive_capacity.complete_block_bytes !=
+            expected_receive_capacity->complete_block_bytes ||
+         transport_plan.receive_capacity.revision != expected_receive_capacity->revision ||
+         transport_plan.receive_capacity.evidence_id != expected_receive_capacity->evidence_id)) {
+        result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
         outcome->transport_error = result;
         return result;
     }
@@ -4254,6 +4288,62 @@ void append_t1_edc(std::vector<unsigned char> &block, bool crc)
     block.push_back(static_cast<unsigned char>(value >> 8));
 }
 
+bool valid_t1_receive_capacity(const dtv::spi::CardT1ReceiveCapacity &capacity, bool crc)
+{
+    if (!capacity.known)
+        return capacity.complete_block_bytes == 0 && capacity.revision == 0 &&
+            capacity.evidence_id == 0;
+    return capacity.complete_block_bytes >= 4 + t1_edc_size(crc) &&
+        capacity.revision != 0 && capacity.evidence_id != 0;
+}
+
+bool same_t1_receive_capacity(const dtv::spi::CardT1ReceiveCapacity &left,
+                              const dtv::spi::CardT1ReceiveCapacity &right)
+{
+    return left.known == right.known &&
+        left.complete_block_bytes == right.complete_block_bytes &&
+        left.revision == right.revision && left.evidence_id == right.evidence_id;
+}
+
+dtv_internal_result query_t1_receive_capacity(
+    dtv_enclosure *enclosure, const dtv::spi::CardTransportContext &context,
+    dtv::spi::CardT1ReceiveCapacity *capacity)
+{
+    if (enclosure == nullptr || capacity == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    *capacity = dtv::spi::CardT1ReceiveCapacity{};
+    auto &state = public_discovery_state();
+    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
+    {
+        std::lock_guard lock(state.open_mutex);
+        const auto found = state.open_slots.find(enclosure);
+        if (found == state.open_slots.end())
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        slot = found->second;
+    }
+    std::shared_ptr<dtv::spi::ProductInstance> instance;
+    {
+        std::lock_guard lock(slot->mutex);
+        if (slot->phase != PublicDiscoveryState::OpenSlot::Phase::open)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        instance = slot->product_instance;
+    }
+    if (!instance || slot->ops == nullptr || slot->ops->plan_card_transport == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+    dtv::spi::CardTransportRequest request{};
+    request.context = context;
+    request.operation = dtv::spi::CardByteRead{0};
+    dtv::spi::PublicCardTransportPlan plan{};
+    const auto result = call_callback([&] {
+        return slot->ops->plan_card_transport(instance->context(), &request, &plan);
+    });
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+    if (!valid_t1_receive_capacity(plan.receive_capacity, context.t1_crc))
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    *capacity = plan.receive_capacity;
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
 bool valid_t1_block(std::span<const unsigned char> block, bool crc, bool check_edc)
 {
     if (block.size() < 3 + t1_edc_size(crc) || block[0] == 0xff || block[2] == 0xff)
@@ -4276,7 +4366,9 @@ bool valid_t1_block(std::span<const unsigned char> block, bool crc, bool check_e
 dtv_internal_result exchange_public_t1_block(
     dtv_enclosure *enclosure, const T1BlockRequest &request, dtv_timeout timeout,
     T1BlockResult *block_result, std::shared_ptr<void> *retained_ticket,
-    std::span<const unsigned char> encoded_block)
+    std::span<const unsigned char> encoded_block,
+    const dtv::spi::CardT1ReceiveCapacity *expected_receive_capacity,
+    std::size_t response_inf_capacity)
 {
     if (block_result == nullptr)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
@@ -4293,6 +4385,8 @@ dtv_internal_result exchange_public_t1_block(
     if (result.code != DTV_INTERNAL_RESULT_OK) return reject(result);
     if (!context.t1_selected)
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
+    if (context.t1_ifsd == 0 || context.t1_ifsd > 254)
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
     if (request.inf.size() > context.t1_ifsc)
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
     std::vector<unsigned char> outgoing;
@@ -4336,14 +4430,21 @@ dtv_internal_result exchange_public_t1_block(
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
     dtv::spi::CardTransportRequest probe{};
     probe.context = context;
-    const auto response_capacity = 3 + static_cast<std::size_t>(context.t1_ifsd) +
-        t1_edc_size(context.t1_crc);
+    if (response_inf_capacity == 0) response_inf_capacity = context.t1_ifsd;
+    if (response_inf_capacity > context.t1_ifsd)
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
+    const auto response_capacity = 3 + response_inf_capacity + t1_edc_size(context.t1_crc);
     probe.operation = dtv::spi::CardT1BlockExchange{outgoing, response_capacity};
     dtv::spi::PublicCardTransportPlan selection{};
     result = call_callback([&] {
         return slot->ops->plan_card_transport(instance->context(), &probe, &selection);
     });
     if (result.code != DTV_INTERNAL_RESULT_OK) return reject(result);
+    if (!valid_t1_receive_capacity(selection.receive_capacity, context.t1_crc))
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
+    if (expected_receive_capacity != nullptr &&
+        !same_t1_receive_capacity(selection.receive_capacity, *expected_receive_capacity))
+        return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0));
     if (!selection.operation.supported || !selection.operation.ready ||
         !selection.operation.arguments_valid)
         return reject(dtv_internal_result_make(!selection.operation.supported
@@ -4450,6 +4551,10 @@ dtv_internal_result exchange_public_t1_block(
                 return slot->ops->plan_card_transport(instance->context(), &refresh, &refreshed);
             });
             if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
+            if (expected_receive_capacity != nullptr &&
+                !same_t1_receive_capacity(refreshed.receive_capacity,
+                    *expected_receive_capacity))
+                return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0));
             selection.bgt = refreshed.bgt;
             current = bgt_clock->monotonic_now_ns(bgt_clock->user);
             result = public_discovery_state().registry.card_t1_bgt_before_send(enclosure,
@@ -4478,6 +4583,10 @@ dtv_internal_result exchange_public_t1_block(
                         &refreshed);
                 });
                 if (wait_result.code != DTV_INTERNAL_RESULT_OK) return wait_result;
+                if (expected_receive_capacity != nullptr &&
+                    !same_t1_receive_capacity(refreshed.receive_capacity,
+                        *expected_receive_capacity))
+                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
                 *capability = refreshed.bgt;
                 current = bgt_clock->monotonic_now_ns(bgt_clock->user);
                 wait_result = public_discovery_state().registry.card_t1_bgt_before_send(
@@ -4540,11 +4649,11 @@ dtv_internal_result exchange_public_t1_block(
     if (selection.mode == dtv::spi::CardTransportMode::complete_block) {
         result = run_public_card_transport(enclosure,
             dtv::spi::CardT1BlockExchange{outgoing, response_capacity}, next_timeout(),
-            &response, &aggregate, ticket, before_first_send);
+            &response, &aggregate, ticket, before_first_send, expected_receive_capacity);
         if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
         aggregate.reply_complete = true;
         aggregate.result_known = true;
-        if (!valid_t1_block(response, context.t1_crc, false) || response[0] != request.nad ||
+        if (!valid_t1_block(response, context.t1_crc, true) || response[0] != request.nad ||
             response[2] > context.t1_ifsd)
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
     } else {
@@ -4557,7 +4666,8 @@ dtv_internal_result exchange_public_t1_block(
                 dtv::spi::CardByteWrite{bytes}, next_timeout(), &ack, &step, ticket,
                 before_send_pending ? before_first_send :
                     std::function<dtv_internal_result(
-                        dtv::spi::CardBgtCapability *, dtv_timeout *)>{});
+                        dtv::spi::CardBgtCapability *, dtv_timeout *)>{},
+                expected_receive_capacity);
             if (step_result.code == DTV_INTERNAL_RESULT_OK) before_send_pending = false;
             aggregate.tx_bytes_done += step_result.code == DTV_INTERNAL_RESULT_OK
                 ? bytes.size() : (std::min)(bytes.size(), step.tx_bytes_done);
@@ -4582,7 +4692,7 @@ dtv_internal_result exchange_public_t1_block(
                 const auto request_capacity = (std::min)(capacity, remaining);
                 auto step_result = run_public_card_transport(enclosure,
                     dtv::spi::CardByteRead{request_capacity}, next_timeout(), &part, &step,
-                    ticket);
+                    ticket, {}, expected_receive_capacity);
                 aggregate.rx_bytes_done += step_result.code == DTV_INTERNAL_RESULT_OK
                     ? part.size() : step.rx_bytes_done;
                 if (step_result.code != DTV_INTERNAL_RESULT_OK) {
@@ -4610,7 +4720,7 @@ dtv_internal_result exchange_public_t1_block(
         std::vector<unsigned char> extra;
         dtv::spi::CardIoOutcome extra_outcome{};
         result = run_public_card_transport(enclosure, dtv::spi::CardByteRead{1},
-            next_timeout(), &extra, &extra_outcome, ticket);
+            next_timeout(), &extra, &extra_outcome, ticket, {}, expected_receive_capacity);
         if (result.code != DTV_INTERNAL_RESULT_OK) return fail(result);
         if (!extra.empty()) {
             aggregate.rx_bytes_done += extra.size();
@@ -4659,7 +4769,8 @@ dtv_internal_result exchange_public_t1_apdu(
     auto result = registry.begin_card_t1_session(enclosure, &session_lease, &context,
         &send_sequence, &receive_sequence);
     if (result.code != DTV_INTERNAL_RESULT_OK) return reject(result);
-    if (context.t1_ifsc == 0 || context.t1_ifsc > 254)
+    if (context.t1_ifsc == 0 || context.t1_ifsc > 254 ||
+        context.t1_ifsd == 0 || context.t1_ifsd > 254)
         return reject(dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0));
     const auto *clock = system_runtime_clock();
     if (clock == nullptr || clock->monotonic_now_ns == nullptr || clock->delay_until == nullptr)
@@ -4685,14 +4796,72 @@ dtv_internal_result exchange_public_t1_apdu(
     if (!operation) return reject(ticket_result);
     ticket = std::move(operation);
     dtv::spi::CardIoOutcome aggregate{};
+    bool command_may_have_reached_card = false;
     const auto finish = [&](dtv_internal_result failure) {
-        if (aggregate.tx_bytes_done != 0 && !aggregate.reply_complete)
+        if (!command_may_have_reached_card)
+            aggregate.result_known = true;
+        else if (!aggregate.reply_complete)
             aggregate.result_known = false;
         apdu_result->io = aggregate;
         apdu_result->io.transport_error = failure;
         release_public_card_ticket(enclosure, &ticket);
         return failure;
     };
+    dtv::spi::CardT1ReceiveCapacity receive_capacity{};
+    result = query_t1_receive_capacity(enclosure, context, &receive_capacity);
+    if (result.code != DTV_INTERNAL_RESULT_OK) {
+        registry.invalidate_card_t1_session(enclosure, context);
+        return finish(result);
+    }
+    const auto *expected_receive_capacity = receive_capacity.known ? &receive_capacity : nullptr;
+    auto next_ifsd = context.t1_ifsd;
+    if (receive_capacity.known) {
+        const auto edc_size = t1_edc_size(context.t1_crc);
+        const auto maximum_inf = receive_capacity.complete_block_bytes - 3 - edc_size;
+        const auto candidate_ifsd = static_cast<std::uint8_t>((std::min)(maximum_inf,
+            static_cast<std::size_t>(254)));
+        if (candidate_ifsd < next_ifsd) {
+            std::vector<unsigned char> outgoing;
+            try {
+                outgoing.reserve(4 + edc_size);
+                outgoing.push_back(0);
+                outgoing.push_back(0xc1);
+                outgoing.push_back(1);
+                outgoing.push_back(candidate_ifsd);
+                append_t1_edc(outgoing, context.t1_crc);
+            } catch (...) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                return finish(exception_result());
+            }
+            const T1BlockRequest request{0, 0xc1,
+                std::span<const unsigned char>(outgoing.data() + 3, 1)};
+            T1BlockResult reply{};
+            result = exchange_public_t1_block(enclosure, request, next_timeout(), &reply,
+                &ticket, outgoing, expected_receive_capacity, 1);
+            aggregate.tx_bytes_done += reply.io.tx_bytes_done;
+            aggregate.rx_bytes_done += reply.io.rx_bytes_done;
+            aggregate.transport_error = reply.io.transport_error;
+            if (result.code != DTV_INTERNAL_RESULT_OK) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                return finish(result);
+            }
+            if (reply.nad != 0 || reply.pcb != 0xe1 || reply.inf.size() != 1 ||
+                reply.inf[0] != candidate_ifsd ||
+                reply.raw_block_length != 4 + edc_size) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
+            }
+            result = registry.update_card_t1_ifsd(enclosure, context, candidate_ifsd);
+            if (result.code != DTV_INTERNAL_RESULT_OK) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                return finish(result);
+            }
+            next_ifsd = candidate_ifsd;
+        }
+    }
     constexpr unsigned maximum_i_block_attempts = 3;
     std::size_t command_offset = 0;
     auto next_send_sequence = send_sequence;
@@ -4721,7 +4890,9 @@ dtv_internal_result exchange_public_t1_apdu(
         bool received_r_block = false;
         for (unsigned attempt = 0; attempt < maximum_i_block_attempts; ++attempt) {
             result = exchange_public_t1_block(enclosure, request, next_timeout(), &block, &ticket,
-                outgoing);
+                outgoing, expected_receive_capacity);
+            command_may_have_reached_card = command_may_have_reached_card ||
+                block.io.tx_bytes_done != 0;
             aggregate.tx_bytes_done += block.io.tx_bytes_done;
             aggregate.rx_bytes_done += block.io.rx_bytes_done;
             aggregate.result_known = aggregate.result_known && block.io.result_known;
@@ -4838,7 +5009,7 @@ dtv_internal_result exchange_public_t1_apdu(
                 std::span<const unsigned char>(s_outgoing.data() + 3, 1)};
             T1BlockResult s_reply{};
             result = exchange_public_t1_block(enclosure, s_request, next_timeout(),
-                &s_reply, &ticket, s_outgoing);
+                &s_reply, &ticket, s_outgoing, expected_receive_capacity);
             aggregate.tx_bytes_done += s_reply.io.tx_bytes_done;
             aggregate.rx_bytes_done += s_reply.io.rx_bytes_done;
             aggregate.result_known = aggregate.result_known && s_reply.io.result_known;
@@ -4878,7 +5049,7 @@ dtv_internal_result exchange_public_t1_apdu(
             for (unsigned r_attempt = 0; r_attempt < maximum_r_block_attempts; ++r_attempt) {
                 T1BlockResult r_reply{};
                 result = exchange_public_t1_block(enclosure, r_request, next_timeout(),
-                    &r_reply, &ticket, r_outgoing);
+                    &r_reply, &ticket, r_outgoing, expected_receive_capacity);
                 aggregate.tx_bytes_done += r_reply.io.tx_bytes_done;
                 aggregate.rx_bytes_done += r_reply.io.rx_bytes_done;
                 aggregate.result_known = aggregate.result_known && r_reply.io.result_known;
@@ -4947,7 +5118,7 @@ dtv_internal_result exchange_public_t1_apdu(
                                                        std::span<const unsigned char> r_outgoing,
                                                        T1BlockResult *r_reply) {
                 const auto exchange_result = exchange_public_t1_block(enclosure, r_request,
-                    next_timeout(), r_reply, &ticket, r_outgoing);
+                    next_timeout(), r_reply, &ticket, r_outgoing, expected_receive_capacity);
                 aggregate.tx_bytes_done += r_reply->io.tx_bytes_done;
                 aggregate.rx_bytes_done += r_reply->io.rx_bytes_done;
                 aggregate.result_known = aggregate.result_known && r_reply->io.result_known;
@@ -5026,7 +5197,7 @@ dtv_internal_result exchange_public_t1_apdu(
             }
         }
         result = registry.finish_card_t1_exchange(enclosure, context, next_send_sequence,
-            next_receive_sequence, next_ifsc);
+            next_receive_sequence, next_ifsc, next_ifsd);
         if (result.code != DTV_INTERNAL_RESULT_OK) {
             registry.invalidate_card_t1_session(enclosure, context);
             aggregate.reply_complete = false;

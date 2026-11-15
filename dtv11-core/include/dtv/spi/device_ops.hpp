@@ -220,10 +220,18 @@ struct CardBgtCapability {
     std::uint64_t evidence_id = 0;
 };
 
+struct CardT1ReceiveCapacity {
+    bool known = false;
+    std::size_t complete_block_bytes = 0;
+    std::uint64_t revision = 0;
+    std::uint64_t evidence_id = 0;
+};
+
 struct PublicCardTransportPlan {
     PublicOperationPlan operation;
     CardTransportMode mode = CardTransportMode::byte_chunks;
     CardBgtCapability bgt;
+    CardT1ReceiveCapacity receive_capacity;
 };
 
 struct PublicTuneRequest {
