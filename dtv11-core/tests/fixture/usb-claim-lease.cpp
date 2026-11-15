@@ -3178,6 +3178,82 @@ int public_card_transport()
             return 229;
         }
     }
+    for (const auto mode : {1u, 2u}) {
+        set_scan_card_t1_crc(mode == 2);
+        for (const auto [fault, multiplier] : {
+                std::pair{68u, static_cast<unsigned char>(60)},
+                std::pair{69u, static_cast<unsigned char>(255)}}) {
+            if (!reset_t1_session()) return 243;
+            set_scan_card_t1_apdu_mode(true, fault);
+            const std::array<unsigned char, 1> range_wtx_value{multiplier};
+            const auto range_host_i = mode == 1 ? encode_t1_lrc_frame(0x00, apdu_one)
+                                                 : encode_t1_crc_frame(0x00, apdu_one);
+            const auto range_host_wtx = mode == 1
+                ? encode_t1_lrc_frame(0xe3, range_wtx_value)
+                : encode_t1_crc_frame(0xe3, range_wtx_value);
+            const std::array<unsigned char, 4> range_response{0x11, 0x22, 0x90, 0x00};
+            const auto range_receive_bytes = (mode == 1
+                ? encode_t1_lrc_frame(0xc3, range_wtx_value)
+                : encode_t1_crc_frame(0xc3, range_wtx_value)).size() +
+                (mode == 1 ? encode_t1_lrc_frame(0x00, range_response)
+                           : encode_t1_crc_frame(0x00, range_response)).size();
+            dtv::internal::T1ApduResult range_wtx_result{};
+            std::vector<std::vector<unsigned char>> range_wtx_output;
+            const auto range_wtx_code = run_t1_apdu(mode, apdu_one,
+                &range_wtx_result, &range_wtx_output, 5000);
+            if (range_wtx_code != DTV_INTERNAL_RESULT_OK ||
+                range_wtx_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+                !range_wtx_result.io.result_known || !range_wtx_result.io.reply_complete ||
+                range_wtx_result.io.tx_bytes_done != range_host_i.size() + range_host_wtx.size() ||
+                range_wtx_result.io.rx_bytes_done != range_receive_bytes ||
+                !same_apdu_frame_sent(mode, range_wtx_output, range_host_i, apdu_one, 1) ||
+                !same_wtx_frame_sent(mode, range_wtx_output, range_host_wtx, 1)) {
+                std::fprintf(stderr, "WTX range mode=%u multiplier=%u code=%d tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+                    mode, multiplier, range_wtx_code, range_wtx_result.io.tx_bytes_done,
+                    range_wtx_result.io.rx_bytes_done, range_wtx_result.io.result_known,
+                    range_wtx_result.io.reply_complete, range_wtx_output.size());
+                return 244;
+            }
+            set_scan_card_t1_apdu_mode(true, 50);
+            dtv::internal::T1ApduResult range_next_result{};
+            if (run_t1_apdu(mode, apdu_two, &range_next_result) != DTV_INTERNAL_RESULT_OK ||
+                range_next_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+                !range_next_result.io.result_known || !range_next_result.io.reply_complete)
+                return 245;
+        }
+    }
+    set_scan_card_t1_crc(true);
+    set_scan_card_t1_bwt_mode(8);
+    if (!reset_t1_session()) return 246;
+    set_scan_card_t1_apdu_mode(true, 70);
+    dtv::internal::T1ApduResult overflow_wtx_result{};
+    std::vector<std::vector<unsigned char>> overflow_wtx_output;
+    const auto overflow_wtx_code = run_t1_apdu(2, apdu_one,
+        &overflow_wtx_result, &overflow_wtx_output, 5000);
+    const auto overflow_host_i = encode_t1_crc_frame(0x00, apdu_one);
+    const auto overflow_wtx_request = encode_t1_crc_frame(0xc3,
+        std::array<unsigned char, 1>{101});
+    if (overflow_wtx_code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+        !overflow_wtx_result.response.empty() || overflow_wtx_result.io.result_known ||
+        overflow_wtx_result.io.reply_complete ||
+        overflow_wtx_result.io.tx_bytes_done != overflow_host_i.size() ||
+        overflow_wtx_result.io.rx_bytes_done != overflow_wtx_request.size() ||
+        !same_apdu_frame_sent(2, overflow_wtx_output, overflow_host_i, apdu_one, 1) ||
+        !same_wtx_frame_sent(2, overflow_wtx_output,
+            encode_t1_crc_frame(0xe3, std::array<unsigned char, 1>{101}), 0)) {
+        std::fprintf(stderr, "WTX overflow code=%d transport=%d tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+            overflow_wtx_code, overflow_wtx_result.io.transport_error.code,
+            overflow_wtx_result.io.tx_bytes_done,
+            overflow_wtx_result.io.rx_bytes_done, overflow_wtx_result.io.result_known,
+            overflow_wtx_result.io.reply_complete, overflow_wtx_output.size());
+        for (const auto &packet : overflow_wtx_output) {
+            std::fprintf(stderr, "WTX overflow packet:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        return 247;
+    }
+    set_scan_card_t1_bwt_mode(0);
     if (!reset_t1_session()) return 234;
     set_scan_card_t1_bwt_mode(0);
     set_scan_card_t1_apdu_mode(true, 55);

@@ -184,7 +184,8 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
         bool duplicate_i_block = false;
         bool send_r_block = fault == 9;
         unsigned error_code = 0;
-        if ((fault == 51 || fault == 52 || fault == 55 || fault == 56 || fault == 57) &&
+        if ((fault == 51 || fault == 52 || fault == 55 || fault == 56 || fault == 57 ||
+             fault == 68 || fault == 69 || fault == 70) &&
             request[1] == 0xe3) {
             const auto exchange_count = scan_card_t1_wtx_exchange_count.fetch_add(1,
                 std::memory_order_acq_rel) + 1;
@@ -203,13 +204,15 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
                 scan_card_t1_apdu_response_sequence.store(pcb == 0,
                     std::memory_order_release);
             }
-        } else if ((fault == 51 || fault == 52 || fault == 55 || fault == 56 || fault == 57) &&
+        } else if ((fault == 51 || fault == 52 || fault == 55 || fault == 56 || fault == 57 ||
+                    fault == 68 || fault == 69 || fault == 70) &&
                    (request[1] & 0x80) == 0) {
             scan_card_t1_wtx_exchange_count.store(0, std::memory_order_release);
             pcb = 0xc3;
             scan_card_t1_reply.push_back(pcb);
             scan_card_t1_reply.push_back(1);
-            scan_card_t1_reply.push_back(2);
+            scan_card_t1_reply.push_back(fault == 68 ? 60 : fault == 69 ? 255 :
+                fault == 70 ? 101 : 2);
         } else if (fault == 53 && (request[1] & 0x80) == 0) {
             pcb = 0xc3;
             scan_card_t1_reply.push_back(pcb);
@@ -777,8 +780,14 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         std::size_t size = 4;
         if (kind == 0) {
             if (scan_card_t1_crc.load(std::memory_order_acquire)) {
-                reply = {0, 0x3b, 0x80, 0x81, 0x41, 0x01, 0x41, 0};
-                size = 7;
+                if (scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 8) {
+                    reply = {0, 0x3b, 0x90, 0xb1, 0xd1, 0x01, 0x00, 0xf1,
+                        0xfe, 0x90, 0x01, 0x01, 0x6e};
+                    size = 13;
+                } else {
+                    reply = {0, 0x3b, 0x80, 0x81, 0x41, 0x01, 0x41, 0};
+                    size = 7;
+                }
             } else {
                 reply = {0, 0x3b, 0x80, 0x01, 0x81, 0, 0, 0};
                 size = 5;
@@ -1265,7 +1274,8 @@ dtv_internal_result scan_plan_card_transport(
     transport_plan->t1_bwt.card_clock_hz =
         scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 3 ? 4000000000 :
         scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 4 ? 0 :
-        scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 6 ? 5718012000 : 4000000;
+        scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 6 ? 5718012000 :
+        scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 8 ? 1 : 4000000;
     transport_plan->t1_bwt.clock_domain =
         scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 5 ? 0 : 71;
     transport_plan->t1_bwt.error_bound_ns = 1;

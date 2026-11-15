@@ -4330,8 +4330,7 @@ bool t1_bwt_duration_ns(const dtv::spi::CardTransportContext &context,
                         std::uint64_t *duration_ns, std::uint8_t multiplier = 1)
 {
     if (duration_ns == nullptr || context.t1_bwi > 9 || context.t1_f == 0 ||
-        context.t1_d == 0 || capability.card_clock_hz == 0 || multiplier == 0 ||
-        multiplier > 59) return false;
+        context.t1_d == 0 || capability.card_clock_hz == 0 || multiplier == 0) return false;
     const auto scale = (std::uint64_t{1} << context.t1_bwi) * 960 * 372;
     const auto numerator = std::uint64_t{11} * context.t1_f +
         static_cast<std::uint64_t>(context.t1_d) * scale;
@@ -5099,7 +5098,7 @@ dtv_internal_result exchange_public_t1_apdu(
             while (result.code == DTV_INTERNAL_RESULT_OK && block.pcb == 0xc3) {
                 if (block.nad != 0 || block.inf.size() != 1 ||
                     block.raw_block_length != 4 + t1_edc_size(context.t1_crc) ||
-                    block.inf[0] == 0 || block.inf[0] > 59) {
+                    block.inf[0] == 0) {
                     registry.invalidate_card_t1_session(enclosure, context);
                     aggregate.reply_complete = false;
                     aggregate.result_known = false;
