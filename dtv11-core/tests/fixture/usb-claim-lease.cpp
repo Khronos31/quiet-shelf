@@ -37,6 +37,9 @@ void set_scan_card_t1_exchange_mode(unsigned);
 void set_scan_card_t1_bgt(unsigned, std::uint64_t, std::uint64_t);
 unsigned scan_card_t1_bgt_refresh_count_value();
 void set_scan_card_t1_bgt_send_plan_override(std::uint64_t, std::uint64_t);
+unsigned scan_card_t1_apdu_ack_count_value();
+unsigned scan_card_t1_apdu_ack_trace_value();
+void reset_scan_card_t1_apdu_sequence();
 void set_scan_card_t1_fault(unsigned);
 void set_scan_card_t1_crc(bool);
 void set_scan_card_t1_stale_reply(bool);
@@ -2917,12 +2920,12 @@ int public_card_transport()
         return 58;
     }
     set_scan_card_t1_bgt(2, 1000000, 18);
-    std::array<unsigned char, 33> oversized_apdu{};
-    const auto before_oversized = backend->output_snapshot().size();
+    std::array<unsigned char, 0> empty_apdu{};
+    const auto before_empty_apdu = backend->output_snapshot().size();
     dtv::internal::T1ApduResult oversized_result{};
-    if (dtv::internal::exchange_public_t1_apdu(root, oversized_apdu, dtv_timeout{1000, 0},
+    if (dtv::internal::exchange_public_t1_apdu(root, empty_apdu, dtv_timeout{1000, 0},
             &oversized_result).code != DTV_INTERNAL_RESULT_INVALID_ARGUMENT ||
-        backend->output_snapshot().size() != before_oversized) return 30;
+        backend->output_snapshot().size() != before_empty_apdu) return 30;
     set_scan_card_t1_apdu_mode(true, 1);
     dtv::internal::T1ApduResult wrong_sequence_result{};
     std::vector<std::vector<unsigned char>> wrong_sequence_output;
@@ -2970,7 +2973,9 @@ int public_card_transport()
             return false;
         }
         resetting.join();
-        return value.load(std::memory_order_acquire) == DTV_ERROR_OK;
+        const auto reset_ok = value.load(std::memory_order_acquire) == DTV_ERROR_OK;
+        if (reset_ok) reset_scan_card_t1_apdu_sequence();
+        return reset_ok;
     };
     const auto same_apdu_frame_sent = [&](unsigned mode,
         const std::vector<std::vector<unsigned char>> &sent,
@@ -3012,6 +3017,195 @@ int public_card_transport()
         });
     };
     const std::vector<unsigned char> normal_r_one_frame{0x00, 0x90, 0x00, 0x90};
+    const auto encode_t1_lrc_frame = [](unsigned char pcb,
+                                        std::span<const unsigned char> inf) {
+        std::vector<unsigned char> frame{0x00, pcb, static_cast<unsigned char>(inf.size())};
+        frame.insert(frame.end(), inf.begin(), inf.end());
+        unsigned char lrc = 0;
+        for (const auto byte : frame) lrc ^= byte;
+        frame.push_back(lrc);
+        return frame;
+    };
+    std::array<unsigned char, 65> chained_command{};
+    for (std::size_t index = 0; index < chained_command.size(); ++index)
+        chained_command[index] = static_cast<unsigned char>(index + 1);
+    const auto command_piece_one = std::span<const unsigned char>(chained_command).first(32);
+    const auto command_piece_two = std::span<const unsigned char>(chained_command).subspan(32, 32);
+    const auto command_piece_three = std::span<const unsigned char>(chained_command).subspan(64);
+    const auto command_frame_one = encode_t1_lrc_frame(0x20, command_piece_one);
+    const auto command_frame_two = encode_t1_lrc_frame(0x60, command_piece_two);
+    const auto command_frame_three = encode_t1_lrc_frame(0x00, command_piece_three);
+    set_scan_card_t1_bgt(2, 1000000, 18);
+    for (const auto mode : {1u, 2u}) {
+        if (!reset_t1_session()) return 76;
+        set_scan_card_t1_apdu_mode(true, 22);
+        dtv::internal::T1ApduResult command_chain_result{};
+        std::vector<std::vector<unsigned char>> command_chain_output;
+        std::vector<std::uint64_t> command_chain_submit_times;
+        const auto command_chain_code = run_t1_apdu(mode, chained_command,
+            &command_chain_result, &command_chain_output, 1000,
+            &command_chain_submit_times);
+        const auto find_frame_submit = [&](const std::vector<unsigned char> &frame) {
+            const auto found = std::find_if(command_chain_output.begin(),
+                command_chain_output.end(), [&](const auto &packet) {
+                    return mode == 2 ? packet == frame
+                        : packet == std::vector<unsigned char>{0x00, frame[1], frame[2]};
+                });
+            return found == command_chain_output.end()
+                ? command_chain_output.size()
+                : static_cast<std::size_t>(found - command_chain_output.begin());
+        };
+        const auto first_frame_submit = find_frame_submit(command_frame_one);
+        const auto second_frame_submit = find_frame_submit(command_frame_two);
+        const auto third_frame_submit = find_frame_submit(command_frame_three);
+        if (command_chain_code != DTV_INTERNAL_RESULT_OK ||
+            command_chain_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            command_chain_result.io.tx_bytes_done != 77 ||
+            command_chain_result.io.rx_bytes_done != 16 ||
+            !command_chain_result.io.reply_complete || !command_chain_result.io.result_known ||
+            !same_apdu_frame_sent(mode, command_chain_output, command_frame_one,
+                command_piece_one, 1) ||
+            !same_apdu_frame_sent(mode, command_chain_output, command_frame_two,
+                command_piece_two, 1) ||
+            !same_apdu_frame_sent(mode, command_chain_output, command_frame_three,
+                command_piece_three, 1) ||
+            scan_card_t1_apdu_ack_count_value() != 2 ||
+            scan_card_t1_apdu_ack_trace_value() != 1 || command_chain_submit_times.empty() ||
+            command_chain_submit_times.size() != command_chain_output.size() ||
+            first_frame_submit >= second_frame_submit ||
+            second_frame_submit >= third_frame_submit ||
+            command_chain_submit_times[second_frame_submit] <
+                command_chain_submit_times[first_frame_submit] + 22000000 ||
+            command_chain_submit_times[third_frame_submit] <
+                command_chain_submit_times[second_frame_submit] + 22000000) {
+            std::fprintf(stderr, "command chain mode=%u result=%d transport=%d/%u tx=%zu rx=%zu response=%zu output=%zu\n",
+                mode, command_chain_code, command_chain_result.io.transport_error.code,
+                command_chain_result.io.transport_error.detail,
+                command_chain_result.io.tx_bytes_done, command_chain_result.io.rx_bytes_done,
+                command_chain_result.response.size(),
+                command_chain_output.size());
+            for (const auto &packet : command_chain_output) {
+                std::fprintf(stderr, " sent:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 77;
+        }
+        dtv::internal::T1ApduResult following_command_result{};
+        std::vector<std::vector<unsigned char>> following_command_output;
+        if (run_t1_apdu(mode, apdu_one, &following_command_result,
+                &following_command_output) != DTV_INTERNAL_RESULT_OK ||
+            following_command_result.response !=
+                std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            following_command_output.size() == 0 ||
+            !same_apdu_frame_sent(mode, following_command_output,
+                encode_t1_lrc_frame(0x40, apdu_one), apdu_one, 1)) return 78;
+    }
+    if (!reset_t1_session()) return 79;
+    set_scan_card_t1_apdu_mode(true, 23);
+    dtv::internal::T1ApduResult repeated_command_block_result{};
+    std::vector<std::vector<unsigned char>> repeated_command_block_output;
+    if (run_t1_apdu(2, chained_command, &repeated_command_block_result,
+            &repeated_command_block_output) != DTV_INTERNAL_RESULT_OK ||
+        repeated_command_block_result.response !=
+            std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        repeated_command_block_result.io.tx_bytes_done != 113 ||
+        repeated_command_block_result.io.rx_bytes_done != 20 ||
+        !repeated_command_block_result.io.reply_complete ||
+        !repeated_command_block_result.io.result_known ||
+        scan_card_t1_apdu_ack_count_value() != 3 ||
+        scan_card_t1_apdu_ack_trace_value() != 2 ||
+        !same_apdu_frame_sent(2, repeated_command_block_output, command_frame_one,
+            command_piece_one, 2) ||
+        !same_apdu_frame_sent(2, repeated_command_block_output, command_frame_two,
+            command_piece_two, 1) ||
+        !same_apdu_frame_sent(2, repeated_command_block_output, command_frame_three,
+            command_piece_three, 1)) {
+        std::fprintf(stderr, "same N(R) command retry tx=%zu rx=%zu ack=%u/%u output=%zu\n",
+            repeated_command_block_result.io.tx_bytes_done,
+            repeated_command_block_result.io.rx_bytes_done,
+            scan_card_t1_apdu_ack_count_value(), scan_card_t1_apdu_ack_trace_value(),
+            repeated_command_block_output.size());
+        for (const auto &packet : repeated_command_block_output) {
+            std::fprintf(stderr, " sent:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        std::fprintf(stderr, "code=%d response=%zu known=%u complete=%u frames=%d/%d/%d\n",
+            repeated_command_block_result.io.transport_error.code,
+            repeated_command_block_result.response.size(),
+            repeated_command_block_result.io.result_known,
+            repeated_command_block_result.io.reply_complete,
+            static_cast<int>(same_apdu_frame_sent(2, repeated_command_block_output,
+                command_frame_one, command_piece_one, 2)),
+            static_cast<int>(same_apdu_frame_sent(2, repeated_command_block_output,
+                command_frame_two, command_piece_two, 1)),
+            static_cast<int>(same_apdu_frame_sent(2, repeated_command_block_output,
+                command_frame_three, command_piece_three, 1)));
+        std::fprintf(stderr, " response bytes:");
+        for (const auto byte : repeated_command_block_result.response)
+            std::fprintf(stderr, " %02x", byte);
+        std::fprintf(stderr, "\n");
+        return 80;
+    }
+    for (const auto fault : {24u, 25u}) {
+        if (!reset_t1_session()) return 81;
+        set_scan_card_t1_apdu_mode(true, fault);
+        dtv::internal::T1ApduResult invalid_command_chain_result{};
+        std::vector<std::vector<unsigned char>> invalid_command_chain_output;
+        if (run_t1_apdu(2, chained_command, &invalid_command_chain_result,
+                &invalid_command_chain_output) != DTV_INTERNAL_RESULT_USB_IO ||
+            !invalid_command_chain_result.response.empty() ||
+            invalid_command_chain_result.io.tx_bytes_done != command_frame_one.size() ||
+            invalid_command_chain_result.io.result_known ||
+            invalid_command_chain_result.io.reply_complete ||
+            !same_apdu_frame_sent(2, invalid_command_chain_output, command_frame_one,
+                command_piece_one, 1)) return 82;
+    }
+    if (!reset_t1_session()) return 83;
+    set_scan_card_t1_apdu_mode(true, 26);
+    dtv::internal::T1ApduResult missing_command_ack_result{};
+    std::vector<std::vector<unsigned char>> missing_command_ack_output;
+    if (run_t1_apdu(2, chained_command, &missing_command_ack_result,
+            &missing_command_ack_output, 100) != DTV_INTERNAL_RESULT_TIMEOUT ||
+        !missing_command_ack_result.response.empty() ||
+        missing_command_ack_result.io.tx_bytes_done != command_frame_one.size() ||
+        missing_command_ack_result.io.rx_bytes_done != 0 ||
+        missing_command_ack_result.io.result_known ||
+        missing_command_ack_result.io.reply_complete ||
+        !same_apdu_frame_sent(2, missing_command_ack_output, command_frame_one,
+            command_piece_one, 1)) return 84;
+    if (!reset_t1_session()) return 85;
+    set_scan_card_t1_apdu_mode(true, 22);
+    backend->actual_length_limit = 7;
+    dtv::internal::T1ApduResult partial_command_out_result{};
+    std::vector<std::vector<unsigned char>> partial_command_out;
+    const auto partial_command_out_code = run_t1_apdu(2, chained_command,
+        &partial_command_out_result, &partial_command_out);
+    backend->actual_length_limit = (std::numeric_limits<std::size_t>::max)();
+    if (partial_command_out_code != DTV_INTERNAL_RESULT_USB_IO ||
+        !partial_command_out_result.response.empty() ||
+        partial_command_out_result.io.tx_bytes_done == 0 ||
+        partial_command_out_result.io.result_known ||
+        partial_command_out_result.io.reply_complete ||
+        partial_command_out.size() != 1) return 86;
+    if (!reset_t1_session()) return 87;
+    set_scan_card_t1_apdu_mode(true, 22);
+    synthetic_bgt_clock.cancel_root = root;
+    synthetic_bgt_clock.cancel_on_delay = true;
+    dtv::internal::T1ApduResult cancelled_command_chain_result{};
+    std::vector<std::vector<unsigned char>> cancelled_command_chain_output;
+    const auto cancelled_command_chain_code = run_t1_apdu(2, chained_command,
+        &cancelled_command_chain_result, &cancelled_command_chain_output, 30000);
+    synthetic_bgt_clock.cancel_root = nullptr;
+    if (cancelled_command_chain_code != DTV_INTERNAL_RESULT_CANCELLED ||
+        !cancelled_command_chain_result.response.empty() ||
+        cancelled_command_chain_result.io.tx_bytes_done != command_frame_one.size() ||
+        cancelled_command_chain_result.io.rx_bytes_done != 4 ||
+        cancelled_command_chain_result.io.result_known ||
+        cancelled_command_chain_result.io.reply_complete ||
+        !same_apdu_frame_sent(2, cancelled_command_chain_output, command_frame_one,
+            command_piece_one, 1)) return 88;
     for (const auto mode : {1u, 2u}) {
         if (!reset_t1_session()) return 63;
         set_scan_card_t1_apdu_mode(true, 18);
@@ -3215,7 +3409,18 @@ int public_card_transport()
             sequence_one_r_frame.size() || r_timeout_result.io.result_known ||
         r_timeout_result.io.reply_complete ||
         !same_apdu_frame_sent(2, r_timeout_output, second_apdu_frame, apdu_two, 1) ||
-        !same_r_frame_sent(2, r_timeout_output, sequence_one_r_frame, 1)) return 58;
+        !same_r_frame_sent(2, r_timeout_output, sequence_one_r_frame, 1)) {
+        std::fprintf(stderr, "R timeout code=%d tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+            r_timeout_code, r_timeout_result.io.tx_bytes_done, r_timeout_result.io.rx_bytes_done,
+            r_timeout_result.io.result_known, r_timeout_result.io.reply_complete,
+            r_timeout_output.size());
+        for (const auto &packet : r_timeout_output) {
+            std::fprintf(stderr, " sent:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        return 58;
+    }
 
     if (!reset_t1_session()) return 51;
     set_scan_card_t1_apdu_mode(true, 0);
