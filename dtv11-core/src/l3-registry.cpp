@@ -4747,12 +4747,6 @@ dtv_internal_result exchange_public_t1_apdu(
             aggregate.result_known = false;
             return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
         }
-        if ((block.pcb & 0x20) != 0) {
-            registry.invalidate_card_t1_session(enclosure, context);
-            aggregate.reply_complete = false;
-            aggregate.result_known = false;
-            return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
-        }
         if (((block.pcb & 0x40) != 0) != receive_sequence) {
             std::vector<unsigned char> r_outgoing;
             try {
@@ -4786,7 +4780,7 @@ dtv_internal_result exchange_public_t1_apdu(
                 }
                 const auto is_i_block = (r_reply.pcb & 0x80) == 0;
                 const auto is_expected_i_block = is_i_block &&
-                    (r_reply.pcb & 0x1f) == 0 && (r_reply.pcb & 0x20) == 0 &&
+                    (r_reply.pcb & 0x1f) == 0 &&
                     (((r_reply.pcb & 0x40) != 0) == receive_sequence);
                 if (is_expected_i_block) {
                     block = std::move(r_reply);
@@ -4794,7 +4788,7 @@ dtv_internal_result exchange_public_t1_apdu(
                     break;
                 }
                 const auto is_duplicate_i_block = is_i_block &&
-                    (r_reply.pcb & 0x1f) == 0 && (r_reply.pcb & 0x20) == 0 &&
+                    (r_reply.pcb & 0x1f) == 0 &&
                     (((r_reply.pcb & 0x40) != 0) != receive_sequence);
                 if (!is_duplicate_i_block) {
                     registry.invalidate_card_t1_session(enclosure, context);
@@ -4811,18 +4805,119 @@ dtv_internal_result exchange_public_t1_apdu(
                 return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
             }
         }
-        try {
-            apdu_result->response.assign(block.inf.begin(), block.inf.end());
-        } catch (...) {
-            registry.invalidate_card_t1_session(enclosure, context);
-            aggregate.reply_complete = false;
-            aggregate.result_known = false;
-            return finish(exception_result());
+        std::vector<unsigned char> response;
+        auto next_receive_sequence = receive_sequence;
+        for (;;) {
+            if (block.nad != 0 || (block.pcb & 0x80) != 0 ||
+                (block.pcb & 0x1f) != 0 ||
+                (((block.pcb & 0x40) != 0) != next_receive_sequence)) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                aggregate.result_known = false;
+                return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
+            }
+            if (block.inf.size() > response.max_size() - response.size()) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                aggregate.result_known = false;
+                return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0));
+            }
+            try {
+                response.insert(response.end(), block.inf.begin(), block.inf.end());
+            } catch (...) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                aggregate.result_known = false;
+                return finish(exception_result());
+            }
+            next_receive_sequence = !next_receive_sequence;
+            if ((block.pcb & 0x20) == 0) break;
+
+            const auto exchange_response_block = [&](const T1BlockRequest &r_request,
+                                                       std::span<const unsigned char> r_outgoing,
+                                                       T1BlockResult *r_reply) {
+                const auto exchange_result = exchange_public_t1_block(enclosure, r_request,
+                    next_timeout(), r_reply, &ticket, r_outgoing);
+                aggregate.tx_bytes_done += r_reply->io.tx_bytes_done;
+                aggregate.rx_bytes_done += r_reply->io.rx_bytes_done;
+                aggregate.result_known = aggregate.result_known && r_reply->io.result_known;
+                aggregate.transport_error = r_reply->io.transport_error;
+                return exchange_result;
+            };
+            std::vector<unsigned char> r_outgoing;
+            try {
+                r_outgoing.reserve(3 + t1_edc_size(context.t1_crc));
+                r_outgoing.push_back(0);
+                r_outgoing.push_back(static_cast<unsigned char>(0x80 |
+                    (next_receive_sequence ? 0x10 : 0)));
+                r_outgoing.push_back(0);
+                append_t1_edc(r_outgoing, context.t1_crc);
+            } catch (...) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                aggregate.result_known = false;
+                return finish(exception_result());
+            }
+            T1BlockRequest r_request{0, r_outgoing[1], {}};
+            T1BlockResult r_reply{};
+            result = exchange_response_block(r_request, r_outgoing, &r_reply);
+            if (result.code != DTV_INTERNAL_RESULT_OK) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                return finish(result);
+            }
+            bool received_expected_i_block = false;
+            constexpr unsigned maximum_r_block_attempts = 3;
+            for (unsigned r_attempt = 0; r_attempt < maximum_r_block_attempts; ++r_attempt) {
+                const auto is_i_block = (r_reply.pcb & 0x80) == 0;
+                const auto valid_i_block = is_i_block && r_reply.nad == 0 &&
+                    (r_reply.pcb & 0x1f) == 0;
+                if (!valid_i_block) {
+                    registry.invalidate_card_t1_session(enclosure, context);
+                    aggregate.reply_complete = false;
+                    aggregate.result_known = false;
+                    return finish(is_i_block
+                        ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0)
+                        : dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
+                }
+                if (((r_reply.pcb & 0x40) != 0) == next_receive_sequence) {
+                    block = std::move(r_reply);
+                    received_expected_i_block = true;
+                    break;
+                }
+                if (r_attempt + 1 == maximum_r_block_attempts) break;
+                std::vector<unsigned char> retry_outgoing;
+                try {
+                    retry_outgoing.reserve(3 + t1_edc_size(context.t1_crc));
+                    retry_outgoing.push_back(0);
+                    retry_outgoing.push_back(static_cast<unsigned char>(0x82 |
+                        (next_receive_sequence ? 0x10 : 0)));
+                    retry_outgoing.push_back(0);
+                    append_t1_edc(retry_outgoing, context.t1_crc);
+                } catch (...) {
+                    registry.invalidate_card_t1_session(enclosure, context);
+                    aggregate.reply_complete = false;
+                    aggregate.result_known = false;
+                    return finish(exception_result());
+                }
+                const T1BlockRequest retry_request{0, retry_outgoing[1], {}};
+                result = exchange_response_block(retry_request, retry_outgoing, &r_reply);
+                if (result.code != DTV_INTERNAL_RESULT_OK) {
+                    registry.invalidate_card_t1_session(enclosure, context);
+                    aggregate.reply_complete = false;
+                    return finish(result);
+                }
+            }
+            if (!received_expected_i_block) {
+                registry.invalidate_card_t1_session(enclosure, context);
+                aggregate.reply_complete = false;
+                aggregate.result_known = false;
+                return finish(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
+            }
         }
         result = registry.finish_card_t1_exchange(enclosure, context, !send_sequence,
-            !receive_sequence);
+            next_receive_sequence);
         if (result.code != DTV_INTERNAL_RESULT_OK) {
-            apdu_result->response.clear();
             registry.invalidate_card_t1_session(enclosure, context);
             aggregate.reply_complete = false;
             aggregate.result_known = false;
@@ -4831,6 +4926,7 @@ dtv_internal_result exchange_public_t1_apdu(
         aggregate.reply_complete = true;
         aggregate.result_known = true;
         aggregate.transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        apdu_result->response = std::move(response);
         apdu_result->io = aggregate;
         release_public_card_ticket(enclosure, &ticket);
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);

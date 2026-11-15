@@ -108,6 +108,7 @@ std::atomic<unsigned> scan_card_t1_fault{0};
 std::atomic<bool> scan_card_t1_apdu_mode{false};
 std::atomic<unsigned> scan_card_t1_apdu_fault{0};
 std::atomic<bool> scan_card_t1_apdu_rblock_sent{false};
+std::atomic<unsigned> scan_card_t1_apdu_chain_index{0};
 std::atomic<bool> scan_card_t1_apdu_drop_r_reply{false};
 std::atomic<unsigned> scan_card_t1_apdu_reply_count{0};
 std::atomic<unsigned char> scan_card_t1_apdu_pending_ins{0};
@@ -146,6 +147,7 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
             request.back() != static_cast<unsigned char>(crc >> 8)) return;
     }
     scan_card_t1_reply.clear();
+    scan_card_t1_reply_offset = 0;
     scan_card_t1_reply.push_back(request[0]);
     if (scan_card_t1_apdu_mode.load(std::memory_order_acquire)) {
         const auto fault = scan_card_t1_apdu_fault.load(std::memory_order_acquire);
@@ -154,7 +156,53 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
         bool duplicate_i_block = false;
         bool send_r_block = fault == 9;
         unsigned error_code = 0;
-        if (fault == 13 || fault == 14 || fault == 15) {
+        if (fault == 18 || fault == 19) {
+            const auto is_r_block = (request[1] & 0xc0) == 0x80;
+            auto chain_index = 0u;
+            if (is_r_block)
+                chain_index = scan_card_t1_apdu_chain_index.fetch_add(1,
+                    std::memory_order_acq_rel) + 1;
+            else
+                scan_card_t1_apdu_chain_index.store(0, std::memory_order_release);
+            const auto block_count = fault == 19 ? 3u : 2u;
+            const auto response_sequence = static_cast<unsigned char>((chain_index & 1u) != 0
+                ? 0x40 : 0x00);
+            const auto more = chain_index + 1 < block_count;
+            pcb = static_cast<unsigned char>(response_sequence | (more ? 0x20 : 0x00));
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(0);
+            if (fault == 18) {
+                if (chain_index == 0)
+                    scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x11, 0x22});
+                else
+                    scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x90, 0x00});
+            } else if (chain_index == 0) {
+                scan_card_t1_reply.push_back(0x11);
+            } else if (chain_index == 1) {
+                scan_card_t1_reply.push_back(0x22);
+            } else {
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x90, 0x00});
+            }
+            scan_card_t1_reply[2] = static_cast<unsigned char>(scan_card_t1_reply.size() - 3);
+        } else if (fault == 21) {
+            const auto is_r_block = (request[1] & 0xc0) == 0x80;
+            pcb = is_r_block ? 0 : 0x20;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(2);
+            if (is_r_block)
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0xde, 0xad});
+            else
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x11, 0x22});
+        } else if (fault == 20) {
+            const auto ins = request[3 + (request[2] > 1 ? 1 : 0)];
+            pcb = 0;
+            scan_card_t1_reply.push_back(pcb);
+            scan_card_t1_reply.push_back(4);
+            if (ins == 0xca)
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x33, 0x44, 0x90, 0x00});
+            else
+                scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x11, 0x22, 0x90, 0x00});
+        } else if (fault == 13 || fault == 14 || fault == 15) {
             if ((request[1] & 0xc0) == 0x80) {
                 if (fault == 15)
                     scan_card_t1_apdu_drop_r_reply.store(true, std::memory_order_release);
@@ -180,14 +228,14 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
             send_r_block = true;
             error_code = 3;
         }
-        if (send_r_block) {
+        if (fault != 18 && fault != 19 && fault != 20 && fault != 21 && send_r_block) {
             pcb = static_cast<unsigned char>(0x80 | expected_nr | error_code);
             if (fault == 6) pcb = static_cast<unsigned char>(0x80 | (expected_nr ^ 0x10));
             scan_card_t1_reply.push_back(pcb);
             scan_card_t1_reply.push_back(fault == 10 ? 1 : 0);
             if (fault == 10) scan_card_t1_reply.push_back(0xaa);
             if (fault == 11) scan_card_t1_reply[0] = 1;
-        } else {
+        } else if (fault != 18 && fault != 19 && fault != 20 && fault != 21) {
             if (fault == 1) pcb ^= 0x40;
             else if (fault == 3) pcb |= 0x20;
             else if (fault == 4) pcb = 0xc0;
@@ -1304,6 +1352,7 @@ void set_scan_card_t1_apdu_mode(bool enabled, unsigned fault)
 {
     scan_card_t1_apdu_fault.store(fault, std::memory_order_release);
     scan_card_t1_apdu_rblock_sent.store(false, std::memory_order_release);
+    scan_card_t1_apdu_chain_index.store(0, std::memory_order_release);
     scan_card_t1_apdu_reply_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_mode.store(enabled, std::memory_order_release);
 }

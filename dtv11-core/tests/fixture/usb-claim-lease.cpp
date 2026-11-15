@@ -2803,7 +2803,8 @@ int public_card_transport()
     const auto run_t1_apdu = [&](unsigned mode, std::span<const unsigned char> command,
                                  dtv::internal::T1ApduResult *apdu_result,
                                  std::vector<std::vector<unsigned char>> *sent = nullptr,
-                                 std::uint32_t timeout_ms = 1000) {
+                                 std::uint32_t timeout_ms = 1000,
+                                 std::vector<std::uint64_t> *submit_times = nullptr) {
         set_scan_card_t1_exchange_mode(mode);
         const auto output_start = backend->output_snapshot().size();
         std::atomic<bool> done{false};
@@ -2816,6 +2817,8 @@ int public_card_transport()
         auto next_output = backend->endpoint_submission_count(0x02) + 1;
         for (unsigned step = 0; step < 64 && !done.load(std::memory_order_acquire); ++step) {
             if (!backend->wait_for_endpoint_submissions(0x02, next_output)) break;
+            if (submit_times != nullptr)
+                submit_times->push_back(synthetic_now(&synthetic_bgt_clock));
             callbacks = backend->callback_count_snapshot();
             backend->complete_endpoint(0x02);
             if (!backend->wait_for_callbacks(callbacks + 1)) break;
@@ -3008,6 +3011,101 @@ int public_card_transport()
                 std::vector<unsigned char>(frame.begin() + 3, frame.end());
         });
     };
+    const std::vector<unsigned char> normal_r_one_frame{0x00, 0x90, 0x00, 0x90};
+    for (const auto mode : {1u, 2u}) {
+        if (!reset_t1_session()) return 63;
+        set_scan_card_t1_apdu_mode(true, 18);
+        dtv::internal::T1ApduResult chained_result{};
+        std::vector<std::vector<unsigned char>> chained_output;
+        std::vector<std::uint64_t> chained_submit_times;
+        if (run_t1_apdu(mode, apdu_one, &chained_result, &chained_output, 1000,
+                &chained_submit_times) != DTV_INTERNAL_RESULT_OK ||
+            chained_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            chained_result.io.tx_bytes_done != 12 || chained_result.io.rx_bytes_done != 12 ||
+            !chained_result.io.reply_complete || !chained_result.io.result_known ||
+            !same_r_frame_sent(mode, chained_output, normal_r_one_frame, 1)) {
+            std::fprintf(stderr, "response chain mode=%u transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u outputs=%zu\n",
+                mode, chained_result.io.transport_error.code, chained_result.response.size(),
+                chained_result.io.tx_bytes_done, chained_result.io.rx_bytes_done,
+                chained_result.io.result_known, chained_result.io.reply_complete,
+                chained_output.size());
+            for (const auto byte : chained_result.response)
+                std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+            for (const auto &packet : chained_output) {
+                std::fprintf(stderr, " sent:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 64;
+        }
+        if (chained_submit_times.empty()) return 65;
+        const auto guarded_submit = std::find_if(chained_submit_times.begin(),
+            chained_submit_times.end(), [&](const auto time) {
+                return time >= chained_submit_times.front() + 22000000;
+            });
+        if (guarded_submit == chained_submit_times.end()) return 65;
+        set_scan_card_t1_apdu_mode(true, 20);
+        dtv::internal::T1ApduResult following_result{};
+        std::vector<std::vector<unsigned char>> following_output;
+        if (run_t1_apdu(mode, apdu_two, &following_result, &following_output) !=
+                DTV_INTERNAL_RESULT_OK ||
+            following_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+            following_output.empty() ||
+            (mode == 1 && following_output[0] != std::vector<unsigned char>{0x00, 0x40, 0x04}) ||
+            (mode == 2 && following_output[0] != std::vector<unsigned char>{0x00, 0x40, 0x04,
+                0x00, 0xca, 0x00, 0x00, 0x8e})) return 66;
+    }
+    if (!reset_t1_session()) return 69;
+    set_scan_card_t1_apdu_mode(true, 21);
+    dtv::internal::T1ApduResult incomplete_chain_result{};
+    std::vector<std::vector<unsigned char>> incomplete_chain_output;
+    if (run_t1_apdu(2, apdu_one, &incomplete_chain_result, &incomplete_chain_output) !=
+            DTV_INTERNAL_RESULT_UNSUPPORTED ||
+        !incomplete_chain_result.response.empty() || incomplete_chain_result.io.result_known ||
+        incomplete_chain_result.io.reply_complete ||
+        std::count(incomplete_chain_output.begin(), incomplete_chain_output.end(),
+            std::vector<unsigned char>{0x00, 0x00, 0x04, 0x00, 0xa4, 0x04, 0x00, 0xa4}) != 1)
+        return 70;
+    set_scan_card_t1_crc(true);
+    if (!reset_t1_session()) return 71;
+    set_scan_card_t1_apdu_mode(true, 18);
+    dtv::internal::T1ApduResult crc_chain_result{};
+    std::vector<std::vector<unsigned char>> crc_chain_output;
+    const auto crc_chain_code = run_t1_apdu(2, apdu_one, &crc_chain_result, &crc_chain_output);
+    if (crc_chain_code !=
+            DTV_INTERNAL_RESULT_OK ||
+        crc_chain_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        crc_chain_result.io.tx_bytes_done != 14 || crc_chain_result.io.rx_bytes_done != 14 ||
+        !same_r_frame_sent(2, crc_chain_output,
+            std::vector<unsigned char>{0x00, 0x90, 0x00, 0x91, 0xdf}, 1)) {
+        std::fprintf(stderr, "CRC response chain result=%d transport=%d response=%zu tx=%zu rx=%zu output=%zu\n",
+            crc_chain_code, crc_chain_result.io.transport_error.code,
+            crc_chain_result.response.size(), crc_chain_result.io.tx_bytes_done,
+            crc_chain_result.io.rx_bytes_done, crc_chain_output.size());
+        for (const auto &packet : crc_chain_output) {
+            std::fprintf(stderr, " sent:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        return 72;
+    }
+    set_scan_card_t1_crc(false);
+    if (!reset_t1_session()) return 67;
+    set_scan_card_t1_apdu_mode(true, 19);
+    dtv::internal::T1ApduResult three_block_result{};
+    std::vector<std::vector<unsigned char>> three_block_output;
+    std::vector<std::uint64_t> three_block_submit_times;
+    if (run_t1_apdu(2, apdu_one, &three_block_result, &three_block_output, 1000,
+            &three_block_submit_times) != DTV_INTERNAL_RESULT_OK ||
+        three_block_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        three_block_result.io.tx_bytes_done != 16 || three_block_result.io.rx_bytes_done != 16 ||
+        std::count(three_block_output.begin(), three_block_output.end(), normal_r_one_frame) != 1 ||
+        std::count(three_block_output.begin(), three_block_output.end(),
+            std::vector<unsigned char>{0x00, 0x80, 0x00, 0x80}) != 1 ||
+        three_block_submit_times.size() < 3 ||
+        three_block_submit_times[1] < three_block_submit_times[0] + 22000000 ||
+        three_block_submit_times[2] < three_block_submit_times[1] + 22000000) return 68;
     const std::vector<unsigned char> first_apdu_frame{
         0x00, 0x00, 0x04, 0x00, 0xa4, 0x04, 0x00, 0xa4};
     const std::vector<unsigned char> second_apdu_frame{
