@@ -2929,7 +2929,7 @@ int public_card_transport()
     const auto wrong_sequence_code = run_t1_apdu(1, apdu_one, &wrong_sequence_result,
         &wrong_sequence_output);
     if (wrong_sequence_code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
-        !wrong_sequence_result.response.empty() || !wrong_sequence_result.io.result_known ||
+        !wrong_sequence_result.response.empty() || wrong_sequence_result.io.result_known ||
         wrong_sequence_result.io.reply_complete || wrong_sequence_output.size() < 3 ||
         wrong_sequence_output[0] != std::vector<unsigned char>{0x00, 0x00, 0x04}) {
         std::fprintf(stderr, "wrong sequence result=%d transport=%d response=%zu tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
@@ -3231,7 +3231,7 @@ int public_card_transport()
         repeated_i_result.io.tx_bytes_done != second_apdu_frame.size() +
             sequence_one_r_frame.size() * 3 ||
         repeated_i_result.io.rx_bytes_done != 32 || repeated_i_result.io.reply_complete ||
-        !repeated_i_result.io.result_known ||
+        repeated_i_result.io.result_known ||
         !same_apdu_frame_sent(2, repeated_i_output, second_apdu_frame, apdu_two, 1) ||
         !same_r_frame_sent(2, repeated_i_output, sequence_one_r_frame, 3)) return 53;
     if (!reset_t1_session()) return 54;
@@ -3286,7 +3286,7 @@ int public_card_transport()
     if (run_t1_apdu(2, apdu_one, &repeated_r_result, &repeated_r_output) !=
             DTV_INTERNAL_RESULT_UNSUPPORTED || !repeated_r_result.response.empty() ||
         repeated_r_result.io.tx_bytes_done != 24 || repeated_r_result.io.rx_bytes_done != 12 ||
-        repeated_r_result.io.reply_complete || !repeated_r_result.io.result_known ||
+        repeated_r_result.io.reply_complete || repeated_r_result.io.result_known ||
         repeated_r_output.size() != 3 || repeated_r_output[0] != first_apdu_frame ||
         repeated_r_output[1] != first_apdu_frame || repeated_r_output[2] != first_apdu_frame)
         return 38;
@@ -3666,6 +3666,38 @@ int public_card_transport()
     }
     synthetic_bgt_clock.now_ns.fetch_add(20000000000, std::memory_order_acq_rel);
     set_scan_card_t1_bgt(2, 1000000, 20);
+    if (!reset_t1_session()) return 73;
+    set_scan_card_t1_apdu_mode(true, 18);
+    set_scan_card_t1_bgt(2, 500000000, 21);
+    synthetic_bgt_clock.cancel_root = root;
+    synthetic_bgt_clock.cancel_on_delay = true;
+    const auto before_chained_bgt_cancel = backend->endpoint_submission_count(0x02);
+    dtv::internal::T1ApduResult chained_bgt_cancel_result{};
+    std::vector<std::vector<unsigned char>> chained_bgt_cancel_output;
+    const auto chained_bgt_cancel_code = run_t1_apdu(2, apdu_one,
+        &chained_bgt_cancel_result, &chained_bgt_cancel_output, 30000);
+    synthetic_bgt_clock.cancel_root = nullptr;
+    if (chained_bgt_cancel_code != DTV_INTERNAL_RESULT_CANCELLED ||
+        backend->endpoint_submission_count(0x02) != before_chained_bgt_cancel + 1 ||
+        chained_bgt_cancel_result.io.tx_bytes_done != 8 ||
+        chained_bgt_cancel_result.io.rx_bytes_done != 6 ||
+        chained_bgt_cancel_result.io.result_known ||
+        chained_bgt_cancel_result.io.reply_complete ||
+        !chained_bgt_cancel_result.response.empty() ||
+        chained_bgt_cancel_output != std::vector<std::vector<unsigned char>>{{
+            0x00, 0x00, 0x04, 0x00, 0xa4, 0x04, 0x00, 0xa4}}) {
+        std::fprintf(stderr, "chained BGT cancel result=%d outputs=%u/%u tx=%zu rx=%zu known=%u complete=%u response=%zu packets=%zu\n",
+            chained_bgt_cancel_code, backend->endpoint_submission_count(0x02),
+            before_chained_bgt_cancel, chained_bgt_cancel_result.io.tx_bytes_done,
+            chained_bgt_cancel_result.io.rx_bytes_done, chained_bgt_cancel_result.io.result_known,
+            chained_bgt_cancel_result.io.reply_complete,
+            chained_bgt_cancel_result.response.size(), chained_bgt_cancel_output.size());
+        return 74;
+    }
+    set_scan_card_t1_crc(true);
+    set_scan_card_t1_apdu_mode(true, 0);
+    if (!reset_t1_session()) return 75;
+    set_scan_card_t1_bgt(2, 1000000, 22);
 
     set_scan_card_transport_drop_reply(true);
     reply.clear();

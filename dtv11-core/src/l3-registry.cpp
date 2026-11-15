@@ -4688,6 +4688,8 @@ dtv_internal_result exchange_public_t1_apdu(
     ticket = std::move(operation);
     dtv::spi::CardIoOutcome aggregate{};
     const auto finish = [&](dtv_internal_result failure) {
+        if (aggregate.tx_bytes_done != 0 && !aggregate.reply_complete)
+            aggregate.result_known = false;
         apdu_result->io = aggregate;
         apdu_result->io.transport_error = failure;
         release_public_card_ticket(enclosure, &ticket);
