@@ -2529,12 +2529,20 @@ int public_reset_card()
     const std::uint8_t *unsupported_getter_atr = reinterpret_cast<const std::uint8_t *>(
         std::uintptr_t{1});
     std::uint64_t unsupported_getter_size = 1;
+    const std::array<std::uint8_t, 4> unsupported_command{0x00, 0xa4, 0x04, 0x00};
+    const std::uint8_t *unsupported_response = reinterpret_cast<const std::uint8_t *>(
+        std::uintptr_t{1});
+    std::uint64_t unsupported_response_size = 1;
     if (dtv_reset_card(root, nullptr, &unsupported_atr, &unsupported_size, &error) !=
             DTV_ERROR_UNSUPPORTED || error.code != DTV_ERROR_UNSUPPORTED ||
         unsupported_atr != nullptr || unsupported_size != 0 ||
         dtv_get_card_atr(root, nullptr, &unsupported_getter_atr, &unsupported_getter_size,
             &error) != DTV_ERROR_UNSUPPORTED || error.code != DTV_ERROR_UNSUPPORTED ||
         unsupported_getter_atr != nullptr || unsupported_getter_size != 0 ||
+        dtv_transmit_apdu(root, unsupported_command.data(), unsupported_command.size(),
+            nullptr, &unsupported_response, &unsupported_response_size, &error) !=
+            DTV_ERROR_UNSUPPORTED || error.code != DTV_ERROR_UNSUPPORTED ||
+        unsupported_response != nullptr || unsupported_response_size != 0 ||
         unsupported_backend->output_snapshot().size() != output_count) return 13;
     dtv::internal::set_public_discovery_batch_for_test({});
     set_scan_public_open_case(0);
@@ -2580,6 +2588,18 @@ int public_card_transport()
     backend->complete_endpoint(0x82);
     opening.join();
     if (open_result.load(std::memory_order_acquire) != DTV_ERROR_OK) return 4;
+
+    const std::array<std::uint8_t, 4> not_ready_command{0x00, 0xa4, 0x04, 0x00};
+    const auto not_ready_output_count = backend->output_snapshot().size();
+    const std::uint8_t *not_ready_response = reinterpret_cast<const std::uint8_t *>(
+        std::uintptr_t{1});
+    std::uint64_t not_ready_response_size = 1;
+    if (dtv_transmit_apdu(root, not_ready_command.data(), not_ready_command.size(), nullptr,
+            &not_ready_response, &not_ready_response_size, &error) != DTV_ERROR_NOT_READY ||
+        error.code != DTV_ERROR_NOT_READY || not_ready_response != nullptr ||
+        not_ready_response_size != 0 ||
+        backend->output_snapshot().size() != not_ready_output_count)
+        return 269;
 
     const auto reset_output = backend->endpoint_submission_count(0x02) + 1;
     std::atomic<std::int32_t> reset_result{DTV_ERROR_INTERNAL};
@@ -3056,6 +3076,139 @@ int public_card_transport()
         frame.push_back(static_cast<unsigned char>(crc >> 8));
         return frame;
     };
+    const auto run_public_apdu = [&](unsigned mode,
+                                     std::span<const unsigned char> command,
+                                     std::vector<unsigned char> *response,
+                                     std::vector<std::vector<unsigned char>> *sent,
+                                     std::uint64_t timeout_ms = 0,
+                                     const std::uint8_t **returned_data = nullptr,
+                                     std::uint64_t *returned_size = nullptr) -> std::int32_t {
+        set_scan_card_t1_exchange_mode(mode);
+        const auto output_start = backend->output_snapshot().size();
+        std::atomic<bool> done{false};
+        std::atomic<std::int32_t> code{DTV_ERROR_INTERNAL};
+        std::atomic<std::int32_t> error_code{DTV_ERROR_INTERNAL};
+        std::vector<unsigned char> received;
+        std::thread caller([&] {
+            const std::uint8_t *data = nullptr;
+            std::uint64_t size = 0;
+            dtv_error public_apdu_error{};
+            public_apdu_error.struct_size = sizeof(public_apdu_error);
+            const dtv_call_options call_options{sizeof(dtv_call_options), timeout_ms};
+            const auto result = dtv_transmit_apdu(root, command.data(), command.size(),
+                timeout_ms == 0 ? nullptr : &call_options, &data, &size, &public_apdu_error);
+            if (result == DTV_ERROR_OK && data != nullptr) {
+                received.assign(data, data + size);
+                if (returned_data != nullptr) *returned_data = data;
+                if (returned_size != nullptr) *returned_size = size;
+            }
+            error_code.store(public_apdu_error.code, std::memory_order_release);
+            code.store(result, std::memory_order_release);
+            done.store(true, std::memory_order_release);
+        });
+        auto next_output = backend->endpoint_submission_count(0x02) + 1;
+        for (unsigned step = 0; step < 64 && !done.load(std::memory_order_acquire); ++step) {
+            if (!backend->wait_for_endpoint_submissions(0x02, next_output)) break;
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x02);
+            if (!backend->wait_for_callbacks(callbacks + 1)) break;
+            callbacks = backend->callback_count_snapshot();
+            backend->complete_endpoint(0x81);
+            if (!backend->wait_for_callbacks(callbacks + 1)) break;
+            ++next_output;
+        }
+        if (!done.load(std::memory_order_acquire)) dtv_cancel_enclosure(root, &error);
+        caller.join();
+        if (sent != nullptr) {
+            const auto output = backend->output_snapshot();
+            sent->assign(output.begin() + static_cast<std::ptrdiff_t>(output_start), output.end());
+        }
+        if (response != nullptr) *response = std::move(received);
+        if (code.load(std::memory_order_acquire) !=
+            error_code.load(std::memory_order_acquire)) return DTV_ERROR_INTERNAL;
+        return code.load(std::memory_order_acquire);
+    };
+    set_scan_card_t1_crc(false);
+    if (!reset_t1_session()) return 262;
+    set_scan_card_t1_apdu_mode(true, 0);
+    const auto invalid_output_count = backend->output_snapshot().size();
+    const std::uint8_t *invalid_response = reinterpret_cast<const std::uint8_t *>(
+        std::uintptr_t{1});
+    std::uint64_t invalid_response_size = 1;
+    if (dtv_transmit_apdu(root, apdu_one.data(), 0, nullptr, &invalid_response,
+            &invalid_response_size, &error) != DTV_ERROR_INVALID_ARGUMENT ||
+        error.code != DTV_ERROR_INVALID_ARGUMENT || invalid_response != nullptr ||
+        invalid_response_size != 0 ||
+        backend->output_snapshot().size() != invalid_output_count)
+        return 270;
+    for (const auto mode : {1u, 2u}) {
+        if (mode == 2) {
+            set_scan_card_t1_crc(true);
+            if (!reset_t1_session()) return 263;
+            set_scan_card_t1_apdu_mode(true, 0);
+        }
+        const auto first_host_i = mode == 1 ? encode_t1_lrc_frame(0x00, apdu_one)
+                                            : encode_t1_crc_frame(0x00, apdu_one);
+        const auto second_host_i = mode == 1 ? encode_t1_lrc_frame(0x40, apdu_two)
+                                             : encode_t1_crc_frame(0x40, apdu_two);
+        std::vector<unsigned char> first_response;
+        std::vector<unsigned char> second_response;
+        std::vector<std::vector<unsigned char>> first_output;
+        std::vector<std::vector<unsigned char>> second_output;
+        const std::uint8_t *first_response_data = nullptr;
+        std::uint64_t first_response_size = 0;
+        if (run_public_apdu(mode, apdu_one, &first_response, &first_output, 0,
+                &first_response_data, &first_response_size) != DTV_ERROR_OK ||
+            first_response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            !same_apdu_frame_sent(mode, first_output, first_host_i, apdu_one, 1))
+            return 264;
+        auto *const *public_devices = dtv_get_devices(root);
+        auto *const *public_receivers = public_devices == nullptr
+            ? nullptr : dtv_get_receivers(public_devices[0]);
+        dtv_signal public_signal{};
+        if (public_receivers == nullptr || public_receivers[0] == nullptr ||
+            dtv_get_signal(public_receivers[0], nullptr, &public_signal, &error) != DTV_ERROR_OK ||
+            first_response_data == nullptr || first_response_size != first_response.size() ||
+            !std::equal(first_response.begin(), first_response.end(), first_response_data))
+            return 267;
+        if (run_public_apdu(mode, apdu_two, &second_response, &second_output) != DTV_ERROR_OK ||
+            second_response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+            !same_apdu_frame_sent(mode, second_output, second_host_i, apdu_two, 1)) {
+            std::fprintf(stderr, "public APDU mode=%u first=%zu second=%zu\n",
+                mode, first_response.size(), second_response.size());
+            return 264;
+        }
+    }
+    set_scan_card_t1_bgt(2, 100000000, 1000);
+    const auto timeout_output_count = backend->output_snapshot().size();
+    std::vector<unsigned char> timeout_response;
+    std::vector<std::vector<unsigned char>> timeout_output;
+    const auto public_timeout_code = run_public_apdu(1, apdu_one,
+        &timeout_response, &timeout_output, 1);
+    if (public_timeout_code != DTV_ERROR_TIMEOUT || !timeout_response.empty() ||
+        !timeout_output.empty() || backend->output_snapshot().size() != timeout_output_count) {
+        std::fprintf(stderr, "public APDU timeout code=%d response=%zu output=%zu delta=%zu\n",
+            public_timeout_code, timeout_response.size(), timeout_output.size(),
+            backend->output_snapshot().size() - timeout_output_count);
+        return 266;
+    }
+    set_scan_card_t1_bgt(2, 1000000, 1001);
+    synthetic_bgt_clock.cancel_root.store(root, std::memory_order_release);
+    synthetic_bgt_clock.cancel_on_delay.store(true, std::memory_order_release);
+    const auto cancel_output_count = backend->output_snapshot().size();
+    std::vector<unsigned char> cancelled_response;
+    std::vector<std::vector<unsigned char>> cancelled_output;
+    const auto public_cancel_code = run_public_apdu(1, apdu_one,
+        &cancelled_response, &cancelled_output);
+    synthetic_bgt_clock.cancel_root.store(nullptr, std::memory_order_release);
+    synthetic_bgt_clock.cancel_on_delay.store(false, std::memory_order_release);
+    if (public_cancel_code != DTV_ERROR_CANCELLED || !cancelled_response.empty() ||
+        !cancelled_output.empty() || backend->output_snapshot().size() != cancel_output_count)
+        return 268;
+    set_scan_card_t1_bgt(2, 1000000, 18);
+    set_scan_card_t1_crc(false);
+    if (!reset_t1_session()) return 265;
+    set_scan_card_t1_apdu_mode(true, 0);
     const auto same_wtx_frame_sent = [&](unsigned mode,
         const std::vector<std::vector<unsigned char>> &sent,
         const std::vector<unsigned char> &frame, std::size_t expected_frames) {
@@ -4682,6 +4835,20 @@ int public_card_transport()
             scan_card_interleave_phase_value());
         cleanup_interleave();
         return 37;
+    }
+    const auto removed_apdu_output_count = backend->output_snapshot().size();
+    const std::uint8_t *removed_apdu_response = reinterpret_cast<const std::uint8_t *>(
+        std::uintptr_t{1});
+    std::uint64_t removed_apdu_response_size = 1;
+    dtv_error removed_apdu_error{};
+    removed_apdu_error.struct_size = sizeof(removed_apdu_error);
+    if (dtv_transmit_apdu(root, apdu_one.data(), apdu_one.size(), nullptr,
+            &removed_apdu_response, &removed_apdu_response_size, &removed_apdu_error) !=
+            DTV_ERROR_CARD_REMOVED || removed_apdu_error.code != DTV_ERROR_CARD_REMOVED ||
+        removed_apdu_response != nullptr || removed_apdu_response_size != 0 ||
+        backend->output_snapshot().size() != removed_apdu_output_count) {
+        cleanup_interleave();
+        return 41;
     }
     const auto present_submissions = backend->endpoint_submission_count(0x81);
     callbacks = backend->callback_count_snapshot();

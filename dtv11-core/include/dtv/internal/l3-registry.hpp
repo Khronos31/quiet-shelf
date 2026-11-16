@@ -95,6 +95,9 @@ public:
                                           std::span<const std::uint8_t>);
     dtv_internal_result card_atr_view(const dtv_enclosure *, const std::uint8_t **,
                                       std::uint64_t *) const;
+    dtv_internal_result store_card_apdu_response(const dtv_enclosure *,
+        const dtv::spi::CardTransportContext &, std::vector<unsigned char> &&,
+        const std::uint8_t **, std::uint64_t *);
     std::uint32_t enclosure_id(const dtv_enclosure *) const;
     const char *product(const dtv_enclosure *) const;
     const char *model(const dtv_enclosure *) const;
@@ -212,7 +215,8 @@ dtv_internal_result exchange_public_t1_block(
     std::shared_ptr<void> * = nullptr, std::span<const unsigned char> = {},
     const dtv::spi::CardT1ReceiveCapacity * = nullptr, std::size_t = 0);
 dtv_internal_result exchange_public_t1_apdu(
-    dtv_enclosure *, std::span<const unsigned char>, dtv_timeout, T1ApduResult *);
+    dtv_enclosure *, std::span<const unsigned char>, dtv_timeout, T1ApduResult *,
+    std::shared_ptr<void> * = nullptr, std::shared_ptr<void> * = nullptr);
 void set_public_card_bgt_clock_for_test(const dtv_runtime_clock *);
 std::int32_t run_public_stream_operation(
     dtv_stream *, std::uint32_t, std::span<const unsigned char>, dtv_timeout,
