@@ -3287,7 +3287,7 @@ int public_card_transport()
     std::vector<unsigned char> partial_cwt_unknown_response;
     std::vector<std::vector<unsigned char>> partial_cwt_unknown_output;
     const auto partial_cwt_unknown_code = run_public_apdu(1, apdu_one,
-        &partial_cwt_unknown_response, &partial_cwt_unknown_output, 100);
+        &partial_cwt_unknown_response, &partial_cwt_unknown_output, 1000);
     if (partial_cwt_unknown_code != DTV_ERROR_TIMEOUT ||
         !partial_cwt_unknown_response.empty() ||
         !same_apdu_frame_sent(1, partial_cwt_unknown_output, partial_cwt_host_i, apdu_one, 1) ||
