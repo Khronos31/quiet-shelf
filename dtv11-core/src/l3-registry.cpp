@@ -4207,8 +4207,15 @@ dtv_internal_result run_public_card_transport(
     std::shared_ptr<dtv::spi::ProductInstance> instance;
     {
         std::lock_guard lock(slot->mutex);
-        if (slot->phase != PublicDiscoveryState::OpenSlot::Phase::open)
+        if (slot->phase != PublicDiscoveryState::OpenSlot::Phase::open) {
+            if (retained_ticket != nullptr && *retained_ticket) {
+                const auto ticket = std::static_pointer_cast<
+                    PublicDiscoveryState::OpenSlot::OperationControl>(*retained_ticket);
+                if (ticket->cancelled.load(std::memory_order_acquire))
+                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+            }
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        }
         instance = slot->product_instance;
     }
     if (!instance || slot->ops == nullptr || slot->ops->plan_card_transport == nullptr)
@@ -4450,8 +4457,10 @@ T1CwtResult classify_t1_cwt(const dtv::spi::CardTransportContext &context,
     const dtv::spi::CardT1BwtEvidence &bwt_evidence,
     const dtv::spi::CardT1CwtEvidence &evidence,
     std::uint64_t host_transaction_id, std::uint64_t card_transaction_id,
-    std::size_t received_octet_count, std::uint64_t *duration_ns)
+    std::span<const unsigned char> received_octets, std::uint64_t *duration_ns,
+    std::uint64_t *quiet_lower_bound_ns = nullptr)
 {
+    if (quiet_lower_bound_ns != nullptr) *quiet_lower_bound_ns = 0;
     if (capability.card_clock_hz == 0 || capability.clock_domain == 0 ||
         !capability.error_bound_known || capability.revision == 0 ||
         capability.evidence_id == 0 || !bwt_evidence.error_bound_known ||
@@ -4470,8 +4479,8 @@ T1CwtResult classify_t1_cwt(const dtv::spi::CardTransportContext &context,
         evidence.request_epoch != context.request_epoch ||
         evidence.host_transaction_id != host_transaction_id ||
         evidence.card_transaction_id != card_transaction_id ||
-        evidence.received_octet_count != received_octet_count || received_octet_count < 2 ||
-        evidence.adjacent_gap_bounds.size() != received_octet_count - 1 ||
+        evidence.received_octet_count != received_octets.size() || received_octets.size() < 2 ||
+        evidence.adjacent_gap_bounds.size() != received_octets.size() - 1 ||
         !t1_cwt_duration_ns(context, capability, duration_ns))
         return T1CwtResult::unavailable;
     if (evidence.error_bound_ns > (std::numeric_limits<std::uint64_t>::max)() -
@@ -4490,6 +4499,23 @@ T1CwtResult classify_t1_cwt(const dtv::spi::CardTransportContext &context,
         const auto lower = gap.lower_ns > error_bound ? gap.lower_ns - error_bound : 0;
         if (lower > *duration_ns) return T1CwtResult::exceeded;
         uncertain = true;
+    }
+    if (evidence.silence_observation ==
+        dtv::spi::CardT1CwtSilenceObservation::continuous_no_io) {
+        if (evidence.received_octets.size() != received_octets.size() ||
+            !std::equal(received_octets.begin(), received_octets.end(),
+                evidence.received_octets.begin()) || evidence.last_character_edge_ns == 0 ||
+            evidence.io_silence_observed_through_ns < evidence.last_character_edge_ns)
+            return T1CwtResult::unavailable;
+        const auto elapsed = evidence.io_silence_observed_through_ns -
+            evidence.last_character_edge_ns;
+        if (elapsed > (std::numeric_limits<std::uint64_t>::max)() - error_bound)
+            return T1CwtResult::uncertain;
+        const auto lower = elapsed > error_bound ? elapsed - error_bound : 0;
+        const auto upper = elapsed + error_bound;
+        if (quiet_lower_bound_ns != nullptr) *quiet_lower_bound_ns = lower;
+        if (lower > *duration_ns) return T1CwtResult::exceeded;
+        if (upper > *duration_ns) uncertain = true;
     }
     return uncertain ? T1CwtResult::uncertain : T1CwtResult::timely;
 }
@@ -4902,10 +4928,11 @@ dtv_internal_result exchange_public_t1_block(
             response[2] > context.t1_ifsd)
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
         std::uint64_t cwt_duration_ns = 0;
-        if (classify_t1_cwt(context, selection.t1_bwt, aggregate.t1_bwt,
-                aggregate.t1_bwt.t1_cwt, aggregate.operation_transaction_id,
-                aggregate.response_transaction_id, response.size(), &cwt_duration_ns) !=
-            T1CwtResult::timely)
+        const auto cwt_result = classify_t1_cwt(context, selection.t1_bwt,
+            aggregate.t1_bwt, aggregate.t1_bwt.t1_cwt,
+            aggregate.operation_transaction_id, aggregate.response_transaction_id,
+            response, &cwt_duration_ns);
+        if (cwt_result != T1CwtResult::timely)
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
     } else {
         bool before_send_pending = true;
@@ -4985,7 +5012,54 @@ dtv_internal_result exchange_public_t1_block(
                     }
                     if (timing != T1BwtResult::timely)
                         return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-                    return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
+                    if (response.size() < 2)
+                        return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
+                    if (retained_ticket == nullptr)
+                        return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
+                    std::uint64_t cwt_duration_ns = 0;
+                    std::uint64_t quiet_lower_bound_ns = 0;
+                    const auto cwt = classify_t1_cwt(context, selection.t1_bwt,
+                        aggregate.t1_bwt, aggregate.t1_bwt.t1_cwt,
+                        aggregate.operation_transaction_id, aggregate.response_transaction_id,
+                        response, &cwt_duration_ns, &quiet_lower_bound_ns);
+                    if (cwt == T1CwtResult::unavailable || cwt == T1CwtResult::uncertain ||
+                        aggregate.t1_bwt.t1_cwt.silence_observation !=
+                            dtv::spi::CardT1CwtSilenceObservation::continuous_no_io)
+                        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+                    if (cwt == T1CwtResult::exceeded) {
+                        if (completed_bgt.mode != dtv::spi::CardBgtMode::bounded_etu ||
+                            !completed_bgt.receive_complete_after_last_edge ||
+                            completed_bgt.etu_upper_bound_ns == 0 ||
+                            completed_bgt.revision == 0 || completed_bgt.evidence_id == 0 ||
+                            completed_bgt.etu_upper_bound_ns >
+                                (std::numeric_limits<std::uint64_t>::max)() / 22)
+                            return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+                        const auto bgt_guard_ns = completed_bgt.etu_upper_bound_ns * 22;
+                        if (quiet_lower_bound_ns > (std::max)(cwt_duration_ns, bgt_guard_ns)) {
+                            aggregate.t1_cwt_timeout = true;
+                            return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
+                        }
+                    }
+                    suspend_public_card_ticket(enclosure, ticket);
+                    if (ticket != nullptr && *ticket) {
+                        const auto operation = std::static_pointer_cast<
+                            PublicDiscoveryState::OpenSlot::OperationControl>(*ticket);
+                        if (operation->cancelled.load(std::memory_order_acquire))
+                            return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+                    }
+                    const auto now = clock->monotonic_now_ns(clock->user);
+                    if (deadline != UINT64_MAX && now >= deadline)
+                        return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
+                    const auto poll_at = now > (std::numeric_limits<std::uint64_t>::max)() -
+                            1000000 ? deadline : now + 1000000;
+                    std::uint32_t cancelled = 0;
+                    const auto wait_result = clock->delay_until(clock->user,
+                        deadline == UINT64_MAX ? poll_at : (std::min)(poll_at, deadline),
+                        deadline, nullptr, &cancelled);
+                    if (wait_result.code != DTV_INTERNAL_RESULT_OK) return wait_result;
+                    if (cancelled != 0)
+                        return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+                    continue;
                 }
                 if (part.size() > remaining)
                     return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
@@ -5016,7 +5090,7 @@ dtv_internal_result exchange_public_t1_block(
         std::uint64_t cwt_duration_ns = 0;
         if (classify_t1_cwt(context, selection.t1_bwt, aggregate.t1_bwt,
                 aggregate.t1_bwt.t1_cwt, aggregate.operation_transaction_id,
-                aggregate.response_transaction_id, response.size(), &cwt_duration_ns) !=
+                aggregate.response_transaction_id, response, &cwt_duration_ns) !=
             T1CwtResult::timely)
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
         aggregate.reply_complete = true;
@@ -5265,7 +5339,7 @@ dtv_internal_result exchange_public_t1_apdu(
             if (result.code != DTV_INTERNAL_RESULT_OK) {
                 aggregate.reply_complete = false;
                 aggregate.result_known = aggregate.result_known && block.io.result_known;
-                if (block.io.t1_bwt_timeout && !more_command) {
+                if ((block.io.t1_bwt_timeout || block.io.t1_cwt_timeout) && !more_command) {
                     std::vector<unsigned char> r_outgoing;
                     try {
                         r_outgoing.reserve(3 + t1_edc_size(context.t1_crc));

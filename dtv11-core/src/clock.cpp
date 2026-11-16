@@ -2,6 +2,7 @@
 #include <dtv/internal/clock.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -12,6 +13,9 @@ namespace dtv::internal {
 namespace {
 
 extern dtv_runtime_clock kSystemClock;
+
+std::atomic<void (*)(void *)> system_clock_delay_hook_for_test{nullptr};
+std::atomic<void *> system_clock_delay_hook_user_for_test{nullptr};
 
 uint64_t monotonic_now_ns(void *)
 {
@@ -39,6 +43,9 @@ dtv_internal_result delay_until(void *user, uint64_t wake_at_ns,
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     }
     *cancelled = 0;
+    const auto hook = system_clock_delay_hook_for_test.load(std::memory_order_acquire);
+    if (hook != nullptr)
+        hook(system_clock_delay_hook_user_for_test.load(std::memory_order_acquire));
     const auto *clock = static_cast<const dtv_runtime_clock *>(user);
     if (clock == nullptr || clock->monotonic_now_ns == nullptr) {
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
@@ -77,6 +84,12 @@ dtv_runtime_clock kSystemClock{
 const dtv_runtime_clock *system_runtime_clock()
 {
     return &kSystemClock;
+}
+
+void set_system_clock_delay_hook_for_test(void (*hook)(void *), void *user)
+{
+    system_clock_delay_hook_user_for_test.store(user, std::memory_order_release);
+    system_clock_delay_hook_for_test.store(hook, std::memory_order_release);
 }
 
 }

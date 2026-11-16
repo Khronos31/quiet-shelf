@@ -109,6 +109,10 @@ struct CardT1CwtGapBounds {
     std::uint64_t upper_ns = 0;
 };
 
+enum class CardT1CwtSilenceObservation : std::uint32_t {
+    unavailable, continuous_no_io
+};
+
 struct CardT1CwtEvidence {
     std::uint64_t host_transaction_id = 0;
     std::uint64_t card_transaction_id = 0;
@@ -121,6 +125,11 @@ struct CardT1CwtEvidence {
     std::uint64_t request_epoch = 0;
     std::size_t received_octet_count = 0;
     std::vector<CardT1CwtGapBounds> adjacent_gap_bounds;
+    std::vector<unsigned char> received_octets;
+    CardT1CwtSilenceObservation silence_observation =
+        CardT1CwtSilenceObservation::unavailable;
+    std::uint64_t last_character_edge_ns = 0;
+    std::uint64_t io_silence_observed_through_ns = 0;
 };
 
 struct CardT1BwtEvidence {
@@ -267,6 +276,7 @@ struct CardIoOutcome {
     CardT1BwtEvidence t1_bwt;
     bool t1_bwt_timeout = false;
     CardT1BwtCapability t1_bwt_capability;
+    bool t1_cwt_timeout = false;
 };
 
 enum class CardTransportMode : std::uint32_t { byte_chunks, complete_block };

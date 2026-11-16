@@ -118,6 +118,7 @@ std::atomic<unsigned> scan_card_t1_wtx_exchange_count{0};
 std::atomic<std::uint64_t> scan_card_t1_cwt_card_transaction{0};
 std::atomic<std::uint64_t> scan_card_t1_cwt_duration_ns{0};
 std::atomic<unsigned> scan_card_t1_cwt_fault{0};
+std::atomic<bool> scan_card_t1_cwt_silence_delivered{false};
 std::atomic<unsigned> scan_card_t1_bwt_mode{0};
 std::atomic<unsigned> scan_card_t1_bwt_timeout_count{0};
 std::atomic<bool> scan_card_t1_bwt_decided{false};
@@ -175,6 +176,8 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
     scan_card_t1_last_outgoing_pcb.store(request[1], std::memory_order_release);
     if (scan_card_t1_bwt_mode.load(std::memory_order_acquire) != 0 &&
         (request[1] & 0xc0) == 0x80) {
+        if (scan_card_t1_cwt_fault.load(std::memory_order_acquire) == 102)
+            scan_card_t1_apdu_drop_r_reply.store(true, std::memory_order_release);
         const auto pcb = scan_card_t1_apdu_response_sequence.load(std::memory_order_acquire)
             ? 0x40 : 0x00;
         scan_card_t1_reply.push_back(static_cast<unsigned char>(pcb));
@@ -297,8 +300,9 @@ void scan_prepare_t1_reply(std::span<const unsigned char> request)
                 scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x33, 0x44, 0x90, 0x00});
             else
                 scan_card_t1_reply.insert(scan_card_t1_reply.end(), {0x11, 0x22, 0x90, 0x00});
-            scan_card_t1_apdu_response_sequence.store(pcb == 0,
-                std::memory_order_release);
+            if (scan_card_t1_cwt_fault.load(std::memory_order_acquire) < 100)
+                scan_card_t1_apdu_response_sequence.store(pcb == 0,
+                    std::memory_order_release);
         } else if (fault >= 30) {
             if (request[1] == 0xe1) {
                 scan_card_t1_apdu_ifs_negotiated.store(true, std::memory_order_release);
@@ -900,7 +904,8 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
             if (apdu_fault == 55 &&
                 scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0x00)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-            if (!bwt_timeout && size >= 2) {
+            if (!bwt_timeout && (size >= 2 ||
+                scan_card_t1_cwt_fault.load(std::memory_order_acquire) >= 100)) {
                 auto &cwt = message->t1_bwt.t1_cwt;
                 cwt.host_transaction_id = scan_card_t1_last_write_transaction.load(
                     std::memory_order_acquire);
@@ -920,6 +925,29 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
                         {1000, 1000});
                 }
                 const auto cwt_fault = scan_card_t1_cwt_fault.load(std::memory_order_acquire);
+                if (cwt_fault >= 100) {
+                    std::lock_guard lock(scan_card_t1_mutex);
+                    cwt.received_octet_count = (std::min)(scan_card_t1_reply_offset,
+                        scan_card_t1_reply.size());
+                    cwt.received_octets.assign(scan_card_t1_reply.begin(),
+                        scan_card_t1_reply.begin() +
+                            static_cast<std::ptrdiff_t>(cwt.received_octet_count));
+                    cwt.adjacent_gap_bounds.assign(cwt.received_octet_count == 0 ? 0 :
+                        cwt.received_octet_count - 1, {1000, 1000});
+                    if (size == 0 && cwt.received_octet_count >= 2) {
+                        const auto cwt_duration = scan_card_t1_cwt_duration_ns.load(
+                            std::memory_order_acquire);
+                        const auto extra_quiet_ns = cwt_fault == 101
+                            ? 1000000 : 100000000;
+                        cwt.silence_observation =
+                            dtv::spi::CardT1CwtSilenceObservation::continuous_no_io;
+                        scan_card_t1_cwt_silence_delivered.store(true,
+                            std::memory_order_release);
+                        cwt.last_character_edge_ns = 1000000000;
+                        cwt.io_silence_observed_through_ns =
+                            cwt.last_character_edge_ns + cwt_duration + extra_quiet_ns;
+                    }
+                }
                 if (cwt_fault >= 91 && cwt_fault <= 99 &&
                     scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) == 0x00 &&
                     cwt.adjacent_gap_bounds.size() > 2) {
@@ -1325,6 +1353,7 @@ dtv_internal_result scan_plan_card_transport(
     transport_plan->bgt.etu_upper_bound_ns =
         scan_card_t1_bgt_etu_upper_bound_ns.load(std::memory_order_acquire);
     transport_plan->bgt.revision = scan_card_t1_bgt_revision.load(std::memory_order_acquire);
+    transport_plan->bgt.evidence_id = 2;
     transport_plan->t1_bwt.card_clock_hz =
         scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 3 ? 4000000000 :
         scan_card_t1_bwt_mode.load(std::memory_order_acquire) == 4 ? 0 :
@@ -1424,7 +1453,14 @@ dtv_internal_result scan_plan_card_transport(
                 scan_card_t1_cwt_card_transaction.store(plan.transaction_id,
                     std::memory_order_release);
             const auto available = scan_card_t1_reply.size() - scan_card_t1_reply_offset;
-            const auto count = (std::min)({available, read->capacity, std::size_t{2}});
+            auto count = (std::min)({available, read->capacity, std::size_t{2}});
+            const auto cwt_fault = scan_card_t1_cwt_fault.load(std::memory_order_acquire);
+            if (cwt_fault >= 100 &&
+                (scan_card_t1_last_outgoing_pcb.load(std::memory_order_acquire) & 0xc0) != 0x80) {
+                const auto partial_remaining = scan_card_t1_reply_offset < 4
+                    ? 4 - scan_card_t1_reply_offset : 0;
+                count = (std::min)(count, partial_remaining);
+            }
             scan_card_t1_pending.assign(
                 scan_card_t1_reply.begin() + static_cast<std::ptrdiff_t>(scan_card_t1_reply_offset),
                 scan_card_t1_reply.begin() + static_cast<std::ptrdiff_t>(scan_card_t1_reply_offset + count));
@@ -1722,6 +1758,7 @@ void set_scan_public_open_case(unsigned value)
     scan_card_t1_cwt_card_transaction.store(0, std::memory_order_release);
     scan_card_t1_cwt_duration_ns.store(0, std::memory_order_release);
     scan_card_t1_cwt_fault.store(0, std::memory_order_release);
+    scan_card_t1_cwt_silence_delivered.store(false, std::memory_order_release);
     scan_card_t1_bwt_mode.store(0, std::memory_order_release);
     scan_card_t1_bwt_timeout_count.store(0, std::memory_order_release);
     scan_card_t1_apdu_pending_ins.store(0, std::memory_order_release);
@@ -1847,7 +1884,14 @@ void set_scan_card_t1_apdu_mode(bool enabled, unsigned fault)
 
 void set_scan_card_t1_cwt_fault(unsigned fault)
 {
+    if (fault >= 100)
+        scan_card_t1_cwt_silence_delivered.store(false, std::memory_order_release);
     scan_card_t1_cwt_fault.store(fault, std::memory_order_release);
+}
+
+bool scan_card_t1_cwt_silence_delivered_value()
+{
+    return scan_card_t1_cwt_silence_delivered.load(std::memory_order_acquire);
 }
 
 void set_scan_card_t1_receive_capacity(bool known, std::size_t complete_block_bytes,

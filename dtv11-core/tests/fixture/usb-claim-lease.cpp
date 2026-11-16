@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <dtv/internal/discovery.hpp>
+#include <dtv/internal/clock.hpp>
 #include <dtv/internal/l3-registry.hpp>
 #include <dtv/spi/device_ops.hpp>
 
@@ -46,6 +47,7 @@ void set_scan_card_t1_crc(bool);
 void set_scan_card_t1_stale_reply(bool);
 void set_scan_card_t1_apdu_mode(bool, unsigned);
 void set_scan_card_t1_cwt_fault(unsigned);
+bool scan_card_t1_cwt_silence_delivered_value();
 void set_scan_card_t1_receive_capacity(bool, std::size_t, std::uint64_t, std::uint64_t);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
@@ -3179,6 +3181,165 @@ int public_card_transport()
             return 264;
         }
     }
+    set_scan_card_t1_crc(false);
+    set_scan_card_t1_bgt(2, 1000000, 200);
+    set_scan_card_t1_bwt_mode(10);
+    if (!reset_t1_session()) return 271;
+    set_scan_card_t1_apdu_mode(true, 50);
+    set_scan_card_t1_cwt_fault(100);
+    const auto partial_cwt_host_i = encode_t1_lrc_frame(0x00, apdu_one);
+    const auto partial_cwt_host_r = encode_t1_lrc_frame(0x82, {});
+    const auto partial_cwt_next_host_i = encode_t1_lrc_frame(0x40, apdu_two);
+    std::vector<unsigned char> partial_cwt_response;
+    std::vector<std::vector<unsigned char>> partial_cwt_output;
+    const std::uint8_t *partial_cwt_response_data = nullptr;
+    std::uint64_t partial_cwt_response_size = 0;
+    const auto partial_cwt_code = run_public_apdu(1, apdu_one,
+        &partial_cwt_response, &partial_cwt_output, 0,
+        &partial_cwt_response_data, &partial_cwt_response_size);
+    if (partial_cwt_code != DTV_ERROR_OK ||
+        partial_cwt_response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        partial_cwt_response_data == nullptr || partial_cwt_response_size != 4 ||
+        !std::equal(partial_cwt_response.begin(), partial_cwt_response.end(),
+            partial_cwt_response_data) ||
+        !same_apdu_frame_sent(1, partial_cwt_output, partial_cwt_host_i, apdu_one, 1) ||
+        !same_r_frame_sent(1, partial_cwt_output, partial_cwt_host_r, 1)) {
+        std::fprintf(stderr, "partial CWT recovery code=%d response=%zu size=%llu output=%zu\n",
+            partial_cwt_code,
+            partial_cwt_response.size(),
+            static_cast<unsigned long long>(partial_cwt_response_size),
+            partial_cwt_output.size());
+        for (const auto &packet : partial_cwt_output) {
+            std::fprintf(stderr, "partial CWT packet:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        return 272;
+    }
+    set_scan_card_t1_cwt_fault(0);
+    set_scan_card_t1_bgt(2, 1000000, 201);
+    std::vector<unsigned char> partial_cwt_next_response;
+    std::vector<std::vector<unsigned char>> partial_cwt_next_output;
+    if (run_public_apdu(1, apdu_two, &partial_cwt_next_response,
+            &partial_cwt_next_output) != DTV_ERROR_OK ||
+        partial_cwt_next_response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+        !same_apdu_frame_sent(1, partial_cwt_next_output, partial_cwt_next_host_i,
+            apdu_two, 1)) return 273;
+
+    set_scan_card_t1_bgt(2, 36000000, 202);
+    set_scan_card_t1_bwt_mode(9);
+    if (!reset_t1_session()) return 281;
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    set_scan_card_t1_apdu_mode(true, 50);
+    set_scan_card_t1_cwt_fault(101);
+    const auto partial_cwt_cancel_start = backend->output_snapshot().size();
+    const auto partial_cwt_cancel_output_start =
+        backend->endpoint_submission_count(0x02) + 1;
+    std::atomic<std::int32_t> partial_cwt_cancel_code{DTV_ERROR_INTERNAL};
+    std::vector<unsigned char> partial_cwt_cancel_response;
+    std::atomic<bool> partial_cwt_cancel_done{false};
+    std::thread partial_cwt_cancel_caller([&] {
+        const std::uint8_t *data = nullptr;
+        std::uint64_t size = 0;
+        dtv_error apdu_error{};
+        apdu_error.struct_size = sizeof(apdu_error);
+        const auto code = dtv_transmit_apdu(root, apdu_one.data(), apdu_one.size(),
+            nullptr, &data, &size, &apdu_error);
+        if (code == DTV_ERROR_OK && data != nullptr)
+            partial_cwt_cancel_response.assign(data, data + size);
+        partial_cwt_cancel_code.store(code, std::memory_order_release);
+        partial_cwt_cancel_done.store(true, std::memory_order_release);
+    });
+    auto partial_cwt_cancel_next_output = partial_cwt_cancel_output_start;
+    bool partial_cwt_cancel_sent = false;
+    for (unsigned step = 0; step < 16 &&
+         !partial_cwt_cancel_done.load(std::memory_order_acquire); ++step) {
+        if (!backend->wait_for_endpoint_submissions(0x02, partial_cwt_cancel_next_output))
+            break;
+        auto cancel_callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x02);
+        if (!backend->wait_for_callbacks(cancel_callbacks + 1)) break;
+        cancel_callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x81);
+        if (!backend->wait_for_callbacks(cancel_callbacks + 1)) break;
+        ++partial_cwt_cancel_next_output;
+        if (backend->output_snapshot().size() >= partial_cwt_cancel_start + 8) {
+            if (dtv_cancel_enclosure(root, &error) == DTV_ERROR_OK)
+                partial_cwt_cancel_sent = true;
+            break;
+        }
+    }
+    partial_cwt_cancel_caller.join();
+    if (!partial_cwt_cancel_sent ||
+        partial_cwt_cancel_code.load(std::memory_order_acquire) != DTV_ERROR_CANCELLED ||
+        !partial_cwt_cancel_response.empty()) {
+        std::fprintf(stderr, "partial CWT cancel sent=%u code=%d response=%zu\n",
+            partial_cwt_cancel_sent ? 1 : 0,
+            partial_cwt_cancel_code.load(std::memory_order_acquire),
+            partial_cwt_cancel_response.size());
+        return 282;
+    }
+    set_scan_card_t1_cwt_fault(0);
+    if (!reset_t1_session()) return 283;
+
+    set_scan_card_t1_apdu_mode(true, 26);
+    set_scan_card_t1_cwt_fault(102);
+    std::vector<unsigned char> partial_cwt_unknown_response;
+    std::vector<std::vector<unsigned char>> partial_cwt_unknown_output;
+    const auto partial_cwt_unknown_code = run_public_apdu(1, apdu_one,
+        &partial_cwt_unknown_response, &partial_cwt_unknown_output, 100);
+    if (partial_cwt_unknown_code != DTV_ERROR_TIMEOUT ||
+        !partial_cwt_unknown_response.empty() ||
+        !same_apdu_frame_sent(1, partial_cwt_unknown_output, partial_cwt_host_i, apdu_one, 1) ||
+        !same_r_frame_sent(1, partial_cwt_unknown_output, partial_cwt_host_r, 1)) {
+        std::fprintf(stderr, "partial CWT unknown R code=%d response=%zu output=%zu\n",
+            partial_cwt_unknown_code, partial_cwt_unknown_response.size(),
+            partial_cwt_unknown_output.size());
+        return 279;
+    }
+    set_scan_card_t1_cwt_fault(0);
+    if (!reset_t1_session()) return 280;
+
+    set_scan_card_t1_bgt(2, 36000000, 202);
+    set_scan_card_t1_bwt_mode(9);
+    if (!reset_t1_session()) return 274;
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    set_scan_card_t1_apdu_mode(true, 50);
+    set_scan_card_t1_cwt_fault(101);
+    const auto below_bgt_host_i = encode_t1_lrc_frame(0x00, apdu_one);
+    const auto below_bgt_host_r = encode_t1_lrc_frame(0x82, {});
+    std::vector<unsigned char> below_bgt_response;
+    std::vector<std::vector<unsigned char>> below_bgt_output;
+    const auto below_bgt_code = run_public_apdu(1, apdu_one, &below_bgt_response,
+        &below_bgt_output, 100);
+    if (below_bgt_code != DTV_ERROR_TIMEOUT || !below_bgt_response.empty() ||
+        !same_apdu_frame_sent(1, below_bgt_output, below_bgt_host_i, apdu_one, 1) ||
+        same_r_frame_sent(1, below_bgt_output, below_bgt_host_r, 1)) {
+        std::fprintf(stderr, "partial CWT below BGT code=%d response=%zu output=%zu I=%d R=%d\n",
+            below_bgt_code, below_bgt_response.size(), below_bgt_output.size(),
+            same_apdu_frame_sent(1, below_bgt_output, below_bgt_host_i, apdu_one, 1),
+            same_r_frame_sent(1, below_bgt_output, below_bgt_host_r, 1));
+        for (const auto &packet : below_bgt_output) {
+            std::fprintf(stderr, "partial CWT below BGT packet:");
+            for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
+        return 275;
+    }
+    set_scan_card_t1_cwt_fault(0);
+    if (!reset_t1_session()) return 276;
+    std::vector<unsigned char> bgt_timeout_warmup_response;
+    std::vector<std::vector<unsigned char>> bgt_timeout_warmup_output;
+    const auto bgt_timeout_warmup_code = run_public_apdu(1, apdu_one,
+        &bgt_timeout_warmup_response, &bgt_timeout_warmup_output);
+    if (bgt_timeout_warmup_code != DTV_ERROR_OK ||
+        bgt_timeout_warmup_response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00}) {
+        std::fprintf(stderr, "BGT timeout warmup code=%d response=%zu output=%zu\n",
+            bgt_timeout_warmup_code, bgt_timeout_warmup_response.size(),
+            bgt_timeout_warmup_output.size());
+        return 277;
+    }
+
     set_scan_card_t1_bgt(2, 100000000, 1000);
     const auto timeout_output_count = backend->output_snapshot().size();
     std::vector<unsigned char> timeout_response;
@@ -3205,7 +3366,8 @@ int public_card_transport()
     if (public_cancel_code != DTV_ERROR_CANCELLED || !cancelled_response.empty() ||
         !cancelled_output.empty() || backend->output_snapshot().size() != cancel_output_count)
         return 268;
-    set_scan_card_t1_bgt(2, 1000000, 18);
+    set_scan_card_t1_bgt(2, 1000000, 1002);
+    set_scan_card_t1_bwt_mode(0);
     set_scan_card_t1_crc(false);
     if (!reset_t1_session()) return 265;
     set_scan_card_t1_apdu_mode(true, 0);
@@ -3307,7 +3469,20 @@ int public_card_transport()
             !wtx_timeout_result.io.reply_complete || !wtx_timeout_result.io.result_known ||
             !same_apdu_frame_sent(mode, wtx_timeout_output, host_i_lrc, apdu_one, 1) ||
             !same_wtx_frame_sent(mode, wtx_timeout_output, host_wtx, 1) ||
-            !same_r_frame_sent(mode, wtx_timeout_output, host_r_zero, 1)) return 227;
+            !same_r_frame_sent(mode, wtx_timeout_output, host_r_zero, 1)) {
+            std::fprintf(stderr, "WTX timeout mode=%u code=%d transport=%d/%u response=%zu tx=%zu rx=%zu known=%u complete=%u output=%zu\n",
+                mode, wtx_timeout_code, wtx_timeout_result.io.transport_error.code,
+                wtx_timeout_result.io.transport_error.detail, wtx_timeout_result.response.size(),
+                wtx_timeout_result.io.tx_bytes_done, wtx_timeout_result.io.rx_bytes_done,
+                wtx_timeout_result.io.result_known, wtx_timeout_result.io.reply_complete,
+                wtx_timeout_output.size());
+            for (const auto &packet : wtx_timeout_output) {
+                std::fprintf(stderr, "WTX timeout packet:");
+                for (const auto byte : packet) std::fprintf(stderr, " %02x", byte);
+                std::fprintf(stderr, "\n");
+            }
+            return 227;
+        }
         if (!reset_t1_session()) return 228;
         set_scan_card_t1_apdu_mode(true, 53);
         dtv::internal::T1ApduResult invalid_wtx_result{};
@@ -5061,6 +5236,200 @@ int public_card_transport()
     return 0;
 }
 
+int public_partial_cwt_close()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    set_scan_public_open_case(18);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 921), snapshot(context, 4, 922)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error error{};
+    error.struct_size = sizeof(error);
+    auto *const *enclosures = dtv_list_enclosures(&error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    std::atomic<std::int32_t> open_result{DTV_ERROR_INTERNAL};
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    std::thread opening([&] {
+        open_result.store(dtv_open_enclosure(root, nullptr, &open_error),
+                          std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x81, 1) ||
+        !backend->wait_for_endpoint_submissions(0x82, 1)) {
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+        opening.join();
+        return 3;
+    }
+    backend->complete_endpoint(0x81);
+    backend->complete_endpoint(0x82);
+    opening.join();
+    if (open_result.load(std::memory_order_acquire) != DTV_ERROR_OK) return 4;
+
+    set_scan_card_t1_crc(false);
+    set_scan_card_t1_exchange_mode(1);
+    set_scan_card_t1_bgt(2, 36000000, 2200);
+    set_scan_card_t1_bwt_mode(9);
+    const auto reset_output = backend->endpoint_submission_count(0x02) + 1;
+    std::atomic<std::int32_t> reset_result{DTV_ERROR_INTERNAL};
+    std::thread resetting([&] {
+        const std::uint8_t *atr = nullptr;
+        std::uint64_t atr_size = 0;
+        dtv_error reset_error{};
+        reset_error.struct_size = sizeof(reset_error);
+        reset_result.store(dtv_reset_card(root, nullptr, &atr, &atr_size, &reset_error),
+                           std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x02, reset_output)) {
+        dtv_cancel_enclosure(root, &error);
+        resetting.join();
+        return 5;
+    }
+    auto callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x02);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        resetting.join();
+        return 6;
+    }
+    callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    if (!backend->wait_for_callbacks(callbacks + 1)) {
+        dtv_cancel_enclosure(root, &error);
+        resetting.join();
+        return 7;
+    }
+    resetting.join();
+    if (reset_result.load(std::memory_order_acquire) != DTV_ERROR_OK) return 8;
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+    struct SystemClockGate {
+        std::atomic<bool> armed{true};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+    } gate;
+    const auto delay_hook = [](void *user) {
+        auto *state = static_cast<SystemClockGate *>(user);
+        if (!scan_card_t1_cwt_silence_delivered_value() ||
+            !state->armed.exchange(false, std::memory_order_acq_rel)) return;
+        state->entered.store(true, std::memory_order_release);
+        while (!state->release.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    };
+    const std::array<unsigned char, 4> command{0x00, 0xa4, 0x04, 0x00};
+    const auto expected_i_header = std::vector<unsigned char>{0x00, 0x00, 0x04};
+    const auto expected_i_data = std::vector<unsigned char>(command.begin(), command.end());
+    std::uint8_t expected_i_lrc = 0;
+    for (const auto byte : expected_i_header) expected_i_lrc ^= byte;
+    for (const auto byte : expected_i_data) expected_i_lrc ^= byte;
+    const auto expected_r_header = std::vector<unsigned char>{0x00, 0x82, 0x00};
+    std::uint8_t expected_r_lrc = 0;
+    for (const auto byte : expected_r_header) expected_r_lrc ^= byte;
+    const auto output_start = backend->output_snapshot().size();
+    const std::uint8_t *response_data = reinterpret_cast<const std::uint8_t *>(
+        std::uintptr_t{1});
+    std::uint64_t response_size = 1;
+    std::atomic<std::int32_t> api_code{DTV_ERROR_INTERNAL};
+    std::atomic<std::int32_t> api_error_code{DTV_ERROR_INTERNAL};
+    std::atomic<bool> done{false};
+    set_scan_card_t1_apdu_mode(true, 50);
+    set_scan_card_t1_cwt_fault(101);
+    dtv::internal::set_system_clock_delay_hook_for_test(delay_hook, &gate);
+    std::thread caller([&] {
+        dtv_error apdu_error{};
+        apdu_error.struct_size = sizeof(apdu_error);
+        api_code.store(dtv_transmit_apdu(root, command.data(), command.size(), nullptr,
+            &response_data, &response_size, &apdu_error), std::memory_order_release);
+        api_error_code.store(apdu_error.code, std::memory_order_release);
+        done.store(true, std::memory_order_release);
+    });
+    auto next_out = backend->endpoint_submission_count(0x02) + 1;
+    for (unsigned step = 0; step < 16 && !done.load(std::memory_order_acquire) &&
+         !scan_card_t1_cwt_silence_delivered_value(); ++step) {
+        if (!backend->wait_for_endpoint_submissions(0x02, next_out)) break;
+        callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x02);
+        if (!backend->wait_for_callbacks(callbacks + 1)) break;
+        callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x81);
+        if (!backend->wait_for_callbacks(callbacks + 1)) break;
+        ++next_out;
+    }
+    const auto gate_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!gate.entered.load(std::memory_order_acquire) &&
+           !done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < gate_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!scan_card_t1_cwt_silence_delivered_value() ||
+        !gate.entered.load(std::memory_order_acquire) || done.load(std::memory_order_acquire)) {
+        gate.release.store(true, std::memory_order_release);
+        dtv::internal::set_system_clock_delay_hook_for_test(nullptr, nullptr);
+        if (!done.load(std::memory_order_acquire)) dtv_cancel_enclosure(root, &error);
+        caller.join();
+        (void)dtv_close_enclosure(root, nullptr, &error);
+        dtv_release_enclosure(root);
+        dtv_drop_enclosure(root);
+        dtv::internal::set_public_discovery_batch_for_test({});
+        set_scan_public_open_case(0);
+        return 9;
+    }
+    const dtv_call_options short_close{sizeof(dtv_call_options), 1};
+    const auto close_state = dtv_close_enclosure(root, &short_close, &error);
+    gate.release.store(true, std::memory_order_release);
+    const auto caller_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < caller_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    caller.join();
+    dtv::internal::set_system_clock_delay_hook_for_test(nullptr, nullptr);
+    set_scan_card_t1_cwt_fault(0);
+    const auto all_output = backend->output_snapshot();
+    std::vector<std::vector<unsigned char>> output(
+        all_output.begin() + static_cast<std::ptrdiff_t>(output_start), all_output.end());
+    std::size_t command_count = 0;
+    for (std::size_t index = 0; index + 2 < output.size(); ++index) {
+        if (output[index] == expected_i_header && output[index + 1] == expected_i_data &&
+            output[index + 2] == std::vector<unsigned char>{expected_i_lrc})
+            ++command_count;
+    }
+    std::size_t r_frame_count = 0;
+    for (std::size_t index = 0; index + 1 < output.size(); ++index) {
+        if (output[index] == expected_r_header && output[index + 1] ==
+            std::vector<unsigned char>{expected_r_lrc}) ++r_frame_count;
+    }
+    const auto final_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto final_state = dtv_get_enclosure_close_state(root, &error);
+    while (final_state == DTV_CLOSE_PENDING &&
+           std::chrono::steady_clock::now() < final_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        final_state = dtv_get_enclosure_close_state(root, &error);
+    }
+    const bool passed = close_state == DTV_CLOSE_PENDING &&
+        api_code.load(std::memory_order_acquire) == DTV_ERROR_CANCELLED &&
+        api_error_code.load(std::memory_order_acquire) == DTV_ERROR_CANCELLED &&
+        response_data == nullptr && response_size == 0 && command_count == 1 &&
+        r_frame_count == 0 && final_state == DTV_CLOSE_CLOSED;
+    std::fprintf(stderr,
+        "cwt-close-gated evidence=%d close=%d api=%d error=%d ptr_null=%d size=%llu outputs=%zu I_frames=%zu R_frames=%zu final=%d\n",
+        scan_card_t1_cwt_silence_delivered_value() ? 1 : 0,
+        static_cast<int>(close_state), api_code.load(), api_error_code.load(),
+        response_data == nullptr ? 1 : 0,
+        static_cast<unsigned long long>(response_size), output.size(), command_count,
+        r_frame_count, static_cast<int>(final_state));
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    dtv::internal::set_public_discovery_batch_for_test({});
+    set_scan_public_open_case(0);
+    return passed ? 0 : 10;
+}
+
 int public_open_operation_admission()
 {
     auto backend = std::make_shared<FakeBackend>();
@@ -5783,6 +6152,10 @@ int main()
     if (const int result = public_card_transport(); result != 0) {
         std::fprintf(stderr, "public_card_transport failed: %d\n", result);
         return 160 + result;
+    }
+    if (const int result = public_partial_cwt_close(); result != 0) {
+        std::fprintf(stderr, "public_partial_cwt_close failed: %d\n", result);
+        return 170 + result;
     }
     if (const int result = registry_plan_and_success(); result != 0) {
         std::fprintf(stderr, "registry_plan_and_success failed: %d\n", result);
