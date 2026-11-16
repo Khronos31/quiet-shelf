@@ -2714,6 +2714,14 @@ int public_card_transport()
         std::atomic<std::uint64_t> revision_shrink_revision{14};
         std::atomic<dtv_enclosure *> cancel_root{nullptr};
         std::atomic<bool> cancel_on_delay{false};
+        std::atomic<std::uint64_t> cancel_delay_calls{0};
+        std::atomic<std::uint64_t> cancel_delay_calls_at_arm{0};
+        std::atomic<std::uint64_t> cancel_arm_monotonic_ns{0};
+        std::atomic<std::uint64_t> cancel_arm_synthetic_ns{0};
+        std::atomic<std::uint64_t> cancel_trigger_monotonic_ns{0};
+        std::atomic<std::uint64_t> cancel_trigger_synthetic_ns{0};
+        std::atomic<std::uint64_t> cancel_trigger_attempts{0};
+        std::atomic<std::int32_t> cancel_trigger_result{DTV_ERROR_INTERNAL};
     } synthetic_bgt_clock;
     synthetic_bgt_clock.now_ns.store(static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2726,11 +2734,20 @@ int public_card_transport()
     const auto synthetic_delay = [](void *user, std::uint64_t wake_at, std::uint64_t deadline,
                                     const dtv_cancel *, std::uint32_t *cancelled) {
         auto *clock = static_cast<SyntheticBgtClock *>(user);
+        clock->cancel_delay_calls.fetch_add(1, std::memory_order_acq_rel);
         if (clock->cancel_on_delay && clock->cancel_root != nullptr) {
             clock->cancel_on_delay = false;
+            clock->cancel_trigger_attempts.fetch_add(1, std::memory_order_acq_rel);
+            clock->cancel_trigger_monotonic_ns.store(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()),
+                std::memory_order_release);
+            clock->cancel_trigger_synthetic_ns.store(
+                clock->now_ns.load(std::memory_order_acquire), std::memory_order_release);
             dtv_error error{};
             error.struct_size = sizeof(error);
-            (void)dtv_cancel_enclosure(clock->cancel_root, &error);
+            clock->cancel_trigger_result.store(dtv_cancel_enclosure(clock->cancel_root, &error),
+                std::memory_order_release);
         }
         const auto now = clock->now_ns.load(std::memory_order_acquire);
         if (deadline != UINT64_MAX && wake_at > deadline)
@@ -2773,20 +2790,33 @@ int public_card_transport()
     std::array<dtv::internal::T1BlockResult, 2> t1_results{};
     const auto run_t1_exchange = [&](unsigned mode, dtv::internal::T1BlockResult *block_result,
                                      std::uint32_t timeout_ms = 1000,
-                                     std::vector<std::vector<unsigned char>> *sent = nullptr) {
+                                     std::vector<std::vector<unsigned char>> *sent = nullptr,
+                                     std::uint64_t *caller_started_ns = nullptr,
+                                     std::uint64_t *caller_finished_ns = nullptr,
+                                     std::vector<std::uint64_t> *output_submit_ns = nullptr) {
         set_scan_card_t1_exchange_mode(mode);
         const auto output_start = backend->output_snapshot().size();
         std::atomic<bool> done{false};
         dtv_internal_result exchange_result{};
         std::thread caller([&] {
+            if (caller_started_ns != nullptr) *caller_started_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
             exchange_result = dtv::internal::exchange_public_t1_block(root,
                 dtv::internal::T1BlockRequest{0x00, 0x00, t1_inf}, dtv_timeout{timeout_ms, 0},
                 block_result);
+            if (caller_finished_ns != nullptr) *caller_finished_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
             done.store(true, std::memory_order_release);
         });
         auto next_output = backend->endpoint_submission_count(0x02) + 1;
         for (unsigned step = 0; step < 16 && !done.load(std::memory_order_acquire); ++step) {
             if (!backend->wait_for_endpoint_submissions(0x02, next_output)) break;
+            if (output_submit_ns != nullptr)
+                output_submit_ns->push_back(static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count()));
             callbacks = backend->callback_count_snapshot();
             backend->complete_endpoint(0x02);
             if (!backend->wait_for_callbacks(callbacks + 1)) break;
@@ -2856,14 +2886,23 @@ int public_card_transport()
             if (!backend->wait_for_callbacks(callbacks + 1)) break;
             backend->actual_length_limit = (std::numeric_limits<std::size_t>::max)();
             callbacks = backend->callback_count_snapshot();
+            if (cancel_after_input_count != 0 && step + 1 == cancel_after_input_count) {
+                synthetic_bgt_clock.cancel_root = root;
+                synthetic_bgt_clock.cancel_arm_monotonic_ns.store(static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count()),
+                    std::memory_order_release);
+                synthetic_bgt_clock.cancel_arm_synthetic_ns.store(
+                    synthetic_now(&synthetic_bgt_clock), std::memory_order_release);
+                synthetic_bgt_clock.cancel_delay_calls_at_arm.store(
+                    synthetic_bgt_clock.cancel_delay_calls.load(std::memory_order_acquire),
+                    std::memory_order_release);
+                synthetic_bgt_clock.cancel_on_delay = true;
+            }
             backend->complete_endpoint(0x81);
             if (!backend->wait_for_callbacks(callbacks + 1)) break;
             if (input_complete_times != nullptr)
                 input_complete_times->push_back(synthetic_now(&synthetic_bgt_clock));
-            if (cancel_after_input_count != 0 && step + 1 == cancel_after_input_count) {
-                synthetic_bgt_clock.cancel_root = root;
-                synthetic_bgt_clock.cancel_on_delay = true;
-            }
             ++next_output;
         }
         caller.join();
@@ -4232,16 +4271,81 @@ int public_card_transport()
     set_scan_card_t1_apdu_mode(true, 30);
     dtv::internal::T1ApduResult cancelled_ifs_result{};
     std::vector<std::vector<unsigned char>> cancelled_ifs_output;
+    synthetic_bgt_clock.cancel_delay_calls.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_delay_calls_at_arm.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_arm_monotonic_ns.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_arm_synthetic_ns.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_trigger_monotonic_ns.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_trigger_synthetic_ns.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_trigger_attempts.store(0, std::memory_order_release);
+    synthetic_bgt_clock.cancel_trigger_result.store(DTV_ERROR_INTERNAL, std::memory_order_release);
+    const auto cancelled_ifs_started = std::chrono::steady_clock::now();
     const auto cancelled_ifs_code = run_t1_apdu(2, apdu_one, &cancelled_ifs_result,
         &cancelled_ifs_output, 1000, nullptr, nullptr, 0, 1);
+    const auto cancelled_ifs_finished = std::chrono::steady_clock::now();
+    const auto cancelled_ifs_cancel_pending = synthetic_bgt_clock.cancel_on_delay.load(
+        std::memory_order_acquire);
+    std::fprintf(stderr,
+        "IFS cancel observed code=%d expected=%d tx=%llu rx=%llu response=%zu known=%u complete=%u transport=%d out=%zu delays=%llu delays_at_arm=%llu cancel_pending=%u cancel_armed=%u arm_ns=%llu trigger_attempts=%llu cancel_result=%d trigger_ns=%llu elapsed_ns=%llu synthetic_arm=%llu synthetic_trigger=%llu\n",
+        cancelled_ifs_code, DTV_INTERNAL_RESULT_CANCELLED,
+        static_cast<unsigned long long>(cancelled_ifs_result.io.tx_bytes_done),
+        static_cast<unsigned long long>(cancelled_ifs_result.io.rx_bytes_done),
+        cancelled_ifs_result.response.size(), cancelled_ifs_result.io.result_known,
+        cancelled_ifs_result.io.reply_complete,
+        cancelled_ifs_result.io.transport_error.code, cancelled_ifs_output.size(),
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_delay_calls.load(
+            std::memory_order_acquire)),
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_delay_calls_at_arm.load(
+            std::memory_order_acquire)), cancelled_ifs_cancel_pending,
+        synthetic_bgt_clock.cancel_arm_monotonic_ns.load(std::memory_order_acquire) != 0,
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_arm_monotonic_ns.load(
+            std::memory_order_acquire)),
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_trigger_attempts.load(
+            std::memory_order_acquire)),
+        synthetic_bgt_clock.cancel_trigger_result.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_trigger_monotonic_ns.load(
+            std::memory_order_acquire)),
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            cancelled_ifs_finished - cancelled_ifs_started).count()),
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_arm_synthetic_ns.load(
+            std::memory_order_acquire)),
+        static_cast<unsigned long long>(synthetic_bgt_clock.cancel_trigger_synthetic_ns.load(
+            std::memory_order_acquire)));
     synthetic_bgt_clock.cancel_root = nullptr;
     synthetic_bgt_clock.cancel_on_delay = false;
     if (cancelled_ifs_code != DTV_INTERNAL_RESULT_CANCELLED) {
-        std::fprintf(stderr, "IFS cancel code=%d tx=%llu rx=%llu out=%zu\n",
+        std::fprintf(stderr,
+            "IFS cancel triage code=%d expected=%d tx=%llu rx=%llu response=%zu known=%u complete=%u transport=%d out=%zu delays=%llu cancel_armed=%u arm_ns=%llu trigger_attempts=%llu cancel_result=%d trigger_ns=%llu elapsed_ns=%llu synthetic_arm=%llu synthetic_trigger=%llu\n",
             cancelled_ifs_code,
+            DTV_INTERNAL_RESULT_CANCELLED,
             static_cast<unsigned long long>(cancelled_ifs_result.io.tx_bytes_done),
             static_cast<unsigned long long>(cancelled_ifs_result.io.rx_bytes_done),
-            cancelled_ifs_output.size());
+            cancelled_ifs_result.response.size(), cancelled_ifs_result.io.result_known,
+            cancelled_ifs_result.io.reply_complete,
+            cancelled_ifs_result.io.transport_error.code, cancelled_ifs_output.size(),
+            static_cast<unsigned long long>(synthetic_bgt_clock.cancel_delay_calls.load(
+                std::memory_order_acquire)),
+            synthetic_bgt_clock.cancel_arm_monotonic_ns.load(std::memory_order_acquire) != 0,
+            static_cast<unsigned long long>(synthetic_bgt_clock.cancel_arm_monotonic_ns.load(
+                std::memory_order_acquire)),
+            static_cast<unsigned long long>(synthetic_bgt_clock.cancel_trigger_attempts.load(
+                std::memory_order_acquire)),
+            synthetic_bgt_clock.cancel_trigger_result.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(synthetic_bgt_clock.cancel_trigger_monotonic_ns.load(
+                std::memory_order_acquire)),
+            static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cancelled_ifs_finished - cancelled_ifs_started).count()),
+            static_cast<unsigned long long>(synthetic_bgt_clock.cancel_arm_synthetic_ns.load(
+                std::memory_order_acquire)),
+            static_cast<unsigned long long>(synthetic_bgt_clock.cancel_trigger_synthetic_ns.load(
+                std::memory_order_acquire)));
+        for (std::size_t index = 0; index < cancelled_ifs_output.size(); ++index) {
+            std::fprintf(stderr, "IFS cancel OUT[%zu] len=%zu:", index,
+                cancelled_ifs_output[index].size());
+            for (const auto byte : cancelled_ifs_output[index])
+                std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
         return 160 + cancelled_ifs_code;
     }
     if (
@@ -4797,10 +4901,60 @@ int public_card_transport()
     set_scan_card_transport_drop_reply(true);
     const auto t1_timeout_outputs = backend->endpoint_submission_count(0x02);
     dtv::internal::T1BlockResult timed_out_t1{};
-    if (run_t1_exchange(1, &timed_out_t1, 100) != DTV_INTERNAL_RESULT_TIMEOUT ||
+    std::vector<std::vector<unsigned char>> timed_out_t1_output;
+    std::vector<std::uint64_t> timed_out_t1_output_submit_ns;
+    std::uint64_t timed_out_t1_caller_started_ns = 0;
+    std::uint64_t timed_out_t1_caller_finished_ns = 0;
+    const auto timed_out_t1_started = std::chrono::steady_clock::now();
+    const auto timed_out_t1_code = run_t1_exchange(1, &timed_out_t1, 200,
+        &timed_out_t1_output, &timed_out_t1_caller_started_ns,
+        &timed_out_t1_caller_finished_ns, &timed_out_t1_output_submit_ns);
+    const auto timed_out_t1_finished = std::chrono::steady_clock::now();
+    const auto timed_out_t1_output_delta =
+        backend->endpoint_submission_count(0x02) - t1_timeout_outputs;
+    std::fprintf(stderr,
+        "common deadline observed code=%d expected=%d tx=%llu rx=%llu known=%u complete=%u transport=%d out_delta=%llu caller_elapsed_ns=%llu driver_elapsed_ns=%llu budget_ms=200 packets=%zu\n",
+        timed_out_t1_code, DTV_INTERNAL_RESULT_TIMEOUT,
+        static_cast<unsigned long long>(timed_out_t1.io.tx_bytes_done),
+        static_cast<unsigned long long>(timed_out_t1.io.rx_bytes_done),
+        timed_out_t1.io.result_known, timed_out_t1.io.reply_complete,
+        timed_out_t1.io.transport_error.code,
+        static_cast<unsigned long long>(timed_out_t1_output_delta),
+        static_cast<unsigned long long>(timed_out_t1_caller_finished_ns -
+            timed_out_t1_caller_started_ns),
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            timed_out_t1_finished - timed_out_t1_started).count()),
+        timed_out_t1_output.size());
+    std::fprintf(stderr, "common deadline OUT offsets_us=");
+    for (const auto submitted_ns : timed_out_t1_output_submit_ns)
+        std::fprintf(stderr, " %lld",
+            static_cast<long long>(submitted_ns - timed_out_t1_caller_started_ns) / 1000);
+    std::fprintf(stderr, "\n");
+    if (timed_out_t1_code != DTV_INTERNAL_RESULT_TIMEOUT ||
         timed_out_t1.io.reply_complete || timed_out_t1.io.result_known ||
-        backend->endpoint_submission_count(0x02) != t1_timeout_outputs + 4)
+        timed_out_t1_output_delta != 4) {
+        std::fprintf(stderr,
+            "common deadline triage code=%d expected=%d tx=%llu rx=%llu known=%u complete=%u transport=%d out_delta=%llu caller_elapsed_ns=%llu driver_elapsed_ns=%llu budget_ms=200 packets=%zu\n",
+            timed_out_t1_code, DTV_INTERNAL_RESULT_TIMEOUT,
+            static_cast<unsigned long long>(timed_out_t1.io.tx_bytes_done),
+            static_cast<unsigned long long>(timed_out_t1.io.rx_bytes_done),
+            timed_out_t1.io.result_known, timed_out_t1.io.reply_complete,
+            timed_out_t1.io.transport_error.code,
+            static_cast<unsigned long long>(timed_out_t1_output_delta),
+            static_cast<unsigned long long>(timed_out_t1_caller_finished_ns -
+                timed_out_t1_caller_started_ns),
+            static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                timed_out_t1_finished - timed_out_t1_started).count()),
+            timed_out_t1_output.size());
+        for (std::size_t index = 0; index < timed_out_t1_output.size(); ++index) {
+            std::fprintf(stderr, "common deadline OUT[%zu] len=%zu:", index,
+                timed_out_t1_output[index].size());
+            for (const auto byte : timed_out_t1_output[index])
+                std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
         return 27;
+    }
     set_scan_card_transport_drop_reply(false);
     set_scan_card_t1_exchange_mode(0);
     set_scan_card_t1_crc(true);
