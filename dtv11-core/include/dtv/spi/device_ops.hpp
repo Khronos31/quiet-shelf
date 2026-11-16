@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 #include <variant>
+#include <vector>
 
 #include <dtv/cli.h>
 #include <dtv/dtv.h>
@@ -103,6 +104,25 @@ enum class PublicOpenNotificationKind { none, card_state, receiver_lock };
 
 enum class CardT1BwtObservation : std::uint32_t { unavailable, first_character, absence_confirmed };
 
+struct CardT1CwtGapBounds {
+    std::uint64_t lower_ns = 0;
+    std::uint64_t upper_ns = 0;
+};
+
+struct CardT1CwtEvidence {
+    std::uint64_t host_transaction_id = 0;
+    std::uint64_t card_transaction_id = 0;
+    std::uint64_t clock_domain = 0;
+    std::uint64_t error_bound_ns = 0;
+    bool error_bound_known = false;
+    std::uint64_t evidence_id = 0;
+    std::uint64_t revision = 0;
+    std::uint64_t connection_epoch = 0;
+    std::uint64_t request_epoch = 0;
+    std::size_t received_octet_count = 0;
+    std::vector<CardT1CwtGapBounds> adjacent_gap_bounds;
+};
+
 struct CardT1BwtEvidence {
     CardT1BwtObservation observation = CardT1BwtObservation::unavailable;
     std::uint64_t host_transaction_id = 0;
@@ -117,6 +137,7 @@ struct CardT1BwtEvidence {
     std::uint64_t revision = 0;
     std::uint64_t connection_epoch = 0;
     std::uint64_t request_epoch = 0;
+    CardT1CwtEvidence t1_cwt;
 };
 
 struct PublicOpenMessage {
@@ -215,6 +236,7 @@ struct CardTransportContext {
     bool t1_crc = false;
     std::uint8_t t1_ifsc = 32;
     std::uint8_t t1_ifsd = 32;
+    std::uint8_t t1_cwi = 13;
     std::uint16_t t1_bwi = 4;
     std::uint16_t t1_f = 372;
     std::uint16_t t1_d = 1;

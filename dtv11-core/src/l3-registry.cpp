@@ -46,6 +46,7 @@ struct CardAtrT1Parameters {
     std::uint8_t ifsc = 32;
     std::uint8_t ifsd = 32;
     std::uint16_t bwi = 4;
+    std::uint8_t cwi = 13;
     std::uint16_t f = 372;
     std::uint16_t d = 1;
 };
@@ -1100,6 +1101,7 @@ dtv_internal_result EnclosureRegistry::card_transport_context(
     context->t1_crc = parameters.crc;
     context->t1_ifsc = root->card_t1_ifsc;
     context->t1_ifsd = root->card_t1_ifsd;
+    context->t1_cwi = parameters.cwi;
     context->t1_bwi = parameters.bwi;
     context->t1_f = parameters.f;
     context->t1_d = parameters.d;
@@ -4314,6 +4316,7 @@ std::size_t t1_edc_size(bool crc)
 }
 
 enum class T1BwtResult { unavailable, timely, timeout, uncertain };
+enum class T1CwtResult { unavailable, timely, exceeded, uncertain };
 
 bool same_t1_bwt_capability(const dtv::spi::CardT1BwtCapability &left,
                             const dtv::spi::CardT1BwtCapability &right)
@@ -4391,6 +4394,76 @@ T1BwtResult classify_t1_bwt(const dtv::spi::CardTransportContext &context,
         return lower > *duration_ns ? T1BwtResult::timeout : T1BwtResult::uncertain;
     }
     return T1BwtResult::unavailable;
+}
+
+bool t1_cwt_duration_ns(const dtv::spi::CardTransportContext &context,
+                        const dtv::spi::CardT1BwtCapability &capability,
+                        std::uint64_t *duration_ns)
+{
+    if (duration_ns == nullptr || context.t1_cwi > 15 || context.t1_f == 0 ||
+        context.t1_d == 0 || capability.card_clock_hz == 0) return false;
+    const auto factor = std::uint64_t{11} + (std::uint64_t{1} << context.t1_cwi);
+    if (factor > (std::numeric_limits<std::uint64_t>::max)() / context.t1_f)
+        return false;
+    const auto numerator = factor * context.t1_f;
+    if (numerator > (std::numeric_limits<std::uint64_t>::max)() / 1000000000)
+        return false;
+    const auto scaled = numerator * 1000000000;
+    if (context.t1_d > (std::numeric_limits<std::uint64_t>::max)() /
+            capability.card_clock_hz) return false;
+    const auto denominator = static_cast<std::uint64_t>(context.t1_d) *
+        capability.card_clock_hz;
+    *duration_ns = scaled / denominator + (scaled % denominator != 0 ? 1 : 0);
+    return *duration_ns != 0;
+}
+
+T1CwtResult classify_t1_cwt(const dtv::spi::CardTransportContext &context,
+    const dtv::spi::CardT1BwtCapability &capability,
+    const dtv::spi::CardT1BwtEvidence &bwt_evidence,
+    const dtv::spi::CardT1CwtEvidence &evidence,
+    std::uint64_t host_transaction_id, std::uint64_t card_transaction_id,
+    std::size_t received_octet_count, std::uint64_t *duration_ns)
+{
+    if (capability.card_clock_hz == 0 || capability.clock_domain == 0 ||
+        !capability.error_bound_known || capability.revision == 0 ||
+        capability.evidence_id == 0 || !bwt_evidence.error_bound_known ||
+        bwt_evidence.clock_domain != capability.clock_domain ||
+        bwt_evidence.evidence_id != capability.evidence_id ||
+        bwt_evidence.revision != capability.revision ||
+        bwt_evidence.connection_epoch != context.connection_epoch ||
+        bwt_evidence.request_epoch != context.request_epoch ||
+        bwt_evidence.host_transaction_id != host_transaction_id ||
+        bwt_evidence.card_transaction_id != card_transaction_id ||
+        !evidence.error_bound_known || evidence.clock_domain != capability.clock_domain ||
+        evidence.error_bound_ns != bwt_evidence.error_bound_ns ||
+        evidence.evidence_id != bwt_evidence.evidence_id ||
+        evidence.revision != bwt_evidence.revision ||
+        evidence.connection_epoch != context.connection_epoch ||
+        evidence.request_epoch != context.request_epoch ||
+        evidence.host_transaction_id != host_transaction_id ||
+        evidence.card_transaction_id != card_transaction_id ||
+        evidence.received_octet_count != received_octet_count || received_octet_count < 2 ||
+        evidence.adjacent_gap_bounds.size() != received_octet_count - 1 ||
+        !t1_cwt_duration_ns(context, capability, duration_ns))
+        return T1CwtResult::unavailable;
+    if (evidence.error_bound_ns > (std::numeric_limits<std::uint64_t>::max)() -
+            capability.error_bound_ns)
+        return T1CwtResult::uncertain;
+    const auto error_bound = capability.error_bound_ns + evidence.error_bound_ns;
+    bool uncertain = false;
+    for (const auto &gap : evidence.adjacent_gap_bounds) {
+        if (gap.lower_ns > gap.upper_ns || gap.upper_ns == 0)
+            return T1CwtResult::unavailable;
+        if (gap.upper_ns > (std::numeric_limits<std::uint64_t>::max)() - error_bound) {
+            uncertain = true;
+            continue;
+        }
+        if (gap.upper_ns + error_bound <= *duration_ns) continue;
+        const auto lower = gap.lower_ns > error_bound ? gap.lower_ns - error_bound : 0;
+        if (lower > *duration_ns) return T1CwtResult::exceeded;
+        uncertain = true;
+    }
+    return uncertain ? T1CwtResult::uncertain : T1CwtResult::timely;
 }
 
 void append_t1_edc(std::vector<unsigned char> &block, bool crc)
@@ -4800,6 +4873,12 @@ dtv_internal_result exchange_public_t1_block(
         if (!valid_t1_block(response, context.t1_crc, true) || response[0] != request.nad ||
             response[2] > context.t1_ifsd)
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
+        std::uint64_t cwt_duration_ns = 0;
+        if (classify_t1_cwt(context, selection.t1_bwt, aggregate.t1_bwt,
+                aggregate.t1_bwt.t1_cwt, aggregate.operation_transaction_id,
+                aggregate.response_transaction_id, response.size(), &cwt_duration_ns) !=
+            T1CwtResult::timely)
+            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
     } else {
         bool before_send_pending = true;
         const auto write_part = [&](std::span<const unsigned char> bytes) {
@@ -4854,6 +4933,8 @@ dtv_internal_result exchange_public_t1_block(
                            step.operation_transaction_id != 0) {
                     aggregate.response_transaction_id = step.operation_transaction_id;
                 }
+                if (step.t1_bwt.t1_cwt.received_octet_count != 0)
+                    aggregate.t1_bwt.t1_cwt = step.t1_bwt.t1_cwt;
                 aggregate.rx_bytes_done += step_result.code == DTV_INTERNAL_RESULT_OK
                     ? part.size() : step.rx_bytes_done;
                 if (step_result.code != DTV_INTERNAL_RESULT_OK) {
@@ -4904,6 +4985,12 @@ dtv_internal_result exchange_public_t1_block(
             aggregate.rx_bytes_done += extra.size();
             return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0));
         }
+        std::uint64_t cwt_duration_ns = 0;
+        if (classify_t1_cwt(context, selection.t1_bwt, aggregate.t1_bwt,
+                aggregate.t1_bwt.t1_cwt, aggregate.operation_transaction_id,
+                aggregate.response_transaction_id, response.size(), &cwt_duration_ns) !=
+            T1CwtResult::timely)
+            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
         aggregate.reply_complete = true;
         aggregate.result_known = true;
         aggregate.transport_error = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
@@ -6026,7 +6113,8 @@ CardAtrT1Parameters card_atr_t1_parameters(std::span<const std::uint8_t> atr)
     }
     if (parameters.selected && has_tb_t1) {
         parameters.bwi = static_cast<std::uint16_t>(tb_t1 >> 4);
-        if (parameters.bwi > 9) parameters.selected = false;
+        parameters.cwi = tb_t1 & 0x0f;
+        if (parameters.bwi > 9 || parameters.cwi > 15) parameters.selected = false;
     }
     if (parameters.selected && has_ta_t1) {
         if (ta_t1 == 0 || ta_t1 == 0xff) parameters.selected = false;

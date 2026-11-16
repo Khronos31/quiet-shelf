@@ -45,6 +45,7 @@ void set_scan_card_t1_fault(unsigned);
 void set_scan_card_t1_crc(bool);
 void set_scan_card_t1_stale_reply(bool);
 void set_scan_card_t1_apdu_mode(bool, unsigned);
+void set_scan_card_t1_cwt_fault(unsigned);
 void set_scan_card_t1_receive_capacity(bool, std::size_t, std::uint64_t, std::uint64_t);
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
@@ -3254,6 +3255,162 @@ int public_card_transport()
         return 247;
     }
     set_scan_card_t1_bwt_mode(0);
+    for (const auto mode : {1u, 2u}) {
+        set_scan_card_t1_crc(mode == 2);
+        set_scan_card_t1_bwt_mode(mode == 2 ? 9 : 0);
+        set_scan_card_t1_cwt_fault(0);
+        if (!reset_t1_session()) return 248;
+        set_scan_card_t1_apdu_mode(true, 50);
+        const auto cwt_host_i = mode == 1 ? encode_t1_lrc_frame(0x00, apdu_one)
+                                          : encode_t1_crc_frame(0x00, apdu_one);
+        const std::array<unsigned char, 4> cwt_response{0x11, 0x22, 0x90, 0x00};
+        const auto cwt_response_frame = mode == 1
+            ? encode_t1_lrc_frame(0x00, cwt_response)
+            : encode_t1_crc_frame(0x00, cwt_response);
+        dtv::internal::T1ApduResult cwt_timely_result{};
+        std::vector<std::vector<unsigned char>> cwt_timely_output;
+        const auto cwt_timely_code = run_t1_apdu(mode, apdu_one, &cwt_timely_result,
+            &cwt_timely_output);
+        if (cwt_timely_code != DTV_INTERNAL_RESULT_OK ||
+            cwt_timely_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            cwt_timely_result.io.tx_bytes_done != cwt_host_i.size() ||
+            cwt_timely_result.io.rx_bytes_done != cwt_response_frame.size() ||
+            !cwt_timely_result.io.result_known || !cwt_timely_result.io.reply_complete ||
+            !same_apdu_frame_sent(mode, cwt_timely_output, cwt_host_i, apdu_one, 1)) {
+            std::fprintf(stderr, "CWT timely mode=%u code=%d transport=%d tx=%zu/%zu rx=%zu/%zu known=%u complete=%u output=%zu response=%zu\n",
+                mode, cwt_timely_code, cwt_timely_result.io.transport_error.code,
+                cwt_timely_result.io.tx_bytes_done, cwt_host_i.size(),
+                cwt_timely_result.io.rx_bytes_done, cwt_response_frame.size(),
+                cwt_timely_result.io.result_known, cwt_timely_result.io.reply_complete,
+                cwt_timely_output.size(), cwt_timely_result.response.size());
+            return 249;
+        }
+        set_scan_card_t1_cwt_fault(0);
+        set_scan_card_t1_apdu_mode(true, 50);
+        dtv::internal::T1ApduResult cwt_next_result{};
+        if (run_t1_apdu(mode, apdu_two, &cwt_next_result) != DTV_INTERNAL_RESULT_OK ||
+            cwt_next_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+            !cwt_next_result.io.result_known || !cwt_next_result.io.reply_complete)
+            return 250;
+        set_scan_card_t1_bwt_mode(0);
+    }
+    set_scan_card_t1_crc(true);
+    set_scan_card_t1_bwt_mode(9);
+    if (!reset_t1_session()) return 257;
+    set_scan_card_t1_apdu_mode(true, 0);
+    set_scan_card_t1_cwt_fault(97);
+    const auto cwt_cwi0_host_i = encode_t1_crc_frame(0x00, apdu_one);
+    const std::array<unsigned char, 4> cwt_cwi0_response{0x11, 0x22, 0x90, 0x00};
+    const auto cwt_cwi0_card_i = encode_t1_crc_frame(0x00, cwt_cwi0_response);
+    dtv::internal::T1ApduResult cwt_cwi0_result{};
+    std::vector<std::vector<unsigned char>> cwt_cwi0_output;
+    if (run_t1_apdu(2, apdu_one, &cwt_cwi0_result, &cwt_cwi0_output) !=
+            DTV_INTERNAL_RESULT_UNSUPPORTED || !cwt_cwi0_result.response.empty() ||
+        cwt_cwi0_result.io.result_known || cwt_cwi0_result.io.reply_complete ||
+        cwt_cwi0_result.io.tx_bytes_done != cwt_cwi0_host_i.size() ||
+        cwt_cwi0_result.io.rx_bytes_done != cwt_cwi0_card_i.size() ||
+        !same_apdu_frame_sent(2, cwt_cwi0_output, cwt_cwi0_host_i, apdu_one, 1))
+        return 258;
+    set_scan_card_t1_cwt_fault(0);
+    set_scan_card_t1_bwt_mode(0);
+    for (const auto &[bwt_mode, fault] : {std::pair{10u, 98u}, std::pair{11u, 99u}}) {
+        set_scan_card_t1_crc(true);
+        set_scan_card_t1_bwt_mode(bwt_mode);
+        if (!reset_t1_session()) return 259;
+        set_scan_card_t1_apdu_mode(true, 50);
+        set_scan_card_t1_cwt_fault(fault);
+        const auto cwt_host_i = encode_t1_crc_frame(0x00, apdu_one);
+        const std::array<unsigned char, 4> cwt_response{0x11, 0x22, 0x90, 0x00};
+        const auto cwt_card_i = encode_t1_crc_frame(0x00, cwt_response);
+        dtv::internal::T1ApduResult cwt_result{};
+        std::vector<std::vector<unsigned char>> cwt_output;
+        if (run_t1_apdu(2, apdu_one, &cwt_result, &cwt_output) != DTV_INTERNAL_RESULT_OK ||
+            cwt_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+            cwt_result.io.tx_bytes_done != cwt_host_i.size() ||
+            cwt_result.io.rx_bytes_done != cwt_card_i.size() ||
+            !cwt_result.io.result_known || !cwt_result.io.reply_complete ||
+            !same_apdu_frame_sent(2, cwt_output, cwt_host_i, apdu_one, 1)) {
+            std::fprintf(stderr, "CWT CWI14/15 mode=%u fault=%u code=%d tx=%zu/%zu rx=%zu/%zu known=%u complete=%u\n",
+                bwt_mode, fault, cwt_result.io.transport_error.code,
+                cwt_result.io.tx_bytes_done, cwt_host_i.size(),
+                cwt_result.io.rx_bytes_done, cwt_card_i.size(),
+                cwt_result.io.result_known, cwt_result.io.reply_complete);
+            return 260;
+        }
+        set_scan_card_t1_cwt_fault(0);
+        dtv::internal::T1ApduResult cwt_next_result{};
+        if (run_t1_apdu(2, apdu_two, &cwt_next_result) != DTV_INTERNAL_RESULT_OK ||
+            cwt_next_result.response != std::vector<unsigned char>{0x33, 0x44, 0x90, 0x00} ||
+            !cwt_next_result.io.result_known || !cwt_next_result.io.reply_complete)
+            return 261;
+        set_scan_card_t1_bwt_mode(0);
+    }
+    for (const auto mode : {1u, 2u}) {
+        set_scan_card_t1_crc(mode == 2);
+        const auto cwt_host_i = mode == 1 ? encode_t1_lrc_frame(0x00, apdu_one)
+                                          : encode_t1_crc_frame(0x00, apdu_one);
+        const std::array<unsigned char, 4> cwt_response{0x11, 0x22, 0x90, 0x00};
+        const auto cwt_card_i = mode == 1 ? encode_t1_lrc_frame(0x00, cwt_response)
+                                          : encode_t1_crc_frame(0x00, cwt_response);
+        for (const auto fault : {91u, 93u}) {
+            if (!reset_t1_session()) return 251;
+            set_scan_card_t1_apdu_mode(true, 0);
+            set_scan_card_t1_cwt_fault(fault);
+            dtv::internal::T1ApduResult cwt_rejected_result{};
+            std::vector<std::vector<unsigned char>> cwt_rejected_output;
+            const auto cwt_rejected_code = run_t1_apdu(mode, apdu_one,
+                &cwt_rejected_result, &cwt_rejected_output);
+            if (cwt_rejected_code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+                !cwt_rejected_result.response.empty() || cwt_rejected_result.io.result_known ||
+                cwt_rejected_result.io.reply_complete ||
+                cwt_rejected_result.io.tx_bytes_done != cwt_host_i.size() ||
+                cwt_rejected_result.io.rx_bytes_done != cwt_card_i.size() ||
+                !same_apdu_frame_sent(mode, cwt_rejected_output, cwt_host_i, apdu_one, 1)) {
+                std::fprintf(stderr, "CWT reject mode=%u fault=%u code=%d tx=%zu rx=%zu known=%u complete=%u output=%zu same=%u expected-frame=%zu\n",
+                    mode, fault, cwt_rejected_code, cwt_rejected_result.io.tx_bytes_done,
+                    cwt_rejected_result.io.rx_bytes_done, cwt_rejected_result.io.result_known,
+                    cwt_rejected_result.io.reply_complete, cwt_rejected_output.size(),
+                    same_apdu_frame_sent(mode, cwt_rejected_output, cwt_host_i, apdu_one, 1),
+                    cwt_host_i.size());
+                return 252;
+            }
+        }
+    }
+    set_scan_card_t1_crc(false);
+    if (!reset_t1_session()) return 253;
+    set_scan_card_t1_apdu_mode(true, 0);
+    set_scan_card_t1_cwt_fault(92);
+    dtv::internal::T1ApduResult cwt_boundary_result{};
+    std::vector<std::vector<unsigned char>> cwt_boundary_output;
+    const auto cwt_boundary_code = run_t1_apdu(1, apdu_one,
+        &cwt_boundary_result, &cwt_boundary_output);
+    if (cwt_boundary_code != DTV_INTERNAL_RESULT_OK ||
+        cwt_boundary_result.response != std::vector<unsigned char>{0x11, 0x22, 0x90, 0x00} ||
+        !cwt_boundary_result.io.result_known || !cwt_boundary_result.io.reply_complete)
+        return 254;
+    const auto cwt_lrc_host_i = encode_t1_lrc_frame(0x00, apdu_one);
+    const std::array<unsigned char, 4> cwt_lrc_response{0x11, 0x22, 0x90, 0x00};
+    const auto cwt_lrc_card_i = encode_t1_lrc_frame(0x00, cwt_lrc_response);
+    for (const auto fault : {94u, 95u, 96u}) {
+        if (!reset_t1_session()) return 255;
+        set_scan_card_t1_apdu_mode(true, 0);
+        set_scan_card_t1_cwt_fault(fault);
+        dtv::internal::T1ApduResult cwt_invalid_evidence_result{};
+        std::vector<std::vector<unsigned char>> cwt_invalid_evidence_output;
+        const auto cwt_invalid_evidence_code = run_t1_apdu(1, apdu_one,
+            &cwt_invalid_evidence_result, &cwt_invalid_evidence_output);
+        if (cwt_invalid_evidence_code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+            !cwt_invalid_evidence_result.response.empty() ||
+            cwt_invalid_evidence_result.io.result_known ||
+            cwt_invalid_evidence_result.io.reply_complete ||
+            cwt_invalid_evidence_result.io.tx_bytes_done != cwt_lrc_host_i.size() ||
+            cwt_invalid_evidence_result.io.rx_bytes_done != cwt_lrc_card_i.size() ||
+            !same_apdu_frame_sent(1, cwt_invalid_evidence_output,
+                cwt_lrc_host_i, apdu_one, 1))
+            return 256;
+    }
+    set_scan_card_t1_cwt_fault(0);
+    set_scan_card_t1_crc(true);
     if (!reset_t1_session()) return 234;
     set_scan_card_t1_bwt_mode(0);
     set_scan_card_t1_apdu_mode(true, 55);
@@ -3272,7 +3429,16 @@ int public_card_transport()
         delayed_wtx_result.io.tx_bytes_done != delayed_host_i.size() + delayed_host_wtx.size() ||
         !delayed_wtx_result.io.reply_complete || !delayed_wtx_result.io.result_known ||
         !same_apdu_frame_sent(2, delayed_wtx_output, delayed_host_i, apdu_one, 1) ||
-        !same_wtx_frame_sent(2, delayed_wtx_output, delayed_host_wtx, 1)) return 235;
+        !same_wtx_frame_sent(2, delayed_wtx_output, delayed_host_wtx, 1)) {
+        std::fprintf(stderr, "delayed WTX code=%d transport=%d tx=%zu/%zu rx=%zu/%zu known=%u complete=%u output=%zu response=%zu\n",
+            delayed_wtx_code, delayed_wtx_result.io.transport_error.code,
+            delayed_wtx_result.io.tx_bytes_done,
+            delayed_host_i.size() + delayed_host_wtx.size(),
+            delayed_wtx_result.io.rx_bytes_done, delayed_wtx_receive_bytes,
+            delayed_wtx_result.io.result_known, delayed_wtx_result.io.reply_complete,
+            delayed_wtx_output.size(), delayed_wtx_result.response.size());
+        return 235;
+    }
     if (!reset_t1_session()) return 236;
     set_scan_card_t1_apdu_mode(true, 56);
     dtv::internal::T1ApduResult invalid_wtx_epoch_result{};
