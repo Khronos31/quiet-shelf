@@ -54,7 +54,8 @@ add_library(dtv-userland STATIC
     src/l3-registry.cpp
     src/result.cpp
     src/ts-framer.cpp
-    src/usb.cpp)
+    src/usb.cpp
+    src/wire-envelope.cpp)
 add_library(dtv::userland ALIAS dtv-userland)
 target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
@@ -91,4 +92,7 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(feature_declaration_contract tests/feature-declaration.cpp)
     target_link_libraries(feature_declaration_contract PRIVATE dtv::userland)
     add_test(NAME feature_declaration_contract COMMAND feature_declaration_contract)
+    add_executable(wire_envelope_contract tests/wire-envelope.cpp)
+    target_link_libraries(wire_envelope_contract PRIVATE dtv::userland)
+    add_test(NAME wire_envelope_contract COMMAND wire_envelope_contract)
 endif()
