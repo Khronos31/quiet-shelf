@@ -38,6 +38,8 @@ std::atomic<std::uint32_t> scan_shared_card_state{DTV_CARD_ABSENT};
 std::atomic<bool> scan_shared_card_stale_generation{false};
 std::atomic<std::uint32_t> scan_shared_lock_receiver{0};
 std::atomic<std::uint32_t> scan_shared_lock_state{0};
+std::atomic<std::uint32_t> scan_lnb_requested_state{DTV_LNB_UNKNOWN};
+std::atomic<bool> scan_lnb_reply_pending{false};
 std::atomic<bool> scan_shared_lock_stale_generation{false};
 std::atomic<bool> scan_shared_lock_enabled{false};
 std::atomic<std::uint64_t> scan_stream_generation{0};
@@ -1019,6 +1021,18 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         }
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
+    if (packet->endpoint == 0x81 &&
+        scan_lnb_reply_pending.exchange(false, std::memory_order_acq_rel)) {
+        static thread_local std::array<unsigned char, 2> reply{};
+        reply = {0xa5, static_cast<unsigned char>(
+            scan_lnb_requested_state.load(std::memory_order_acquire))};
+        message->kind = dtv::spi::PublicOpenMessageKind::control_reply;
+        message->resource_scope = 19;
+        message->transaction_id = 190 + reply[1];
+        message->generation = packet->generation;
+        message->payload = reply;
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
     if (scan_public_open_case == 17 && packet->endpoint == 0x81) {
         static thread_local std::array<unsigned char, 8> reply{};
         const auto mode = scan_card_reply_mode.exchange(0, std::memory_order_acq_rel);
@@ -1294,6 +1308,29 @@ dtv_internal_result scan_plan_operation(dtv_context *, const dtv::spi::PublicOpe
 {
     if (request == nullptr || plan == nullptr)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    if (request->operation == DTV_OP_LNB_POWER && request->target_kind ==
+            dtv::spi::PublicOperationTargetKind::enclosure && request->arguments.size() == 1) {
+        static constexpr std::uint64_t lnb_resource = 919;
+        static thread_local std::array<unsigned char, 2> output{};
+        plan->supported = true;
+        plan->ready = scan_public_open_case != 18;
+        plan->arguments_valid = request->target_kind ==
+            dtv::spi::PublicOperationTargetKind::enclosure && request->arguments.size() == 1 &&
+            (request->arguments[0] == DTV_LNB_ON || request->arguments[0] == DTV_LNB_OFF);
+        if (!plan->arguments_valid) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        if (!plan->ready) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        scan_lnb_requested_state.store(request->arguments[0], std::memory_order_release);
+        scan_lnb_reply_pending.store(true, std::memory_order_release);
+        output = {0x4c, request->arguments[0]};
+        plan->handle_index = 0;
+        plan->bulk_out_endpoint = 0x02;
+        plan->resource_scope = 19;
+        plan->transaction_id = 190 + request->arguments[0];
+        plan->reply_capacity = 2;
+        plan->resource_keys = std::span<const std::uint64_t>(&lnb_resource, 1);
+        plan->output = output;
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
     if (request->operation == 4) {
         plan->supported = true;
         plan->ready = true;
@@ -2176,7 +2213,8 @@ extern const ModelEntry scan_model_model{
 
 }
 
-DTV_PRODUCT(scanfixture, DTV_FEATURES(::dtv::spi::Feature::OutputPidFilter, ::dtv::spi::Feature::Card));
+DTV_PRODUCT(scanfixture, DTV_FEATURES(::dtv::spi::Feature::LnbPower,
+    ::dtv::spi::Feature::OutputPidFilter, ::dtv::spi::Feature::Card));
 inline constexpr dtv::spi::model_information::receiver_information scan_receivers[]{
     {0, 0, 1u << DTV_SYSTEM_ISDB_T, 188, 0,
      (1u << (DTV_OP_OUTPUT_PID_FILTER - 1)) |
@@ -2201,10 +2239,35 @@ inline constexpr dtv::spi::model_information::device_receiver_information scan_d
     {1, true, scan_receivers, std::size(scan_receivers)},
 };
 DTV_MODEL(scanfixture, scan_model,
-          DTV_FEATURES(::dtv::spi::Feature::OutputPidFilter, ::dtv::spi::Feature::Card), DTV_NO_FIRMWARE,
+          DTV_FEATURES(::dtv::spi::Feature::LnbPower,
+              ::dtv::spi::Feature::OutputPidFilter, ::dtv::spi::Feature::Card), DTV_NO_FIRMWARE,
           (::dtv::spi::model_information{"Scan Fixture", 0x1234, 0x0101,
                                            scan_device_receivers, std::size(scan_device_receivers)}));
 DTV_DEFINE_MODEL(scanfixture, scan_model);
+
+extern "C" int32_t dtv_model_impl_lnb_on_scanfixture_scan_model(
+    dtv_enclosure *enclosure, const dtv_call_options *options, dtv_error *error)
+{
+    std::array<unsigned char, 2> reply{};
+    std::size_t reply_size = 0;
+    const auto result = dtv::internal::run_public_lnb_operation(enclosure, DTV_LNB_ON,
+        dtv_timeout{options == nullptr ? 0 : options->timeout_ms, 0}, reply, &reply_size, error);
+    if (result != DTV_ERROR_OK) return result;
+    return reply_size == reply.size() && reply[0] == 0xa5 && reply[1] == DTV_LNB_ON
+        ? DTV_ERROR_OK : DTV_ERROR_USB_IO;
+}
+
+extern "C" int32_t dtv_model_impl_lnb_off_scanfixture_scan_model(
+    dtv_enclosure *enclosure, const dtv_call_options *options, dtv_error *error)
+{
+    std::array<unsigned char, 2> reply{};
+    std::size_t reply_size = 0;
+    const auto result = dtv::internal::run_public_lnb_operation(enclosure, DTV_LNB_OFF,
+        dtv_timeout{options == nullptr ? 0 : options->timeout_ms, 0}, reply, &reply_size, error);
+    if (result != DTV_ERROR_OK) return result;
+    return reply_size == reply.size() && reply[0] == 0xa5 && reply[1] == DTV_LNB_OFF
+        ? DTV_ERROR_OK : DTV_ERROR_USB_IO;
+}
 
 extern "C" int32_t dtv_model_impl_reset_card_scanfixture_scan_model(
     dtv_enclosure *enclosure, const dtv_call_options *options,

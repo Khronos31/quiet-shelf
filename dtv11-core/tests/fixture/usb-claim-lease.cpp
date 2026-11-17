@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #if defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -2132,6 +2133,157 @@ int public_open_card_events()
             DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT);
     set_scan_public_open_case(0);
     return consumer_result != 0 ? consumer_result : tune_verified ? 0 : 2;
+}
+
+int public_lnb_roundtrip()
+{
+    set_scan_public_open_case(17);
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    dtv::internal::CompleteGroupBatch batch;
+    static std::uint64_t snapshot_token = 260;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, snapshot_token++), snapshot(context, 4, snapshot_token++)},
+            &batch).code != DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error error{};
+    error.struct_size = sizeof(error);
+    auto *const *enclosures = dtv_list_enclosures(&error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    std::uint32_t support = DTV_UNKNOWN;
+    if (dtv_get_enclosure_support(root, DTV_OP_LNB_POWER, &support, &error) != DTV_ERROR_OK ||
+        support != DTV_YES || dtv_get_lnb_state(root) != DTV_LNB_UNKNOWN) return 3;
+    std::atomic<std::int32_t> open_result{DTV_ERROR_INTERNAL};
+    std::thread opening([&] {
+        open_result.store(dtv_open_enclosure(root, nullptr, &error), std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x81, 1) ||
+        !backend->wait_for_endpoint_submissions(0x82, 1)) {
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+        opening.join();
+        return 4;
+    }
+    backend->complete_endpoint(0x81);
+    backend->complete_endpoint(0x82);
+    opening.join();
+    if (open_result.load(std::memory_order_acquire) != DTV_ERROR_OK) return 5;
+
+    const auto run_lnb = [&](std::uint32_t target_state, std::uint64_t transaction) {
+        set_scan_public_open_case(18);
+        const auto before_unready = backend->endpoint_submission_count(0x02);
+        const auto previous_state = dtv_get_lnb_state(root);
+        const auto unready = target_state == DTV_LNB_ON
+            ? dtv_lnb_on(root, nullptr, &error) : dtv_lnb_off(root, nullptr, &error);
+        if (unready != DTV_ERROR_NOT_READY || error.code != DTV_ERROR_NOT_READY ||
+            backend->endpoint_submission_count(0x02) != before_unready ||
+            dtv_get_lnb_state(root) != previous_state) return false;
+
+        set_scan_public_open_case(17);
+        set_scan_shared_reply_enabled(true);
+        set_scan_shared_transaction_override(transaction);
+        const auto output_submission = backend->endpoint_submission_count(0x02) + 1;
+        std::atomic<std::int32_t> result{DTV_ERROR_INTERNAL};
+        dtv_error call_error{};
+        call_error.struct_size = sizeof(call_error);
+        const dtv_call_options call{sizeof(dtv_call_options), 1000};
+        std::thread caller([&] {
+            result.store(target_state == DTV_LNB_ON
+                    ? dtv_lnb_on(root, &call, &call_error)
+                    : dtv_lnb_off(root, &call, &call_error),
+                std::memory_order_release);
+        });
+        if (!backend->wait_for_endpoint_submissions(0x02, output_submission)) {
+            dtv_cancel_enclosure(root, &error);
+            caller.join();
+            set_scan_shared_reply_enabled(false);
+            return false;
+        }
+        auto callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x02);
+        if (!backend->wait_for_callbacks(callbacks + 1)) {
+            caller.join();
+            set_scan_shared_reply_enabled(false);
+            return false;
+        }
+        callbacks = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x81);
+        const bool reply_done = backend->wait_for_callbacks(callbacks + 1);
+        caller.join();
+        set_scan_shared_reply_enabled(false);
+        const auto output = backend->output_snapshot();
+        if (!reply_done || result.load(std::memory_order_acquire) != DTV_ERROR_OK ||
+            call_error.code != DTV_ERROR_OK || dtv_get_lnb_state(root) != target_state ||
+            output.empty() || output.back() != std::vector<unsigned char>{0x4c,
+                static_cast<unsigned char>(target_state)}) return false;
+        return true;
+    };
+    if (!run_lnb(DTV_LNB_ON, 191) || !run_lnb(DTV_LNB_OFF, 192)) return 6;
+    set_scan_shared_reply_enabled(false);
+    const auto timeout_submission = backend->endpoint_submission_count(0x02) + 1;
+    std::atomic<std::int32_t> timeout_result{DTV_ERROR_INTERNAL};
+    dtv_error timeout_error{};
+    timeout_error.struct_size = sizeof(timeout_error);
+    const dtv_call_options short_call{sizeof(dtv_call_options), 20};
+    std::thread timeout_caller([&] {
+        timeout_result.store(dtv_lnb_on(root, &short_call, &timeout_error),
+            std::memory_order_release);
+    });
+    if (!backend->wait_for_endpoint_submissions(0x02, timeout_submission)) {
+        dtv_cancel_enclosure(root, &error);
+        timeout_caller.join();
+        return 7;
+    }
+    timeout_caller.join();
+    if (timeout_result.load(std::memory_order_acquire) != DTV_ERROR_TIMEOUT ||
+        timeout_error.code != DTV_ERROR_TIMEOUT || dtv_get_lnb_state(root) != DTV_LNB_UNKNOWN ||
+        backend->endpoint_submission_count(0x02) != timeout_submission) return 8;
+    if (dtv_close_enclosure(root, nullptr, &error) != DTV_CLOSE_CLOSED) return 7;
+    if (dtv_get_lnb_state(root) != DTV_LNB_UNKNOWN) return 9;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    dtv::internal::set_public_discovery_batch_for_test({});
+    set_scan_public_open_case(0);
+    return 0;
+}
+
+int public_lnb_unsupported()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    auto batch = complete_group(snapshot(context, 3, 290), snapshot(context, 4, 291));
+    if (batch.groups.size() != 1) return 1;
+    for (auto &item : batch.snapshots) {
+        item.vendor_id = 0x1234;
+        item.product_id = 0x0201;
+    }
+    batch.groups[0].model = &dtv_l3_model_scanfixture_scan_model_alias;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error error{};
+    error.struct_size = sizeof(error);
+    auto *const *enclosures = dtv_list_enclosures(&error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) {
+        std::fprintf(stderr, "unsupported list=%p first=%p error=%d\n",
+            static_cast<const void *>(enclosures),
+            enclosures == nullptr ? nullptr : static_cast<void *>(enclosures[0]), error.code);
+        return 2;
+    }
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    const auto before = backend->endpoint_submission_count(0x02);
+    std::uint32_t support = DTV_UNKNOWN;
+    if (dtv_get_enclosure_support(root, DTV_OP_LNB_POWER, &support, &error) != DTV_ERROR_OK ||
+        support != DTV_NO || dtv_lnb_on(root, nullptr, &error) != DTV_ERROR_UNSUPPORTED ||
+        error.code != DTV_ERROR_UNSUPPORTED ||
+        backend->endpoint_submission_count(0x02) != before) return 3;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    dtv::internal::set_public_discovery_batch_for_test({});
+    return 0;
 }
 
 int public_reset_card()
@@ -6296,9 +6448,24 @@ int public_error_message_boundary()
 
 }
 
-int main()
+int main(int argc, char **argv)
 {
     dtv_load_scanfixture();
+    if (argc == 2 && std::strcmp(argv[1], "--lnb") == 0) {
+        const int result = public_lnb_roundtrip();
+        if (result != 0) {
+            std::fprintf(stderr, "public_lnb_roundtrip failed: %d\n", result);
+            return result;
+        }
+        const int unsupported_result = public_lnb_unsupported();
+        if (unsupported_result != 0)
+            std::fprintf(stderr, "public_lnb_unsupported failed: %d\n", unsupported_result);
+        return unsupported_result;
+    }
+    if (const int result = public_lnb_roundtrip(); result != 0) {
+        std::fprintf(stderr, "public_lnb_roundtrip failed: %d\n", result);
+        return 139 + result;
+    }
     if (const int result = public_reset_card(); result != 0) {
         std::fprintf(stderr, "public_reset_card failed: %d\n", result);
         return 140 + result;

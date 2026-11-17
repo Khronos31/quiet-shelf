@@ -224,6 +224,9 @@ std::int32_t run_public_stream_operation(
 std::int32_t run_public_card_operation(
     dtv_enclosure *, std::uint32_t, std::span<const unsigned char>, dtv_timeout,
     std::span<unsigned char>, std::size_t *, dtv_error *);
+std::int32_t run_public_lnb_operation(
+    dtv_enclosure *, std::uint32_t, dtv_timeout, std::span<unsigned char>,
+    std::size_t *, dtv_error *);
 
 }
 

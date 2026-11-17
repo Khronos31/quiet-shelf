@@ -40,6 +40,28 @@ struct dtv_stream { std::shared_ptr<void> state; };
 namespace dtv::internal {
 namespace {
 
+thread_local dtv_enclosure *active_lnb_operation = nullptr;
+thread_local bool active_lnb_transport_completed = false;
+
+struct ActiveLnbOperationScope {
+    dtv_enclosure *previous_operation;
+    bool previous_transport_completed;
+
+    explicit ActiveLnbOperationScope(dtv_enclosure *object)
+        : previous_operation(active_lnb_operation),
+          previous_transport_completed(active_lnb_transport_completed)
+    {
+        active_lnb_operation = object;
+        active_lnb_transport_completed = false;
+    }
+
+    ~ActiveLnbOperationScope()
+    {
+        active_lnb_operation = previous_operation;
+        active_lnb_transport_completed = previous_transport_completed;
+    }
+};
+
 struct CardAtrT1Parameters {
     bool selected = false;
     bool crc = false;
@@ -2626,12 +2648,13 @@ struct PublicDiscoveryState {
         std::condition_variable condition;
         Phase phase = Phase::opening;
         std::atomic<bool> cancelled{false};
+        std::shared_ptr<SharedInOwner> shared_in;
         std::shared_ptr<EnclosureRuntime> runtime;
         std::shared_ptr<dtv::spi::ProductInstance> product_instance;
         const dtv::spi::PublicOpenOps *ops = nullptr;
-        std::shared_ptr<SharedInOwner> shared_in;
         std::vector<std::uint64_t> requests;
         std::uint32_t first_error = DTV_ERROR_OK;
+        std::uint32_t lnb_state = DTV_LNB_UNKNOWN;
         dtv_internal_result first_error_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         std::vector<std::uint64_t> connections;
         std::mutex operation_mutex;
@@ -4141,6 +4164,40 @@ std::int32_t run_public_card_operation(
         public_discovery_state().registry.enclosure_id(enclosure), arguments};
     const auto result = run_public_operation_for_test(enclosure, request,
         timeout, reply, reply_size);
+    const auto code = public_error_code(result);
+    set_public_error(error, code, nullptr, &result);
+    return code;
+}
+
+std::int32_t run_public_lnb_operation(
+    dtv_enclosure *enclosure, std::uint32_t state, dtv_timeout timeout,
+    std::span<unsigned char> reply, std::size_t *reply_size, dtv_error *error)
+{
+    if (enclosure == nullptr || reply_size == nullptr ||
+        (state != DTV_LNB_ON && state != DTV_LNB_OFF)) {
+        set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
+        return DTV_ERROR_INVALID_ARGUMENT;
+    }
+    const std::array<unsigned char, 1> arguments{static_cast<unsigned char>(state)};
+    const dtv::spi::PublicOperationRequest request{DTV_OP_LNB_POWER,
+        dtv::spi::PublicOperationTargetKind::enclosure,
+        public_discovery_state().registry.enclosure_id(enclosure), arguments};
+    dtv::spi::CardIoOutcome outcome{};
+    const auto result = run_public_operation_for_test(enclosure, request, timeout, reply,
+        reply_size, nullptr, &outcome);
+    auto &state_registry = public_discovery_state();
+    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
+    {
+        std::lock_guard lock(state_registry.open_mutex);
+        const auto found = state_registry.open_slots.find(enclosure);
+        if (found != state_registry.open_slots.end()) slot = found->second;
+    }
+    if (slot != nullptr && (result.code == DTV_INTERNAL_RESULT_OK || !outcome.result_known)) {
+        std::lock_guard lock(slot->mutex);
+        slot->lnb_state = DTV_LNB_UNKNOWN;
+        if (result.code == DTV_INTERNAL_RESULT_OK && active_lnb_operation == enclosure)
+            active_lnb_transport_completed = true;
+    }
     const auto code = public_error_code(result);
     set_public_error(error, code, nullptr, &result);
     return code;
@@ -6079,7 +6136,26 @@ extern "C" std::uint32_t dtv_get_status(dtv_enclosure *object)
     try { return public_discovery_state().registry.status(object); }
     catch (...) { return DTV_ENCLOSURE_UNKNOWN; }
 }
-extern "C" std::uint32_t dtv_get_lnb_state(dtv_enclosure *) { return DTV_LNB_UNKNOWN; }
+extern "C" std::uint32_t dtv_get_lnb_state(dtv_enclosure *object)
+{
+    if (object == nullptr) return DTV_LNB_UNKNOWN;
+    try {
+        auto &state = public_discovery_state();
+        if (state.registry.status(object) != DTV_ENCLOSURE_READY) return DTV_LNB_UNKNOWN;
+        std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
+        {
+            std::lock_guard lock(state.open_mutex);
+            const auto found = state.open_slots.find(object);
+            if (found == state.open_slots.end()) return DTV_LNB_UNKNOWN;
+            slot = found->second;
+        }
+        std::lock_guard lock(slot->mutex);
+        return slot->phase == PublicDiscoveryState::OpenSlot::Phase::open
+            ? slot->lnb_state : DTV_LNB_UNKNOWN;
+    } catch (...) {
+        return DTV_LNB_UNKNOWN;
+    }
+}
 extern "C" std::uint32_t dtv_get_card_state(dtv_enclosure *object)
 {
     try { return public_discovery_state().registry.card_state(object); }
@@ -6113,6 +6189,104 @@ extern "C" std::int32_t dtv_get_enclosure_support(
     const auto result = dtv_get_model_support(model, operation, out_tribool, error);
     if (result == DTV_ERROR_OK) set_public_error(error, DTV_ERROR_OK);
     return result;
+}
+
+namespace {
+
+std::int32_t public_lnb_operation(dtv_enclosure *object, std::uint32_t target_state,
+                                  const dtv_call_options *options, dtv_error *error)
+{
+    if (object == nullptr ||
+        (options != nullptr && options->struct_size < sizeof(*options))) {
+        set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
+        return DTV_ERROR_INVALID_ARGUMENT;
+    }
+    std::uint32_t support = DTV_UNKNOWN;
+    auto code = dtv_get_enclosure_support(object, DTV_OP_LNB_POWER, &support, error);
+    if (code != DTV_ERROR_OK) return code;
+    if (support == DTV_NO) {
+        set_public_error(error, DTV_ERROR_UNSUPPORTED);
+        return DTV_ERROR_UNSUPPORTED;
+    }
+    if (support != DTV_YES) {
+        set_public_error(error, DTV_ERROR_NOT_READY);
+        return DTV_ERROR_NOT_READY;
+    }
+
+    auto &state = public_discovery_state();
+    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
+    {
+        std::lock_guard lock(state.open_mutex);
+        const auto found = state.open_slots.find(object);
+        if (found != state.open_slots.end()) slot = found->second;
+    }
+    if (slot == nullptr) {
+        set_public_error(error, DTV_ERROR_NOT_READY);
+        return DTV_ERROR_NOT_READY;
+    }
+    {
+        std::lock_guard lock(slot->mutex);
+        if (slot->phase != PublicDiscoveryState::OpenSlot::Phase::open) {
+            set_public_error(error, DTV_ERROR_NOT_READY);
+            return DTV_ERROR_NOT_READY;
+        }
+    }
+    const auto *product = state.registry.product(object);
+    const auto *model = state.registry.model(object);
+    if (product == nullptr || model == nullptr) {
+        set_public_error(error, DTV_ERROR_NOT_READY);
+        return DTV_ERROR_NOT_READY;
+    }
+    bool transport_completed = false;
+    {
+        ActiveLnbOperationScope operation_scope(object);
+        code = target_state == DTV_LNB_ON
+            ? dtv::internal::dispatch_lnb_on(product, model, object, options, error)
+            : dtv::internal::dispatch_lnb_off(product, model, object, options, error);
+        transport_completed = active_lnb_transport_completed;
+    }
+    if (code != DTV_ERROR_OK) {
+        set_public_error(error, code);
+        return code;
+    }
+    {
+        std::lock_guard lock(slot->mutex);
+        if (slot->phase != PublicDiscoveryState::OpenSlot::Phase::open) {
+            set_public_error(error, DTV_ERROR_NOT_READY);
+            return DTV_ERROR_NOT_READY;
+        }
+        if (!transport_completed) {
+            set_public_error(error, DTV_ERROR_NOT_READY);
+            return DTV_ERROR_NOT_READY;
+        }
+        slot->lnb_state = target_state;
+    }
+    set_public_error(error, DTV_ERROR_OK);
+    return DTV_ERROR_OK;
+}
+
+}
+
+extern "C" std::int32_t dtv_lnb_on(
+    dtv_enclosure *object, const dtv_call_options *options, dtv_error *error)
+{
+    try { return public_lnb_operation(object, DTV_LNB_ON, options, error); }
+    catch (...) {
+        const auto code = public_error_code_from_exception();
+        set_public_error(error, code);
+        return code;
+    }
+}
+
+extern "C" std::int32_t dtv_lnb_off(
+    dtv_enclosure *object, const dtv_call_options *options, dtv_error *error)
+{
+    try { return public_lnb_operation(object, DTV_LNB_OFF, options, error); }
+    catch (...) {
+        const auto code = public_error_code_from_exception();
+        set_public_error(error, code);
+        return code;
+    }
 }
 
 namespace {
@@ -8230,9 +8404,9 @@ extern "C" uint32_t dtv_get_stream_close_state(dtv_stream *stream, dtv_error *er
 extern "C" void dtv_release_stream(dtv_stream *stream)
 {
     if (stream == nullptr || stream->state == nullptr) return;
-    auto *state = static_cast<PublicStreamState *>(stream->state.get());
-    std::lock_guard lock(state->mutex);
-    if (!state->closed) return;
+    auto shared = std::static_pointer_cast<PublicStreamState>(stream->state);
+    std::lock_guard lock(shared->mutex);
+    if (!shared->closed) return;
     delete stream;
 }
 

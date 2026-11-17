@@ -1404,7 +1404,7 @@ void UsbContext::State::mark_callbacks_returned()
 {
     std::lock_guard lock(requests_mutex);
     for (auto it = requests.begin(); it != requests.end();) {
-        const auto &request = it->second;
+        const auto request = it->second;
         {
             std::lock_guard request_lock(request->mutex);
             if (!request->completed) {
