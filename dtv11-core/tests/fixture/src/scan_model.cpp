@@ -13,88 +13,8 @@
 #include <dtv/internal/l3-registry.hpp>
 #include <dtv/spi/device_ops.hpp>
 #include <dtv/spi/feature.hpp>
-#include <dtv/spi/firmware_session.hpp>
-
-struct ScanFirmwareContext {
-    const dtv_usb_io *io = nullptr;
-    std::uint32_t mode = DTV_IDENTIFY_UNKNOWN;
-    dtv_device_id device_id = 0;
-    std::uint16_t product_id = 0;
-};
-
-std::atomic<dtv_device_id> scan_firmware_last_device{0};
-std::atomic<dtv_function> scan_firmware_last_function{0};
-std::atomic<std::uint64_t> scan_firmware_last_epoch{0};
-std::atomic<std::size_t> scan_firmware_last_handle{0};
-std::atomic<unsigned> scan_firmware_create_count{0};
-std::atomic<unsigned> scan_firmware_open_count{0};
-std::atomic<unsigned> scan_firmware_identify_count{0};
-std::atomic<unsigned> scan_firmware_close_count{0};
-std::atomic<unsigned> scan_firmware_destroy_count{0};
-std::mutex scan_firmware_mutex;
-std::vector<dtv_device_id> scan_firmware_runtime_devices;
-std::atomic<std::uint32_t> scan_firmware_same_id_mode{DTV_IDENTIFY_RUNTIME};
 
 namespace {
-
-dtv_internal_result scan_firmware_open(dtv_context *context, const dtv_usb_io *io,
-                                       const dtv_open_args *args)
-{
-    if (context == nullptr || io == nullptr || args == nullptr || args->usb_observation == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    auto *state = static_cast<ScanFirmwareContext *>(context);
-    scan_firmware_open_count.fetch_add(1, std::memory_order_acq_rel);
-    state->io = io;
-    state->product_id = args->usb_observation->product_id;
-    std::lock_guard lock(scan_firmware_mutex);
-    state->mode = args->usb_observation->product_id == 0x0101
-        ? scan_firmware_same_id_mode.load(std::memory_order_acquire)
-        : (std::find(scan_firmware_runtime_devices.begin(), scan_firmware_runtime_devices.end(),
-                     state->device_id) != scan_firmware_runtime_devices.end()
-            ? DTV_IDENTIFY_RUNTIME : DTV_IDENTIFY_LOADER);
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-dtv_internal_result scan_firmware_identify(dtv_context *context, dtv_identify_info *identity,
-                                           dtv_timeout)
-{
-    if (context == nullptr || identity == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    auto *state = static_cast<ScanFirmwareContext *>(context);
-    scan_firmware_identify_count.fetch_add(1, std::memory_order_acq_rel);
-    identity->state = state->mode;
-    identity->firmware_key = state->mode == DTV_IDENTIFY_RUNTIME ? 1 : 0;
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-dtv_internal_result scan_firmware_close(dtv_context *context, dtv_timeout)
-{
-    if (context != nullptr) static_cast<ScanFirmwareContext *>(context)->io = nullptr;
-    scan_firmware_close_count.fetch_add(1, std::memory_order_acq_rel);
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-dtv_internal_result scan_firmware_create(dtv_device_id device_id, dtv_context **out)
-{
-    if (out == nullptr) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    auto *state = new ScanFirmwareContext;
-    state->device_id = device_id;
-    *out = state;
-    scan_firmware_create_count.fetch_add(1, std::memory_order_acq_rel);
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-void scan_firmware_destroy(dtv_context *context)
-{
-    delete static_cast<ScanFirmwareContext *>(context);
-    scan_firmware_destroy_count.fetch_add(1, std::memory_order_acq_rel);
-}
-
-const dtv::spi::DeviceOps scan_firmware_ops{
-    .open = scan_firmware_open,
-    .identify = scan_firmware_identify,
-    .close = scan_firmware_close,
-};
 
 enum class ScanGroupCase {
     complete, no_match, ambiguous, bad_index, bad_interface, callback_error, callback_exception
@@ -2267,48 +2187,6 @@ bool scan_open_identify_is_blocked()
     return scan_open_identify_blocked.load(std::memory_order_acquire);
 }
 
-dtv_device_id scan_firmware_device_id()
-{
-    return scan_firmware_last_device.load(std::memory_order_acquire);
-}
-
-dtv_function scan_firmware_function()
-{
-    return scan_firmware_last_function.load(std::memory_order_acquire);
-}
-
-std::uint64_t scan_firmware_epoch()
-{
-    return scan_firmware_last_epoch.load(std::memory_order_acquire);
-}
-
-std::size_t scan_firmware_handle_index()
-{
-    return scan_firmware_last_handle.load(std::memory_order_acquire);
-}
-
-void reset_scan_firmware_records()
-{
-    scan_firmware_create_count.store(0, std::memory_order_release);
-    scan_firmware_open_count.store(0, std::memory_order_release);
-    scan_firmware_identify_count.store(0, std::memory_order_release);
-    scan_firmware_close_count.store(0, std::memory_order_release);
-    scan_firmware_destroy_count.store(0, std::memory_order_release);
-    scan_firmware_runtime_devices.clear();
-    scan_firmware_same_id_mode.store(DTV_IDENTIFY_RUNTIME, std::memory_order_release);
-}
-
-void set_scan_firmware_same_id_mode(std::uint32_t mode)
-{
-    scan_firmware_same_id_mode.store(mode, std::memory_order_release);
-}
-
-unsigned scan_firmware_create_calls() { return scan_firmware_create_count.load(); }
-unsigned scan_firmware_open_calls() { return scan_firmware_open_count.load(); }
-unsigned scan_firmware_identify_calls() { return scan_firmware_identify_count.load(); }
-unsigned scan_firmware_close_calls() { return scan_firmware_close_count.load(); }
-unsigned scan_firmware_destroy_calls() { return scan_firmware_destroy_count.load(); }
-
 void release_scan_open_identify()
 {
     scan_open_identify_release.store(true, std::memory_order_release);
@@ -2322,18 +2200,15 @@ std::thread::id scan_group_callback_thread()
 
 namespace dtv::spi {
 
-namespace firmware_assets {
-struct scan_firmware {
-    static constexpr unsigned char data[]{0x31, 0x72, 0xb4, 0xe5};
-    static constexpr std::size_t size = sizeof(data);
-};
-}
-
-inline constexpr FunctionEntry scan_firmware_functions[]{
-    {.function = 1, .bootstrap_ops = &scan_firmware_ops,
-     .create_state = scan_firmware_create, .destroy_state = scan_firmware_destroy},
-    {.function = 2, .bootstrap_ops = &scan_firmware_ops,
-     .create_state = scan_firmware_create, .destroy_state = scan_firmware_destroy},
+extern const ModelEntry scan_model_model{
+    .model = {"Scan Fixture", 0x1234, 0x0101},
+    .firmware = nullptr,
+    .firmware_count = 0,
+    .cold_identities = scan_identities,
+    .cold_identity_count = sizeof(scan_identities) / sizeof(scan_identities[0]),
+    .select_usb_group = select_scan_group,
+    .source_stride_bytes = 188,
+    .public_open = &scan_public_open_ops,
 };
 
 }
@@ -2360,99 +2235,15 @@ inline constexpr dtv::spi::model_information::receiver_information scan_receiver
      (1u << (DTV_OP_TUNE_ISDB_T - 1)) | (1u << (DTV_OP_SIGNAL - 1)),
      0, DTV_TS_UNKNOWN},
 };
-inline constexpr dtv::spi::model_information::receiver_information scan_receivers_second[]{
-    {3, 0, 1u << DTV_SYSTEM_ISDB_T, 188, 0,
-     (1u << (DTV_OP_OUTPUT_PID_FILTER - 1)) |
-         (1u << (DTV_OP_TUNE_ISDB_T - 1)) | (1u << (DTV_OP_SIGNAL - 1)) |
-         (1u << (DTV_OP_SELECT_TSID - 1)) | (1u << (DTV_OP_LNA - 1)),
-     (1u << (DTV_OP_OUTPUT_PID_FILTER - 1)) |
-         (1u << (DTV_OP_TUNE_ISDB_T - 1)) | (1u << (DTV_OP_SIGNAL - 1)) |
-         (1u << (DTV_OP_SELECT_TSID - 1)) | (1u << (DTV_OP_LNA - 1)), DTV_TS_DESCRAMBLED},
-};
 inline constexpr dtv::spi::model_information::device_receiver_information scan_device_receivers[]{
     {1, true, scan_receivers, std::size(scan_receivers)},
 };
-inline constexpr dtv::spi::model_information::device_receiver_information scan_runtime_device_receivers[]{
-    {2, true, scan_receivers_second, std::size(scan_receivers_second)},
-};
-
-namespace dtv::spi {
-
-extern const ModelEntry scan_model_model{
-    .model = {"Scan Fixture", 0x1234, 0x0101},
-    .firmware = nullptr,
-    .firmware_count = 0,
-    .cold_identities = scan_identities,
-    .cold_identity_count = sizeof(scan_identities) / sizeof(scan_identities[0]),
-    .select_usb_group = select_scan_group,
-    .functions = scan_firmware_functions,
-    .function_count = std::size(scan_firmware_functions),
-    .source_stride_bytes = 188,
-    .public_open = &scan_public_open_ops,
-    .runtime_device_receivers = ::scan_runtime_device_receivers,
-    .runtime_device_receiver_count = std::size(::scan_runtime_device_receivers),
-};
-
-}
 DTV_MODEL(scanfixture, scan_model,
           DTV_FEATURES(::dtv::spi::Feature::LnbPower,
-              ::dtv::spi::Feature::OutputPidFilter, ::dtv::spi::Feature::Card),
-          DTV_FIRMWARE(scan_firmware),
+              ::dtv::spi::Feature::OutputPidFilter, ::dtv::spi::Feature::Card), DTV_NO_FIRMWARE,
           (::dtv::spi::model_information{"Scan Fixture", 0x1234, 0x0101,
                                            scan_device_receivers, std::size(scan_device_receivers)}));
 DTV_DEFINE_MODEL(scanfixture, scan_model);
-
-namespace {
-
-int32_t scan_firmware_transfer(dtv_context *context,
-    const dtv::spi::FirmwareSession *session, dtv_bytes package, dtv_error *)
-{
-    auto *state = static_cast<ScanFirmwareContext *>(context);
-    if (state == nullptr || state->io == nullptr || session == nullptr ||
-        session->device_id == 0 || session->connection_epoch == 0)
-        return DTV_ERROR_NOT_READY;
-    if (state->product_id == 0x0101 &&
-        session->initial_identity.state == DTV_IDENTIFY_RUNTIME &&
-        session->initial_identity.firmware_key == 1) return DTV_ERROR_OK;
-    if (state->io->bulk_out == nullptr || state->io->bulk_in == nullptr)
-        return DTV_ERROR_NOT_READY;
-    scan_firmware_last_device.store(session->device_id, std::memory_order_release);
-    scan_firmware_last_function.store(session->function, std::memory_order_release);
-    scan_firmware_last_epoch.store(session->connection_epoch, std::memory_order_release);
-    scan_firmware_last_handle.store(session->handle_index, std::memory_order_release);
-    auto result = state->io->bulk_out(state->io->user, 0x01, package,
-                                        dtv_timeout{1000, 0});
-    if (result.code == DTV_INTERNAL_RESULT_CANCELLED) return DTV_ERROR_CANCELLED;
-    if (result.code == DTV_INTERNAL_RESULT_TIMEOUT) return DTV_ERROR_TIMEOUT;
-    if (result.code != DTV_INTERNAL_RESULT_OK) return DTV_ERROR_USB_IO;
-    std::array<unsigned char, 2> acknowledgement{};
-    dtv_buffer reply{acknowledgement.data(), acknowledgement.size(), 0};
-    result = state->io->bulk_in(state->io->user, 0x83, &reply, dtv_timeout{1000, 0});
-    if (result.code == DTV_INTERNAL_RESULT_CANCELLED) return DTV_ERROR_CANCELLED;
-    if (result.code == DTV_INTERNAL_RESULT_TIMEOUT) return DTV_ERROR_TIMEOUT;
-    if (result.code != DTV_INTERNAL_RESULT_OK) return DTV_ERROR_USB_IO;
-    if (reply.size != acknowledgement.size() || acknowledgement[0] != 0x83 ||
-        acknowledgement[1] != 0x84) return DTV_ERROR_FIRMWARE_REJECTED;
-    state->mode = DTV_IDENTIFY_RUNTIME;
-    scan_firmware_same_id_mode.store(DTV_IDENTIFY_RUNTIME, std::memory_order_release);
-    {
-        std::lock_guard lock(scan_firmware_mutex);
-        if (std::find(scan_firmware_runtime_devices.begin(), scan_firmware_runtime_devices.end(),
-                      session->device_id) == scan_firmware_runtime_devices.end())
-            scan_firmware_runtime_devices.push_back(session->device_id);
-    }
-    return DTV_ERROR_OK;
-}
-
-}
-
-extern "C" int32_t dtv_model_impl_send_firmware_scanfixture_scan_model(
-    dtv_device *device, const uint8_t *firmware, uint64_t size,
-    const dtv_call_options *options, dtv_error *error)
-{
-    return dtv::spi::with_firmware_session(device, {firmware, size}, options,
-        scan_firmware_transfer, error);
-}
 
 extern "C" int32_t dtv_model_impl_lnb_on_scanfixture_scan_model(
     dtv_enclosure *enclosure, const dtv_call_options *options, dtv_error *error)

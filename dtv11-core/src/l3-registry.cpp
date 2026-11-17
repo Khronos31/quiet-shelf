@@ -29,7 +29,6 @@
 #include <dtv/internal/clock.hpp>
 #include <dtv/internal/l3.hpp>
 #include <dtv/internal/ts-framer.hpp>
-#include <dtv/spi/firmware_session.hpp>
 
 #include "usb-transfer-backend.hpp"
 
@@ -87,9 +86,6 @@ std::uint32_t allocate_public_object_id()
 {
     return next_public_object_id.fetch_add(1, std::memory_order_relaxed);
 }
-
-std::uint64_t deadline_after(std::uint64_t, std::uint64_t);
-dtv_timeout remaining_timeout(const dtv_runtime_clock &, std::uint64_t);
 
 void log_capacity_overflow(std::size_t omitted, std::size_t capacity) noexcept
 {
@@ -204,7 +200,6 @@ struct EnclosureRegistry::State {
         std::uint64_t connection;
         SelectedFunction selection;
         UsbDeviceSnapshot snapshot;
-        std::uint32_t mode = DTV_DEVICE_UNKNOWN;
         std::uint32_t bus = 0;
         std::uint32_t address = 0;
         std::string port;
@@ -330,8 +325,6 @@ struct EnclosureRegistry::State {
         std::uint64_t connection;
         SelectedFunction selection;
         UsbDeviceSnapshot snapshot;
-        std::uint32_t observed_device_id = 0;
-        std::uint32_t observed_mode = DTV_DEVICE_UNKNOWN;
     };
 
     struct PreparedGroup {
@@ -428,19 +421,6 @@ struct EnclosureRegistry::State {
         return nullptr;
     }
 
-    std::shared_ptr<Root> find_device_root(const dtv_device *object) const
-    {
-        for (const auto &root : live_roots) {
-            if (root && std::any_of(root->devices.begin(), root->devices.end(),
-                    [&](const auto &device) { return &device->object == object; })) return root;
-        }
-        for (const auto &root : tombstones) {
-            if (root && std::any_of(root->devices.begin(), root->devices.end(),
-                    [&](const auto &device) { return &device->object == object; })) return root;
-        }
-        return {};
-    }
-
     Device::Receiver *find_receiver(const dtv_receiver *object) const
     {
         if (object == nullptr) return nullptr;
@@ -524,17 +504,9 @@ struct EnclosureRegistry::State {
                                                 selection.alternate_setting};
                 selected_functions.push_back(selected);
                 connections.insert(snapshot.connection_token);
-                auto prepared = PreparedDevice{snapshot.connection_token, selected, snapshot};
-                const auto mode = std::find_if(batch.device_modes.begin(), batch.device_modes.end(),
-                    [&](const auto &entry) {
-                        return entry.connection_token == snapshot.connection_token &&
-                            entry.function == selection.function;
-                    });
-                if (mode != batch.device_modes.end()) {
-                    prepared.observed_device_id = mode->device_id;
-                    prepared.observed_mode = mode->mode;
-                }
-                devices_by_function.emplace(selection.function, std::move(prepared));
+                devices_by_function.emplace(selection.function,
+                                            PreparedDevice{snapshot.connection_token, selected,
+                                                           snapshot});
             }
             std::sort(selected_functions.begin(), selected_functions.end(), function_less);
             GroupKey key{observation.product, observation.model, {}};
@@ -624,31 +596,10 @@ struct EnclosureRegistry::State {
         root->device_view.reserve(group.devices.size());
         for (auto &prepared : group.devices) {
             auto device = std::make_unique<Device>();
-            device->id = prepared.observed_device_id != 0
-                ? prepared.observed_device_id : allocate_public_object_id();
+            device->id = allocate_public_object_id();
             device->connection = prepared.connection;
             device->selection = prepared.selection;
             device->snapshot = std::move(prepared.snapshot);
-            if (prepared.observed_mode == DTV_DEVICE_LOADER ||
-                prepared.observed_mode == DTV_DEVICE_RUNTIME) {
-                device->mode = prepared.observed_mode;
-            } else if (group.model != nullptr && group.model->discovery != nullptr) {
-                const auto &model = *group.model->discovery;
-                bool cold_identity = false;
-                for (std::size_t index = 0; index < model.cold_identity_count; ++index) {
-                    if (model.cold_identities[index].vendor_id == device->snapshot.vendor_id &&
-                        model.cold_identities[index].product_id == device->snapshot.product_id) {
-                        cold_identity = true;
-                        break;
-                    }
-                }
-                const bool runtime_identity = group.model->model != nullptr &&
-                    device->snapshot.vendor_id == group.model->model->vid &&
-                    device->snapshot.product_id == group.model->model->pid;
-                if (runtime_identity != cold_identity) {
-                    device->mode = runtime_identity ? DTV_DEVICE_RUNTIME : DTV_DEVICE_LOADER;
-                }
-            }
             device->bus = device->snapshot.bus_number;
             device->address = device->snapshot.device_address;
             if (!device->snapshot.port_path.empty()) {
@@ -897,10 +848,6 @@ struct EnclosureRegistry::State {
                         auto &device = *group.root->devices[index];
                         device.selection = group.devices[index].selection;
                         device.snapshot = std::move(group.devices[index].snapshot);
-                        if (group.devices[index].observed_mode == DTV_DEVICE_LOADER ||
-                            group.devices[index].observed_mode == DTV_DEVICE_RUNTIME) {
-                            device.mode = group.devices[index].observed_mode;
-                        }
                     }
                 }
                 group.root->status = DTV_ENCLOSURE_READY;
@@ -1591,110 +1538,6 @@ std::uint32_t EnclosureRegistry::device_id(const dtv_device *object) const
     return device ? device->id : 0;
 }
 
-std::uint32_t EnclosureRegistry::device_id_for_mode_probe(
-    std::uint64_t connection, dtv_function function) const
-{
-    std::lock_guard lock(state_->mutex);
-    const auto find = [connection, function](const auto &roots) -> std::uint32_t {
-        for (const auto &root : roots) {
-            if (!root) continue;
-            for (const auto &device : root->devices) {
-                if (device->connection == connection && device->selection.function == function)
-                    return device->id;
-            }
-        }
-        return 0;
-    };
-    const auto existing = find(state_->live_roots);
-    return existing != 0 ? existing : allocate_public_object_id();
-}
-
-dtv_internal_result EnclosureRegistry::firmware_target(const dtv_device *object,
-                                                        FirmwareTarget *out) const
-{
-    if (object == nullptr || out == nullptr) return invalid();
-    std::lock_guard lock(state_->mutex);
-    const auto root = state_->find_device_root(object);
-    const auto *device = state_->find_device(object);
-    if (!root || device == nullptr) return invalid();
-    if (root->status != DTV_ENCLOSURE_READY)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
-    *out = {&root->object, device->id, device->mode, device->connection,
-            device->selection.function, device->snapshot, root->model};
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-dtv_internal_result EnclosureRegistry::update_firmware_mode(const dtv_device *object,
-    std::uint64_t connection_epoch, std::uint32_t mode)
-{
-    if (object == nullptr || mode != DTV_DEVICE_RUNTIME) return invalid();
-    try {
-        std::lock_guard lock(state_->mutex);
-        const auto root = state_->find_device_root(object);
-        auto *device = state_->find_device(object);
-        if (!root || device == nullptr || root->status != DTV_ENCLOSURE_READY ||
-            device->connection != connection_epoch || connection_epoch == 0) {
-            return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
-        }
-        if (!device->receiver_count_known && root->model != nullptr &&
-            root->model->discovery != nullptr) {
-            const auto *declarations = root->model->discovery->runtime_device_receivers;
-            auto declaration_count = root->model->discovery->runtime_device_receiver_count;
-            if (declarations == nullptr || declaration_count == 0) {
-                if (root->model->information != nullptr) {
-                    declarations = root->model->information->device_receivers;
-                    declaration_count = root->model->information->device_receiver_count;
-                }
-            }
-            for (std::size_t declaration_index = 0;
-                 declarations != nullptr && declaration_index < declaration_count;
-                 ++declaration_index) {
-                const auto &declaration = declarations[declaration_index];
-                if (declaration.function != device->selection.function) continue;
-                if (!declaration.receiver_count_known) break;
-                if (state_->before_receiver_allocation) state_->before_receiver_allocation();
-                std::vector<std::unique_ptr<State::Device::Receiver>> receivers;
-                std::vector<dtv_receiver *> view;
-                receivers.reserve(declaration.receiver_count);
-                view.reserve(declaration.receiver_count + 1);
-                for (std::size_t index = 0; index < declaration.receiver_count; ++index) {
-                    const auto &metadata = declaration.receivers[index];
-                    auto receiver = std::make_unique<State::Device::Receiver>();
-                    receiver->index = metadata.index;
-                    receiver->local_index = metadata.local_index;
-                    receiver->systems = metadata.systems;
-                    receiver->source_stride_bytes = metadata.source_stride_bytes;
-                    receiver->source_sync_offset_bytes = metadata.source_sync_offset_bytes;
-                    receiver->known_operations = metadata.known_operations;
-                    receiver->supported_operations = metadata.supported_operations;
-                    receiver->ts_scrambling = metadata.ts_scrambling;
-                    view.push_back(&receiver->object);
-                    receivers.push_back(std::move(receiver));
-                }
-                view.push_back(nullptr);
-                device->receivers.swap(receivers);
-                device->public_receiver_view.swap(view);
-                device->receiver_count_known = true;
-                break;
-            }
-        }
-        device->mode = mode;
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    } catch (...) {
-        return exception_result();
-    }
-}
-
-bool EnclosureRegistry::firmware_target_current(const dtv_device *object,
-                                                std::uint64_t connection_epoch) const
-{
-    std::lock_guard lock(state_->mutex);
-    const auto root = state_->find_device_root(object);
-    const auto *device = state_->find_device(object);
-    return root && device != nullptr && root->status == DTV_ENCLOSURE_READY &&
-           device->connection == connection_epoch && connection_epoch != 0;
-}
-
 dtv_receiver *const *EnclosureRegistry::receiver_list(const dtv_device *object) const
 {
     std::lock_guard lock(state_->mutex);
@@ -2343,11 +2186,6 @@ dtv_internal_result DiscoverySession::refresh(CompleteGroupBatch batch,
     return registry_->refresh(std::move(batch), &selection);
 }
 
-dtv_internal_result DiscoverySession::scan_for_modes(CompleteGroupBatch *out)
-{
-    return scan_loaded_product_groups(context_, out);
-}
-
 dtv_internal_result DiscoverySession::scan_with_token_callback(
     dtv_token_of_callback callback, void *user, CompleteGroupBatch *out)
 {
@@ -2384,13 +2222,6 @@ dtv_internal_result DiscoverySession::acquire_claims(
     const dtv_cancel *cancel, std::uint64_t deadline, UsbClaimLeaseGroup *out) const
 {
     return context_.acquire_claims(inputs, clock, cancel, deadline, out);
-}
-
-std::unique_ptr<UsbDevice> DiscoverySession::open_device(
-    const UsbDeviceSnapshot &snapshot, std::span<const UsbInterfaceClaim> interfaces,
-    const dtv_runtime_clock *clock) const
-{
-    return context_.open(snapshot, interfaces, clock);
 }
 
 namespace {
@@ -2849,133 +2680,8 @@ struct PublicDiscoveryState {
     dtv_internal_result refresh()
     {
         if (scan_error_for_test) return session.fail_scan_for_test(*scan_error_for_test);
-        if (registry.resource_limited()) return session.refresh();
-        if (synthetic_batch) {
-            auto batch = *synthetic_batch;
-            observe_modes(batch);
-            return session.refresh(std::move(batch));
-        }
-        CompleteGroupBatch batch;
-        const auto scanned = session.scan_for_modes(&batch);
-        if (scanned.code != DTV_INTERNAL_RESULT_OK) return session.fail_scan_for_test(scanned);
-        observe_modes(batch);
-        return session.refresh(std::move(batch));
-    }
-
-    void observe_modes(CompleteGroupBatch &batch)
-    {
-        const auto *clock = system_runtime_clock();
-        if (clock == nullptr || clock->monotonic_now_ns == nullptr) return;
-        const auto deadline = deadline_after(clock->monotonic_now_ns(clock->user), 1000);
-        for (const auto &group : batch.groups) {
-            if (group.model == nullptr || group.model->discovery == nullptr ||
-                group.model->model == nullptr) continue;
-            const auto &model = *group.model->discovery;
-            if (model.functions == nullptr) continue;
-            for (const auto &selection : group.functions) {
-                if (selection.candidate_index >= batch.snapshots.size()) continue;
-                const auto &snapshot = batch.snapshots[selection.candidate_index];
-                const bool runtime_identity = snapshot.vendor_id == group.model->model->vid &&
-                    snapshot.product_id == group.model->model->pid;
-                const bool cold_identity = model.cold_identity_count != 0 &&
-                    model.cold_identities != nullptr && std::any_of(model.cold_identities,
-                    model.cold_identities + model.cold_identity_count, [&](const auto &identity) {
-                        return identity.vendor_id == snapshot.vendor_id &&
-                            identity.product_id == snapshot.product_id;
-                    });
-                if (!runtime_identity || !cold_identity ||
-                    clock->monotonic_now_ns(clock->user) >= deadline) continue;
-                const auto entry = std::find_if(model.functions,
-                    model.functions + model.function_count, [&](const auto &candidate) {
-                        return candidate.function == selection.function;
-                    });
-                if (entry == model.functions + model.function_count || entry->bootstrap_ops == nullptr ||
-                    entry->bootstrap_ops->open == nullptr || entry->bootstrap_ops->identify == nullptr)
-                    continue;
-                {
-                    std::lock_guard lock(open_mutex);
-                    if (claimed_connections.contains(snapshot.connection_token)) continue;
-                    claimed_connections.emplace(snapshot.connection_token, nullptr);
-                }
-                struct ReleaseProbe {
-                    PublicDiscoveryState &state;
-                    std::uint64_t connection;
-                    ~ReleaseProbe()
-                    {
-                        std::lock_guard lock(state.open_mutex);
-                        const auto found = state.claimed_connections.find(connection);
-                        if (found != state.claimed_connections.end() && found->second == nullptr)
-                            state.claimed_connections.erase(found);
-                    }
-                } release{*this, snapshot.connection_token};
-                UsbOperationScope probe_scope(clock, nullptr, deadline);
-                const std::array<UsbInterfaceClaim, 1> interfaces{{
-                    {selection.interface_number, selection.alternate_setting}}};
-                auto usb = session.open_device(snapshot, interfaces, clock);
-                if (!usb || usb->result().code != DTV_INTERNAL_RESULT_OK ||
-                    clock->monotonic_now_ns(clock->user) >= deadline) continue;
-                const auto create = entry->create_state != nullptr ? entry->create_state : model.create_state;
-                const auto destroy = entry->destroy_state != nullptr ? entry->destroy_state : model.destroy_state;
-                if (create == nullptr || destroy == nullptr) continue;
-                const auto call = [](auto &&callback) {
-                    try { return callback(); }
-                    catch (...) { return dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0); }
-                };
-                dtv_context *context = nullptr;
-                const auto device_id = registry.device_id_for_mode_probe(
-                    snapshot.connection_token, selection.function);
-                auto result = call([&] { return create(device_id, &context); });
-                if (result.code != DTV_INTERNAL_RESULT_OK || context == nullptr) {
-                    if (context != nullptr) destroy(context);
-                    continue;
-                }
-                std::vector<dtv_usb_interface_info> interface_observations;
-                for (const auto &interface : snapshot.interfaces) {
-                    auto observation = interface.info;
-                    observation.endpoints = interface.endpoints.data();
-                    observation.endpoint_count = static_cast<std::uint32_t>(interface.endpoints.size());
-                    interface_observations.push_back(observation);
-                }
-                const dtv_usb_candidate_info usb_observation{snapshot.candidate_id,
-                    snapshot.vendor_id, snapshot.product_id, snapshot.device_version,
-                    snapshot.bus_number, snapshot.device_address, snapshot.port_path.data(),
-                    static_cast<std::uint32_t>(snapshot.port_path.size()), interface_observations.data(),
-                    static_cast<std::uint32_t>(interface_observations.size())};
-                dtv_open_args args{};
-                args.model = &model.model;
-                args.function = selection.function;
-                args.timeout = remaining_timeout(*clock, deadline);
-                args.usb_observation = &usb_observation;
-                args.interface_number = selection.interface_number;
-                args.alternate_setting = selection.alternate_setting;
-                const dtv_usb_io *io = usb->io();
-                result = call([&] { return entry->bootstrap_ops->open(context, io, &args); });
-                std::uint32_t observed_mode = DTV_DEVICE_UNKNOWN;
-                auto close_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-                if (result.code == DTV_INTERNAL_RESULT_OK) {
-                    if (clock->monotonic_now_ns(clock->user) < deadline) {
-                        dtv_identify_info identity{};
-                        identity.state = DTV_IDENTIFY_UNKNOWN;
-                        result = call([&] { return entry->bootstrap_ops->identify(
-                            context, &identity, remaining_timeout(*clock, deadline)); });
-                        if (result.code == DTV_INTERNAL_RESULT_OK) {
-                            if (identity.state == DTV_IDENTIFY_LOADER)
-                                observed_mode = DTV_DEVICE_LOADER;
-                            if (identity.state == DTV_IDENTIFY_RUNTIME)
-                                observed_mode = DTV_DEVICE_RUNTIME;
-                        }
-                    }
-                    close_result = call([&] { return entry->bootstrap_ops->close == nullptr
-                        ? dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0)
-                        : entry->bootstrap_ops->close(context, remaining_timeout(*clock, deadline)); });
-                }
-                destroy(context);
-                if (observed_mode != DTV_DEVICE_UNKNOWN &&
-                    close_result.code == DTV_INTERNAL_RESULT_OK)
-                    batch.device_modes.push_back({snapshot.connection_token, selection.function,
-                                                  device_id, observed_mode});
-            }
-        }
+        if (synthetic_batch) return session.refresh(*synthetic_batch);
+        return session.refresh();
     }
 
     ProductView &product_view(const char *product_id)
@@ -6122,7 +5828,6 @@ dtv_enclosure *const *list_enclosures_by_tokens(
             set_public_error(error, DTV_ERROR_NOT_FOUND, "requested token was not found");
             return nullptr;
         }
-        state.observe_modes(batch);
         result = observe_loaded_product_groups(std::move(selection.snapshots), &selection);
         if (result.code != DTV_INTERNAL_RESULT_OK) {
             state.session.fail_scan_for_test(result);
@@ -7028,674 +6733,7 @@ extern "C" const char *dtv_get_port(dtv_device *object)
     try { return public_discovery_state().registry.port(object); }
     catch (...) { return nullptr; }
 }
-
-namespace {
-
-struct FirmwareRuntimeIo {
-    std::shared_ptr<EnclosureRuntime> runtime;
-    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
-    std::shared_ptr<PublicDiscoveryState::OpenSlot::OperationControl> operation;
-    const dtv_runtime_clock *clock = nullptr;
-    EnclosureRegistry *registry = nullptr;
-    dtv_device *device = nullptr;
-    std::size_t handle_index = 0;
-    std::uint64_t generation = 0;
-    std::uint64_t deadline = UINT64_MAX;
-};
-
-dtv_internal_result firmware_runtime_transfer(FirmwareRuntimeIo *bridge, bool output,
-    std::uint8_t endpoint, dtv_bytes bytes, dtv_buffer *buffer, dtv_timeout timeout)
-{
-    if (bridge == nullptr || !bridge->runtime || !bridge->slot || !bridge->operation ||
-        bridge->clock == nullptr || bridge->clock->monotonic_now_ns == nullptr || endpoint == 0)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    if (bridge->registry == nullptr ||
-        !bridge->registry->firmware_target_current(bridge->device, bridge->generation))
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
-    if (bridge->operation->cancelled.load(std::memory_order_acquire))
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
-    if (bridge->slot->cancelled.load(std::memory_order_acquire))
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
-    if ((output && bytes.size != 0 && bytes.data == nullptr) ||
-        (!output && (buffer == nullptr || buffer->size > buffer->capacity ||
-                     (buffer->capacity != 0 && buffer->data == nullptr))))
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    auto deadline = bridge->deadline;
-    if (timeout.operation_deadline_ns != 0) deadline = (std::min)(deadline,
-        timeout.operation_deadline_ns);
-    if (timeout.timeout_ms != 0) deadline = (std::min)(deadline,
-        deadline_after(bridge->clock->monotonic_now_ns(bridge->clock->user), timeout.timeout_ms));
-    std::uint64_t request = 0;
-    auto result = output
-        ? bridge->runtime->submit_bulk_out(bridge->handle_index, endpoint,
-            {bytes.data, static_cast<std::size_t>(bytes.size)}, bridge->generation,
-            bridge->clock, nullptr, deadline, &request)
-        : bridge->runtime->submit_bulk_in(bridge->handle_index, endpoint, buffer->capacity,
-            bridge->generation, bridge->clock, nullptr, deadline, &request);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    {
-        std::lock_guard lock(bridge->slot->mutex);
-        bridge->slot->requests.push_back(request);
-    }
-    auto remove_request = [&] {
-        std::lock_guard lock(bridge->slot->mutex);
-        const auto found = std::find(bridge->slot->requests.begin(),
-                                     bridge->slot->requests.end(), request);
-        if (found != bridge->slot->requests.end()) bridge->slot->requests.erase(found);
-    };
-    for (;;) {
-        if (bridge->operation->cancelled.load(std::memory_order_acquire))
-            (void)bridge->runtime->cancel(request);
-        auto wait_deadline = deadline;
-        if (wait_deadline == UINT64_MAX || wait_deadline >
-            bridge->clock->monotonic_now_ns(bridge->clock->user) + UINT64_C(10000000))
-            wait_deadline = bridge->clock->monotonic_now_ns(bridge->clock->user) + UINT64_C(10000000);
-        UsbRuntimeTerminal terminal{};
-        result = bridge->runtime->wait_request(request, bridge->clock, wait_deadline, &terminal);
-        if (result.code == DTV_INTERNAL_RESULT_TIMEOUT && wait_deadline != deadline) continue;
-        if (result.code != DTV_INTERNAL_RESULT_OK) {
-            if (result.code == DTV_INTERNAL_RESULT_TIMEOUT ||
-                bridge->operation->cancelled.load(std::memory_order_acquire))
-                (void)bridge->runtime->cancel(request);
-            if (result.code == DTV_INTERNAL_RESULT_TIMEOUT && wait_deadline == deadline) {
-                UsbRuntimeTerminal retired{};
-                (void)bridge->runtime->wait_request(request, bridge->clock, UINT64_MAX, &retired);
-            }
-            UsbRuntimeCompletion ignored;
-            bool available = false;
-            (void)bridge->runtime->take_completion(request, &ignored, &available);
-            remove_request();
-            return result;
-        }
-        UsbRuntimeCompletion completion;
-        bool available = false;
-        result = bridge->runtime->take_completion(request, &completion, &available);
-        remove_request();
-        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-        if (!available) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0);
-        if (completion.terminal != UsbRuntimeTerminal::completed) return completion.result;
-        if (output) {
-            return completion.actual_length == bytes.size
-                ? dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0)
-                : dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO,
-                    static_cast<std::uint32_t>(completion.actual_length));
-        }
-        if (completion.actual_length > buffer->capacity)
-            return dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
-        std::copy_n(completion.bytes.data(), completion.actual_length, buffer->data);
-        buffer->size = completion.actual_length;
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    }
-}
-
-dtv_internal_result firmware_runtime_bulk_out(void *user, std::uint8_t endpoint,
-    dtv_bytes bytes, dtv_timeout timeout)
-{
-    return firmware_runtime_transfer(static_cast<FirmwareRuntimeIo *>(user), true,
-                                     endpoint, bytes, nullptr, timeout);
-}
-
-dtv_internal_result firmware_runtime_bulk_in(void *user, std::uint8_t endpoint,
-    dtv_buffer *buffer, dtv_timeout timeout)
-{
-    return firmware_runtime_transfer(static_cast<FirmwareRuntimeIo *>(user), false,
-        endpoint, dtv_bytes{}, buffer, timeout);
-}
-
-dtv_internal_result firmware_runtime_unsupported(void *, std::uint8_t, std::uint8_t,
-    std::uint16_t, std::uint16_t, dtv_buffer *, dtv_timeout)
-{
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-}
-
-dtv_internal_result firmware_runtime_interrupt_in(void *, std::uint8_t, dtv_buffer *, dtv_timeout)
-{
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-}
-
-struct FirmwareLimitedIo {
-    const dtv_usb_io *base = nullptr;
-    const dtv_runtime_clock *clock = nullptr;
-    EnclosureRegistry *registry = nullptr;
-    dtv_device *device = nullptr;
-    std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
-    std::shared_ptr<PublicDiscoveryState::OpenSlot::OperationControl> operation;
-    std::uint64_t connection_epoch = 0;
-    std::uint64_t deadline = UINT64_MAX;
-    dtv_runtime_clock clock_view{};
-};
-
-dtv_internal_result firmware_clock_delay(void *user, std::uint64_t deadline,
-    std::uint64_t timeout_ms, const dtv_cancel *, std::uint32_t *cancelled)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    if (limited == nullptr || limited->clock == nullptr || limited->clock->delay_until == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-    return limited->clock->delay_until(limited->clock->user, deadline, timeout_ms, nullptr,
-                                       cancelled);
-}
-
-std::uint64_t firmware_clock_now(void *user)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    return limited == nullptr || limited->clock == nullptr ||
-        limited->clock->monotonic_now_ns == nullptr
-        ? 0 : limited->clock->monotonic_now_ns(limited->clock->user);
-}
-
-dtv_internal_result firmware_clock_cancelled(void *user, const dtv_cancel *,
-                                             std::uint32_t *cancelled)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    if (limited == nullptr || cancelled == nullptr || !limited->operation)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    *cancelled = limited->operation->cancelled.load(std::memory_order_acquire) ||
-        (limited->slot && limited->slot->cancelled.load(std::memory_order_acquire)) ? 1u : 0u;
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-dtv_internal_result firmware_limited_timeout(FirmwareLimitedIo *limited, dtv_timeout timeout,
-                                              dtv_timeout *out)
-{
-    if (limited == nullptr || out == nullptr || limited->clock == nullptr ||
-        limited->clock->monotonic_now_ns == nullptr ||
-        !limited->registry->firmware_target_current(limited->device,
-                                                     limited->connection_epoch))
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_DISCONNECTED, 0);
-    if ((limited->operation && limited->operation->cancelled.load(std::memory_order_acquire)) ||
-        (limited->slot && limited->slot->cancelled.load(std::memory_order_acquire)))
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
-    const auto now = limited->clock->monotonic_now_ns(limited->clock->user);
-    if (limited->deadline != UINT64_MAX && now >= limited->deadline)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0);
-    auto deadline = limited->deadline;
-    if (timeout.operation_deadline_ns != 0)
-        deadline = (std::min)(deadline, timeout.operation_deadline_ns);
-    if (timeout.timeout_ms != 0)
-        deadline = (std::min)(deadline, deadline_after(now, timeout.timeout_ms));
-    *out = remaining_timeout(*limited->clock, deadline);
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
-dtv_internal_result firmware_limited_control(void *user, std::uint8_t request_type,
-    std::uint8_t request, std::uint16_t value, std::uint16_t index, dtv_buffer *buffer,
-    dtv_timeout timeout)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    if (limited == nullptr || limited->base == nullptr || limited->base->control == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-    dtv_timeout bounded{};
-    auto result = firmware_limited_timeout(limited, timeout, &bounded);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    const auto *cancel = reinterpret_cast<const dtv_cancel *>(limited->operation.get());
-    UsbOperationScope scope(&limited->clock_view, cancel, bounded.operation_deadline_ns);
-    return limited->base->control(limited->base->user, request_type, request, value, index,
-                                  buffer, bounded);
-}
-
-dtv_internal_result firmware_limited_bulk_out(void *user, std::uint8_t endpoint,
-    dtv_bytes bytes, dtv_timeout timeout)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    if (limited == nullptr || limited->base == nullptr || limited->base->bulk_out == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-    dtv_timeout bounded{};
-    auto result = firmware_limited_timeout(limited, timeout, &bounded);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    const auto *cancel = reinterpret_cast<const dtv_cancel *>(limited->operation.get());
-    UsbOperationScope scope(&limited->clock_view, cancel, bounded.operation_deadline_ns);
-    return limited->base->bulk_out(limited->base->user, endpoint, bytes, bounded);
-}
-
-dtv_internal_result firmware_limited_bulk_in(void *user, std::uint8_t endpoint,
-    dtv_buffer *buffer, dtv_timeout timeout)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    if (limited == nullptr || limited->base == nullptr || limited->base->bulk_in == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-    dtv_timeout bounded{};
-    auto result = firmware_limited_timeout(limited, timeout, &bounded);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    const auto *cancel = reinterpret_cast<const dtv_cancel *>(limited->operation.get());
-    UsbOperationScope scope(&limited->clock_view, cancel, bounded.operation_deadline_ns);
-    return limited->base->bulk_in(limited->base->user, endpoint, buffer, bounded);
-}
-
-dtv_internal_result firmware_limited_interrupt_in(void *user, std::uint8_t endpoint,
-    dtv_buffer *buffer, dtv_timeout timeout)
-{
-    auto *limited = static_cast<FirmwareLimitedIo *>(user);
-    if (limited == nullptr || limited->base == nullptr || limited->base->interrupt_in == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
-    dtv_timeout bounded{};
-    auto result = firmware_limited_timeout(limited, timeout, &bounded);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    const auto *cancel = reinterpret_cast<const dtv_cancel *>(limited->operation.get());
-    UsbOperationScope scope(&limited->clock_view, cancel, bounded.operation_deadline_ns);
-    return limited->base->interrupt_in(limited->base->user, endpoint, buffer, bounded);
-}
-
-int32_t run_firmware_session(dtv_device *object, dtv_bytes package,
-    const dtv_call_options *options, dtv::spi::FirmwarePackageTransfer transfer,
-    dtv_error *error)
-{
-    auto &state = public_discovery_state();
-    dtv::internal::FirmwareTarget target;
-    auto result = state.registry.firmware_target(object, &target);
-    if (result.code != DTV_INTERNAL_RESULT_OK) {
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-    if (target.mode == DTV_DEVICE_UNKNOWN) {
-        set_public_error(error, DTV_ERROR_NOT_READY);
-        return DTV_ERROR_NOT_READY;
-    }
-    if (package.data == nullptr || package.size == 0 || transfer == nullptr ||
-        (options != nullptr && options->struct_size < sizeof(*options))) {
-        set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
-        return DTV_ERROR_INVALID_ARGUMENT;
-    }
-    auto *clock = system_runtime_clock();
-    if (clock == nullptr || clock->monotonic_now_ns == nullptr) {
-        set_public_error(error, DTV_ERROR_INTERNAL);
-        return DTV_ERROR_INTERNAL;
-    }
-    const auto deadline = deadline_after(clock->monotonic_now_ns(clock->user),
-        options == nullptr ? 0 : options->timeout_ms);
-    if (!state.registry.hold(target.enclosure)) {
-        set_public_error(error, DTV_ERROR_NOT_READY);
-        return DTV_ERROR_NOT_READY;
-    }
-    struct DropHold {
-        EnclosureRegistry &registry;
-        dtv_enclosure *enclosure;
-        ~DropHold() { (void)registry.drop(enclosure); }
-    } drop{state.registry, target.enclosure};
-
-    EnclosureOpenDescription description{};
-    result = state.registry.open_description(target.enclosure, &description);
-    if (result.code != DTV_INTERNAL_RESULT_OK) {
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-    if (description.model == nullptr || description.model->functions == nullptr) {
-        set_public_error(error, DTV_ERROR_UNSUPPORTED);
-        return DTV_ERROR_UNSUPPORTED;
-    }
-    const dtv::spi::FunctionEntry *function = nullptr;
-    for (std::size_t index = 0; index < description.model->function_count; ++index) {
-        if (description.model->functions[index].function == target.function) {
-            function = &description.model->functions[index];
-            break;
-        }
-    }
-    if (function == nullptr || function->bootstrap_ops == nullptr ||
-        function->bootstrap_ops->open == nullptr || function->bootstrap_ops->identify == nullptr) {
-        set_public_error(error, DTV_ERROR_UNSUPPORTED);
-        return DTV_ERROR_UNSUPPORTED;
-    }
-    std::size_t handle_index = description.inputs.size();
-    for (std::size_t index = 0; index < description.inputs.size(); ++index) {
-        if (description.inputs[index].connection_epoch == target.connection_epoch) {
-            handle_index = index;
-            break;
-        }
-    }
-    if (handle_index == description.inputs.size()) {
-        set_public_error(error, DTV_ERROR_DISCONNECTED);
-        return DTV_ERROR_DISCONNECTED;
-    }
-
-    std::vector<std::uint64_t> reserved_connections;
-    std::shared_ptr<PublicDiscoveryState::OpenSlot> opened_slot;
-    bool use_open_runtime = false;
-    bool temporary_slot = false;
-    {
-        std::lock_guard lock(state.open_mutex);
-        const auto opened = state.open_slots.find(target.enclosure);
-        if (opened != state.open_slots.end()) {
-            std::lock_guard slot_lock(opened->second->mutex);
-            if (opened->second->phase != PublicDiscoveryState::OpenSlot::Phase::open) {
-                set_public_error(error, DTV_ERROR_BUSY);
-                return DTV_ERROR_BUSY;
-            }
-            opened_slot = opened->second;
-            if (!opened_slot->runtime) {
-                set_public_error(error, DTV_ERROR_BUSY);
-                return DTV_ERROR_BUSY;
-            }
-            use_open_runtime = true;
-        } else {
-            for (const auto &input : description.inputs) {
-                if (state.claimed_connections.contains(input.connection_epoch)) {
-                    set_public_error(error, DTV_ERROR_BUSY);
-                    return DTV_ERROR_BUSY;
-                }
-            }
-            try {
-                reserved_connections.reserve(description.inputs.size());
-                for (const auto &input : description.inputs) {
-                    state.claimed_connections.emplace(input.connection_epoch, target.enclosure);
-                    reserved_connections.push_back(input.connection_epoch);
-                }
-                opened_slot = std::make_shared<PublicDiscoveryState::OpenSlot>();
-                state.open_slots.emplace(target.enclosure, opened_slot);
-                temporary_slot = true;
-            } catch (...) {
-                for (const auto connection : reserved_connections)
-                    state.claimed_connections.erase(connection);
-                state.open_slots.erase(target.enclosure);
-                set_public_error(error, DTV_ERROR_RESOURCE_LIMIT);
-                return DTV_ERROR_RESOURCE_LIMIT;
-            }
-        }
-    }
-    struct ReleaseReservations {
-        PublicDiscoveryState &state;
-        std::vector<std::uint64_t> &connections;
-        ~ReleaseReservations()
-        {
-            std::lock_guard lock(state.open_mutex);
-            for (const auto connection : connections) state.claimed_connections.erase(connection);
-        }
-    } release{state, reserved_connections};
-    struct ReleaseTemporarySlot {
-        PublicDiscoveryState &state;
-        dtv_enclosure *enclosure;
-        std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
-        bool active;
-        ~ReleaseTemporarySlot()
-        {
-            if (!active) return;
-            std::lock_guard lock(state.open_mutex);
-            const auto found = state.open_slots.find(enclosure);
-            if (found != state.open_slots.end() && found->second == slot)
-                state.open_slots.erase(found);
-        }
-    } release_temporary_slot{state, target.enclosure, opened_slot, temporary_slot};
-
-    std::shared_ptr<PublicDiscoveryState::OpenSlot::OperationControl> operation;
-    if (opened_slot) {
-        try {
-            operation = std::make_shared<PublicDiscoveryState::OpenSlot::OperationControl>();
-        } catch (...) {
-            set_public_error(error, DTV_ERROR_RESOURCE_LIMIT);
-            return DTV_ERROR_RESOURCE_LIMIT;
-        }
-        operation->target_kind = dtv::spi::PublicOperationTargetKind::enclosure;
-        operation->target_id = state.registry.enclosure_id(target.enclosure);
-        {
-            std::lock_guard lock(opened_slot->operation_mutex);
-            if (opened_slot->operation_closing || opened_slot->next_operation_id == 0) {
-                set_public_error(error, DTV_ERROR_NOT_READY);
-                return DTV_ERROR_NOT_READY;
-            }
-            const auto free = std::find(opened_slot->operations.begin(), opened_slot->operations.end(), nullptr);
-            if (free == opened_slot->operations.end()) {
-                set_public_error(error, DTV_ERROR_RESOURCE_LIMIT);
-                return DTV_ERROR_RESOURCE_LIMIT;
-            }
-            operation->id = opened_slot->next_operation_id++;
-            *free = operation;
-        }
-        for (;;) {
-            std::unique_lock lock(opened_slot->operation_mutex);
-            if (operation->cancelled.load(std::memory_order_acquire) || opened_slot->operation_closing) {
-                operation->caller_done = true;
-                for (auto &entry : opened_slot->operations) if (entry == operation) entry.reset();
-                opened_slot->operation_condition.notify_all();
-                set_public_error(error, DTV_ERROR_CANCELLED);
-                return DTV_ERROR_CANCELLED;
-            }
-            bool blocked = false;
-            for (const auto &other : opened_slot->operations) {
-                if (other && other != operation && operation_conflicts(*operation, *other) &&
-                    (other->admitted || other->id < operation->id)) {
-                    blocked = true;
-                    break;
-                }
-            }
-            if (!blocked) {
-                operation->admitted = true;
-                break;
-            }
-            if (deadline != UINT64_MAX && clock->monotonic_now_ns(clock->user) >= deadline) {
-                operation->caller_done = true;
-                for (auto &entry : opened_slot->operations) if (entry == operation) entry.reset();
-                opened_slot->operation_condition.notify_all();
-                set_public_error(error, DTV_ERROR_TIMEOUT);
-                return DTV_ERROR_TIMEOUT;
-            }
-            opened_slot->operation_condition.wait_for(lock, std::chrono::milliseconds(2));
-        }
-    }
-    struct ReleaseOperation {
-        std::shared_ptr<PublicDiscoveryState::OpenSlot> slot;
-        std::shared_ptr<PublicDiscoveryState::OpenSlot::OperationControl> operation;
-        ~ReleaseOperation()
-        {
-            if (!slot || !operation) return;
-            std::lock_guard lock(slot->operation_mutex);
-            operation->caller_done = true;
-            for (auto &entry : slot->operations) if (entry == operation) entry.reset();
-            slot->operation_condition.notify_all();
-        }
-    } release_operation{opened_slot, operation};
-
-    if (!state.registry.firmware_target_current(object, target.connection_epoch)) {
-        set_public_error(error, DTV_ERROR_DISCONNECTED);
-        return DTV_ERROR_DISCONNECTED;
-    }
-    auto &input = description.inputs[handle_index];
-    std::unique_ptr<UsbDevice> usb;
-    std::shared_ptr<EnclosureRuntime> runtime;
-    FirmwareRuntimeIo runtime_bridge;
-    FirmwareLimitedIo limited_bridge;
-    dtv_usb_io runtime_io{};
-    const dtv_usb_io *io = nullptr;
-    if (use_open_runtime) {
-        {
-            std::lock_guard lock(opened_slot->mutex);
-            if (opened_slot->phase != PublicDiscoveryState::OpenSlot::Phase::open ||
-                !opened_slot->runtime) {
-                set_public_error(error, DTV_ERROR_NOT_READY);
-                return DTV_ERROR_NOT_READY;
-            }
-            runtime = opened_slot->runtime;
-        }
-        runtime_bridge = {runtime, opened_slot, operation, clock, &state.registry, object,
-                          handle_index, target.connection_epoch, deadline};
-        runtime_io = {&runtime_bridge, firmware_runtime_unsupported,
-            firmware_runtime_bulk_out, firmware_runtime_bulk_in,
-            firmware_runtime_interrupt_in, clock};
-        io = &runtime_io;
-    } else {
-        usb = state.session.open_device(input.snapshot, input.interfaces, clock);
-        if (!usb || usb->result().code != DTV_INTERNAL_RESULT_OK) {
-            result = usb ? usb->result() : dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
-            const auto code = result.code == DTV_INTERNAL_RESULT_USB_IO &&
-                    result.detail == static_cast<std::uint32_t>(-LIBUSB_ERROR_BUSY)
-                ? DTV_ERROR_BUSY : public_error_code(result);
-            set_public_error(error, code, nullptr, &result);
-            return code;
-        }
-        limited_bridge.base = usb->io();
-        limited_bridge.clock = clock;
-        limited_bridge.registry = &state.registry;
-        limited_bridge.device = object;
-        limited_bridge.slot = opened_slot;
-        limited_bridge.operation = operation;
-        limited_bridge.connection_epoch = target.connection_epoch;
-        limited_bridge.deadline = deadline;
-        limited_bridge.clock_view = {&limited_bridge, firmware_clock_now,
-            firmware_clock_delay, firmware_clock_cancelled};
-        runtime_io = {&limited_bridge, firmware_limited_control,
-            firmware_limited_bulk_out, firmware_limited_bulk_in,
-            firmware_limited_interrupt_in, &limited_bridge.clock_view};
-        io = &runtime_io;
-    }
-    dtv_context *context = nullptr;
-    const auto create = function->create_state != nullptr
-        ? function->create_state : description.model->create_state;
-    const auto destroy = function->destroy_state != nullptr
-        ? function->destroy_state : description.model->destroy_state;
-    if (create == nullptr || destroy == nullptr) {
-        set_public_error(error, DTV_ERROR_UNSUPPORTED);
-        return DTV_ERROR_UNSUPPORTED;
-    }
-    result = create(target.device_id, &context);
-    if (result.code != DTV_INTERNAL_RESULT_OK || context == nullptr) {
-        const auto code = public_error_code(result.code == DTV_INTERNAL_RESULT_OK
-            ? dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0) : result);
-        set_public_error(error, code, nullptr, &result);
-        if (context != nullptr) destroy(context);
-        return code;
-    }
-    struct DestroyContext {
-        void (*destroy)(dtv_context *);
-        dtv_context *context;
-        ~DestroyContext() { if (context != nullptr) destroy(context); }
-    } destroy_context{destroy, context};
-
-    const dtv_timeout timeout = remaining_timeout(*clock, deadline);
-    dtv_open_args open_args{};
-    std::vector<dtv_usb_interface_info> interface_observations;
-    interface_observations.reserve(input.snapshot.interfaces.size());
-    for (const auto &interface : input.snapshot.interfaces) {
-        auto observation = interface.info;
-        observation.endpoints = interface.endpoints.data();
-        observation.endpoint_count = static_cast<std::uint32_t>(interface.endpoints.size());
-        interface_observations.push_back(observation);
-    }
-    const dtv_usb_candidate_info usb_observation{input.snapshot.candidate_id,
-        input.snapshot.vendor_id, input.snapshot.product_id, input.snapshot.device_version,
-        input.snapshot.bus_number, input.snapshot.device_address,
-        input.snapshot.port_path.data(), static_cast<std::uint32_t>(input.snapshot.port_path.size()),
-        interface_observations.data(), static_cast<std::uint32_t>(interface_observations.size())};
-    open_args.model = &description.model->model;
-    open_args.function = target.function;
-    open_args.timeout = timeout;
-    open_args.usb_observation = &usb_observation;
-    open_args.interface_number = input.interfaces.empty() ? 0 : input.interfaces.front().interface_number;
-    open_args.alternate_setting = input.interfaces.empty() ? 0 : input.interfaces.front().alternate_setting;
-    result = call_callback([&] { return function->bootstrap_ops->open(
-        context, io, &open_args); });
-    if (result.code != DTV_INTERNAL_RESULT_OK) {
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-    struct CloseContext {
-        const dtv::spi::DeviceOps *ops;
-        dtv_context *context;
-        const dtv_runtime_clock *clock;
-        std::uint64_t deadline;
-        bool opened;
-        ~CloseContext()
-        {
-            if (opened && ops != nullptr && ops->close != nullptr)
-                (void)call_callback([&] { return ops->close(context,
-                    remaining_timeout(*clock, deadline)); });
-        }
-    } close_context{function->bootstrap_ops, context, clock, deadline, true};
-    dtv_identify_info identity{};
-    identity.state = DTV_IDENTIFY_UNKNOWN;
-    result = call_callback([&] { return function->bootstrap_ops->identify(
-        context, &identity, remaining_timeout(*clock, deadline)); });
-    if (result.code != DTV_INTERNAL_RESULT_OK ||
-        (target.mode == DTV_DEVICE_LOADER && identity.state != DTV_IDENTIFY_LOADER) ||
-        (target.mode == DTV_DEVICE_RUNTIME && identity.state != DTV_IDENTIFY_RUNTIME)) {
-        if (result.code == DTV_INTERNAL_RESULT_OK)
-            result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, identity.state);
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-    const dtv::spi::FirmwareSession session{io, target.device_id,
-        target.function, target.connection_epoch, target.mode, identity, handle_index};
-    const auto transferred = transfer(context, &session, package, error);
-    if (transferred != DTV_ERROR_OK) return transferred;
-    if ((operation && operation->cancelled.load(std::memory_order_acquire)) ||
-        (opened_slot && opened_slot->cancelled.load(std::memory_order_acquire))) {
-        set_public_error(error, DTV_ERROR_CANCELLED);
-        return DTV_ERROR_CANCELLED;
-    }
-    if (!state.registry.firmware_target_current(object, target.connection_epoch)) {
-        set_public_error(error, DTV_ERROR_DISCONNECTED);
-        return DTV_ERROR_DISCONNECTED;
-    }
-    identity = {};
-    identity.state = DTV_IDENTIFY_UNKNOWN;
-    result = call_callback([&] { return function->bootstrap_ops->identify(
-        context, &identity, remaining_timeout(*clock, deadline)); });
-    if (result.code != DTV_INTERNAL_RESULT_OK || identity.state != DTV_IDENTIFY_RUNTIME) {
-        if (result.code == DTV_INTERNAL_RESULT_OK)
-            result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, identity.state);
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-    result = state.registry.update_firmware_mode(object, target.connection_epoch,
-                                                 DTV_DEVICE_RUNTIME);
-    if (result.code != DTV_INTERNAL_RESULT_OK) {
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-    set_public_error(error, DTV_ERROR_OK);
-    return DTV_ERROR_OK;
-}
-
-}
-
-extern "C" std::uint32_t dtv_get_mode(dtv_device *object)
-{
-    try {
-        dtv::internal::FirmwareTarget target;
-        return public_discovery_state().registry.firmware_target(object, &target).code ==
-                DTV_INTERNAL_RESULT_OK
-            ? target.mode : DTV_DEVICE_UNKNOWN;
-    } catch (...) { return DTV_DEVICE_UNKNOWN; }
-}
-
-extern "C" int32_t dtv_send_firmware(dtv_device *object, const uint8_t *firmware,
-    uint64_t size, const dtv_call_options *options, dtv_error *error)
-{
-    if (object == nullptr || firmware == nullptr || size == 0 ||
-        (options != nullptr && options->struct_size < sizeof(*options))) {
-        set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
-        return DTV_ERROR_INVALID_ARGUMENT;
-    }
-    try {
-        auto &state = public_discovery_state();
-        dtv::internal::FirmwareTarget target;
-        const auto target_result = state.registry.firmware_target(object, &target);
-        if (target_result.code != DTV_INTERNAL_RESULT_OK) {
-            const auto code = public_error_code(target_result);
-            set_public_error(error, code, nullptr, &target_result);
-            return code;
-        }
-        const auto *product = target.model != nullptr && target.model->model != nullptr
-            ? target.model->model->product : nullptr;
-        const auto *model = target.model != nullptr && target.model->model != nullptr
-            ? target.model->model->name : nullptr;
-        if (product == nullptr || model == nullptr) {
-            set_public_error(error, DTV_ERROR_NOT_READY);
-            return DTV_ERROR_NOT_READY;
-        }
-        const auto result = dispatch_send_firmware(product, model, object, firmware, size,
-                                                    options, error);
-        if (result != DTV_ERROR_OK) set_public_error(error, result);
-        return result;
-    } catch (...) {
-        const auto result = exception_result();
-        const auto code = public_error_code(result);
-        set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-}
+extern "C" std::uint32_t dtv_get_mode(dtv_device *) { return DTV_DEVICE_UNKNOWN; }
 extern "C" dtv_receiver *const *dtv_get_receivers(dtv_device *object)
 {
     try { return public_discovery_state().registry.receiver_list(object); }
@@ -9414,16 +8452,6 @@ extern "C" int32_t dtv_cancel_enclosure(dtv_enclosure *object, dtv_error *error)
 void set_public_card_bgt_clock_for_test(const dtv_runtime_clock *clock)
 {
     public_card_bgt_clock_override.store(clock, std::memory_order_release);
-}
-
-}
-
-namespace dtv::spi {
-
-int32_t with_firmware_session(dtv_device *device, dtv_bytes package,
-    const dtv_call_options *options, FirmwarePackageTransfer transfer, dtv_error *error)
-{
-    return dtv::internal::run_firmware_session(device, package, options, transfer, error);
 }
 
 }

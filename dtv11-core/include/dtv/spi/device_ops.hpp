@@ -13,7 +13,6 @@
 #include <dtv/dtv.h>
 #include <dtv/internal/result.hpp>
 #include <dtv/spi/types.h>
-#include <dtv/spi/feature.hpp>
 
 namespace dtv::spi {
 
@@ -382,8 +381,6 @@ struct ModelEntry {
     std::uint16_t source_stride_bytes = 0;
     std::uint8_t source_sync_offset_bytes = 0;
     const PublicOpenOps *public_open = nullptr;
-    const model_information::device_receiver_information *runtime_device_receivers = nullptr;
-    std::size_t runtime_device_receiver_count = 0;
 };
 
 constexpr bool valid_source_metadata(const ModelEntry &model)
