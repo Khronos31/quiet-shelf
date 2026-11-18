@@ -49,6 +49,7 @@ add_library(dtv-userland STATIC
     src/cli.cpp
     src/clock.cpp
     src/discovery.cpp
+    src/discovery-json.cpp
     src/firmware.cpp
     src/l3.cpp
     src/l3-registry.cpp
@@ -58,7 +59,8 @@ add_library(dtv-userland STATIC
     src/wire-envelope.cpp
     src/wire-error-response.cpp
     src/wire-subset.cpp
-    src/wire-lnb-power.cpp)
+    src/wire-lnb-power.cpp
+    src/status-json.cpp)
 add_library(dtv::userland ALIAS dtv-userland)
 target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
@@ -95,6 +97,9 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(feature_declaration_contract tests/feature-declaration.cpp)
     target_link_libraries(feature_declaration_contract PRIVATE dtv::userland)
     add_test(NAME feature_declaration_contract COMMAND feature_declaration_contract)
+    add_executable(discovery_json_contract tests/discovery-json.cpp)
+    target_link_libraries(discovery_json_contract PRIVATE dtv::userland)
+    add_test(NAME discovery_json_contract COMMAND discovery_json_contract)
     add_executable(wire_envelope_contract tests/wire-envelope.cpp)
     target_link_libraries(wire_envelope_contract PRIVATE dtv::userland)
     add_test(NAME wire_envelope_contract COMMAND wire_envelope_contract)
@@ -107,4 +112,7 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(wire_lnb_power_contract tests/wire-lnb-power.cpp)
     target_link_libraries(wire_lnb_power_contract PRIVATE dtv::userland)
     add_test(NAME wire_lnb_power_contract COMMAND wire_lnb_power_contract)
+    add_executable(status_json_contract tests/status-json.cpp)
+    target_link_libraries(status_json_contract PRIVATE dtv::userland)
+    add_test(NAME status_json_contract COMMAND status_json_contract)
 endif()

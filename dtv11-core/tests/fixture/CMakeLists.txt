@@ -79,6 +79,10 @@ if(BUILD_TESTING)
         COMMAND ${CMAKE_COMMAND}
             "-DCLI=$<TARGET_FILE:fixturectl>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/../cli-contract.cmake")
+    add_test(NAME discovery_cli_contract
+        COMMAND ${CMAKE_COMMAND}
+            "-DCLI=$<TARGET_FILE:fixturectl>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/../discovery-cli-contract.cmake")
 endif()
 
 if(BUILD_TESTING)
