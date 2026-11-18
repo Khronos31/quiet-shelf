@@ -23,6 +23,16 @@ struct EnclosureOpenDescription {
     std::vector<dtv_function> functions;
 };
 
+struct FirmwareTarget {
+    dtv_enclosure *enclosure = nullptr;
+    std::uint32_t device_id = 0;
+    std::uint32_t mode = DTV_DEVICE_UNKNOWN;
+    std::uint64_t connection_epoch = 0;
+    dtv_function function = 0;
+    UsbDeviceSnapshot snapshot{};
+    const dtv::spi::l3_model_record *model = nullptr;
+};
+
 class EnclosureRegistry {
 public:
     struct ReceiverSignalSnapshot {
@@ -105,6 +115,10 @@ public:
     const dtv_candidate *const *candidates(const dtv_enclosure *) const;
     std::span<dtv_device *const> devices(const dtv_enclosure *) const;
     std::uint32_t device_id(const dtv_device *) const;
+    dtv_internal_result firmware_target(const dtv_device *, FirmwareTarget *) const;
+    dtv_internal_result update_firmware_mode(const dtv_device *, std::uint64_t, std::uint32_t);
+    std::uint32_t device_id_for_mode_probe(std::uint64_t, dtv_function) const;
+    bool firmware_target_current(const dtv_device *, std::uint64_t) const;
     std::uint16_t vendor_id(const dtv_device *) const;
     std::uint16_t product_id(const dtv_device *) const;
     dtv_receiver *const *receiver_list(const dtv_device *) const;
@@ -153,6 +167,7 @@ public:
     dtv_internal_result refresh();
     dtv_internal_result refresh(CompleteGroupBatch);
     dtv_internal_result refresh(CompleteGroupBatch, CompleteGroupBatch);
+    dtv_internal_result scan_for_modes(CompleteGroupBatch *);
     dtv_internal_result scan_with_token_callback(
         dtv_token_of_callback, void *, CompleteGroupBatch *);
     dtv_internal_result scan_with_fds(std::span<const std::int32_t>, CompleteGroupBatch *);
@@ -162,6 +177,8 @@ public:
     dtv_internal_result acquire_claims(std::span<const UsbClaimDeviceInput>,
                                        const dtv_runtime_clock *, const dtv_cancel *,
                                        std::uint64_t, UsbClaimLeaseGroup *) const;
+    std::unique_ptr<UsbDevice> open_device(const UsbDeviceSnapshot &,
+        std::span<const UsbInterfaceClaim>, const dtv_runtime_clock *) const;
 
 private:
     UsbContext context_;

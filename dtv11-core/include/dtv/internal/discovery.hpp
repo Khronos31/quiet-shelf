@@ -39,10 +39,18 @@ struct UngroupedObservation {
     const char *model;
 };
 
+struct DeviceModeObservation {
+    std::uint64_t connection_token;
+    dtv_function function;
+    std::uint32_t device_id;
+    std::uint32_t mode;
+};
+
 struct CompleteGroupBatch {
     std::vector<UsbDeviceSnapshot> snapshots;
     std::vector<CompleteGroupObservation> groups;
     std::vector<UngroupedObservation> ungrouped;
+    std::vector<DeviceModeObservation> device_modes;
 };
 
 dtv_internal_result check_operation_requirements(
