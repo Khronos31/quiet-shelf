@@ -5,8 +5,6 @@
 #include <csignal>
 #endif
 
-extern "C" void @PRODUCT_LOAD_SYMBOL@(void);
-
 namespace {
 
 // L3 metadata APIの結果を、CLI内で使う借用descriptorへ移す。
@@ -25,7 +23,6 @@ int main(int argc, char **argv)
         return 70;
     }
 #endif
-    @PRODUCT_LOAD_SYMBOL@();
     const dtv_cli_config config{sizeof(dtv_cli_config), "@PRODUCT_NAME@",
                                 "@PRODUCT_COMMAND@", "@PRODUCT_VERSION@",
                                 "@PRODUCT_DEFAULT_MODEL@"};

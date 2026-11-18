@@ -40,6 +40,14 @@ public:
     virtual int get_config_descriptor(libusb_device *, std::uint8_t,
                                       libusb_config_descriptor **) = 0;
     virtual void free_config_descriptor(libusb_config_descriptor *) = 0;
+    /* STRING 記述子（UTF-16LE）を生のまま読む。index=0,langid=0 は LANGID の一覧。 */
+    virtual int get_string_descriptor(libusb_device_handle *, std::uint8_t index,
+                                      std::uint16_t langid, unsigned char *data, int length,
+                                      unsigned int timeout_ms)
+    {
+        (void)index; (void)langid; (void)data; (void)length; (void)timeout_ms;
+        return LIBUSB_ERROR_NOT_SUPPORTED;
+    }
     virtual int open_device(libusb_device *, libusb_device_handle **) = 0;
     virtual int claim_interface(libusb_device_handle *, int) = 0;
     virtual int set_interface_alt_setting(libusb_device_handle *, int, int) = 0;

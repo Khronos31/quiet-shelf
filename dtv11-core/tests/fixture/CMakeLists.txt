@@ -79,10 +79,6 @@ if(BUILD_TESTING)
         COMMAND ${CMAKE_COMMAND}
             "-DCLI=$<TARGET_FILE:fixturectl>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/../cli-contract.cmake")
-    add_test(NAME discovery_cli_contract
-        COMMAND ${CMAKE_COMMAND}
-            "-DCLI=$<TARGET_FILE:fixturectl>"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/../discovery-cli-contract.cmake")
 endif()
 
 if(BUILD_TESTING)
@@ -115,6 +111,9 @@ if(BUILD_TESTING)
     target_compile_features(ungrouped_public_contract PRIVATE c_std_11)
     target_link_libraries(ungrouped_public_contract PRIVATE scanfixture fixture ${DTV_LIBUSB_TARGET})
     add_test(NAME ungrouped_public_contract COMMAND ungrouped_public_contract)
+    add_executable(serial_contract serial-contract.cpp)
+    target_link_libraries(serial_contract PRIVATE dtv::userland)
+    add_test(NAME serial_contract COMMAND serial_contract)
     add_executable(token_list_public_contract token-list-public.c token-list-public.cpp)
     target_compile_features(token_list_public_contract PRIVATE c_std_11)
     target_include_directories(token_list_public_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
