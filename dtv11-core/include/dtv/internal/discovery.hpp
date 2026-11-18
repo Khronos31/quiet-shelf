@@ -3,7 +3,6 @@
 #define DTV_INTERNAL_DISCOVERY_HPP
 
 #include <span>
-#include <string>
 #include <vector>
 
 #include <dtv/internal/usb.hpp>
@@ -32,10 +31,6 @@ struct CompleteGroupObservation {
     const dtv::spi::l3_model_record *model;
     std::uint32_t anchor_candidate_index;
     std::vector<dtv_usb_function_selection> functions;
-    /* 導出できて公開規則を満たした筐体 serial。known=false のとき空。 */
-    bool serial_known = false;
-    std::string serial;
-    std::uint32_t serial_unique = DTV_UNKNOWN;
 };
 
 struct UngroupedObservation {

@@ -2,8 +2,6 @@
 #include <dtv/internal/discovery.hpp>
 
 #include <algorithm>
-#include <array>
-#include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
@@ -76,132 +74,6 @@ dtv_internal_result invalid()
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
 }
 
-struct CandidateInfos {
-    std::vector<dtv_usb_candidate_info> values;
-    std::vector<std::unique_ptr<dtv_usb_interface_info[]>> interfaces;
-};
-
-bool build_candidate_infos(std::span<const UsbDeviceSnapshot> snapshots, CandidateInfos *out)
-{
-    out->values.assign(snapshots.size(), {});
-    out->interfaces.clear();
-    out->interfaces.reserve(snapshots.size());
-    for (std::size_t index = 0; index < snapshots.size(); ++index) {
-        const auto &snapshot = snapshots[index];
-        if (snapshot.interfaces.size() > std::numeric_limits<std::uint32_t>::max() ||
-            snapshot.port_path.size() > std::numeric_limits<std::uint32_t>::max() ||
-            snapshot.serial_utf8.size() > std::numeric_limits<std::uint32_t>::max()) {
-            return false;
-        }
-        auto &candidate = out->values[index];
-        candidate.candidate_id = snapshot.candidate_id;
-        candidate.vendor_id = snapshot.vendor_id;
-        candidate.product_id = snapshot.product_id;
-        candidate.device_version = snapshot.device_version;
-        candidate.bus_number = snapshot.bus_number;
-        candidate.device_address = snapshot.device_address;
-        candidate.port_path = snapshot.port_path.data();
-        candidate.port_path_length = static_cast<std::uint32_t>(snapshot.port_path.size());
-        candidate.interface_count = static_cast<std::uint32_t>(snapshot.interfaces.size());
-        candidate.serial_state = snapshot.serial_state;
-        if (snapshot.serial_state == DTV_USB_SERIAL_PRESENT) {
-            candidate.serial_utf8 =
-                reinterpret_cast<const std::uint8_t *>(snapshot.serial_utf8.data());
-            candidate.serial_utf8_bytes = static_cast<std::uint32_t>(snapshot.serial_utf8.size());
-        }
-        if (candidate.interface_count == 0) continue;
-        auto view = std::make_unique<dtv_usb_interface_info[]>(candidate.interface_count);
-        for (std::uint32_t interface_index = 0; interface_index < candidate.interface_count;
-             ++interface_index) {
-            const auto &source = snapshot.interfaces[interface_index];
-            if (source.endpoints.size() > std::numeric_limits<std::uint32_t>::max()) return false;
-            view[interface_index] = source.info;
-            view[interface_index].endpoints = source.endpoints.data();
-            view[interface_index].endpoint_count =
-                static_cast<std::uint32_t>(source.endpoints.size());
-        }
-        candidate.interfaces = view.get();
-        out->interfaces.push_back(std::move(view));
-    }
-    return true;
-}
-
-struct DerivedSerial {
-    bool known = false;
-    std::string value;
-};
-
-DerivedSerial derive_group_serial(const CompleteGroupObservation &group,
-                                  const dtv::spi::model_information *information,
-                                  const CandidateInfos &infos)
-{
-    DerivedSerial derived;
-    const dtv_derive_enclosure_serial_fn callback =
-        information == nullptr ? nullptr : information->derive_enclosure_serial;
-    if (callback != nullptr) {
-        dtv_serial_derive_input input{};
-        input.candidates = infos.values.data();
-        input.candidate_count = static_cast<std::uint32_t>(infos.values.size());
-        input.anchor_candidate_index = group.anchor_candidate_index;
-        input.functions = group.functions.data();
-        input.function_count = static_cast<std::uint32_t>(group.functions.size());
-        dtv_serial_derive_output output{sizeof(dtv_serial_derive_output),
-                                        DTV_SERIAL_DERIVE_UNKNOWN, 0};
-        auto result = call_callback([&] { return callback(&input, &output, nullptr, 0); });
-        if (result.code != DTV_INTERNAL_RESULT_OK ||
-            output.outcome != DTV_SERIAL_DERIVE_VALUE) {
-            return derived;
-        }
-        if (output.length == 0 || output.length > DTV_SPI_SERIAL_MAX_BYTES) return derived;
-        std::array<char, DTV_SPI_SERIAL_MAX_BYTES + 1> scratch{};
-        output.length = 0;
-        result = call_callback([&] {
-            return callback(&input, &output, scratch.data(),
-                            static_cast<std::uint32_t>(scratch.size()));
-        });
-        if (result.code != DTV_INTERNAL_RESULT_OK ||
-            output.outcome != DTV_SERIAL_DERIVE_VALUE) {
-            return derived;
-        }
-        if (output.length == 0 || output.length > DTV_SPI_SERIAL_MAX_BYTES) return derived;
-        std::string value(scratch.data(), output.length);
-        if (!valid_public_serial(value)) return derived;
-        derived.known = true;
-        derived.value = std::move(value);
-        return derived;
-    }
-    /* 宣言がなければ、device が1つのときだけその raw を使う。2つ以上は NULL。 */
-    if (group.functions.size() != 1) return derived;
-    const auto candidate_index = group.functions[0].candidate_index;
-    if (candidate_index >= infos.values.size()) return derived;
-    const auto &candidate = infos.values[candidate_index];
-    if (candidate.serial_state != DTV_USB_SERIAL_PRESENT ||
-        candidate.serial_utf8 == nullptr) {
-        return derived;
-    }
-    std::string value(reinterpret_cast<const char *>(candidate.serial_utf8),
-                      candidate.serial_utf8_bytes);
-    if (!valid_public_serial(value)) return derived;
-    derived.known = true;
-    derived.value = std::move(value);
-    return derived;
-}
-
-void assign_group_uniqueness(std::vector<CompleteGroupObservation> &groups)
-{
-    std::map<std::string, std::size_t> counts;
-    for (const auto &group : groups) {
-        if (group.serial_known) ++counts[group.serial];
-    }
-    for (auto &group : groups) {
-        if (!group.serial_known) {
-            group.serial_unique = DTV_UNKNOWN;
-        } else {
-            group.serial_unique = counts[group.serial] > 1 ? DTV_NO : DTV_YES;
-        }
-    }
-}
-
 }
 
 std::vector<BootGroupCandidate> discover_boot_candidates(
@@ -233,13 +105,6 @@ std::vector<BootGroupCandidate> discover_boot_candidates(
             return {};
         }
         candidate.interface_count = static_cast<std::uint32_t>(snapshot.interfaces.size());
-        candidate.serial_state = snapshot.serial_state;
-        if (snapshot.serial_state == DTV_USB_SERIAL_PRESENT &&
-            snapshot.serial_utf8.size() <= std::numeric_limits<std::uint32_t>::max()) {
-            candidate.serial_utf8 =
-                reinterpret_cast<const std::uint8_t *>(snapshot.serial_utf8.data());
-            candidate.serial_utf8_bytes = static_cast<std::uint32_t>(snapshot.serial_utf8.size());
-        }
         capacity_size += snapshot.interfaces.size();
     }
     std::vector<std::unique_ptr<dtv_usb_interface_info[]>> interface_views;
@@ -389,8 +254,6 @@ dtv_internal_result collect_complete_groups(
 
         CompleteGroupBatch batch;
         batch.snapshots = std::move(snapshots);
-        CandidateInfos candidate_infos;
-        if (!build_candidate_infos(batch.snapshots, &candidate_infos)) return invalid();
         std::set<std::uint64_t> complete_connections;
         for (auto &candidate : candidates) {
             if (candidate.match != DTV_USB_GROUP_COMPLETE) continue;
@@ -410,16 +273,10 @@ dtv_internal_result collect_complete_groups(
                 model_record = product->models[index];
             }
             if (model_record == nullptr) return invalid();
-            CompleteGroupObservation observation{candidate.product, model_record,
-                                                 candidate.anchor_candidate_index,
-                                                 std::move(candidate.functions)};
-            const auto derived = derive_group_serial(
-                observation, model_record->information, candidate_infos);
-            observation.serial_known = derived.known;
-            observation.serial = derived.value;
-            batch.groups.push_back(std::move(observation));
+            batch.groups.push_back({candidate.product, model_record,
+                                    candidate.anchor_candidate_index,
+                                    std::move(candidate.functions)});
         }
-        assign_group_uniqueness(batch.groups);
 
         std::map<std::uint64_t, std::size_t> ungrouped_by_connection;
         for (std::size_t snapshot_index = 0; snapshot_index < batch.snapshots.size();

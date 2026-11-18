@@ -8,7 +8,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
-#include <deque>
 #include <functional>
 #include <limits>
 #include <list>
@@ -229,9 +228,6 @@ struct EnclosureRegistry::State {
         std::uint32_t card_generation = 0;
         dtv_device *card_reader_device = nullptr;
         std::uint64_t card_reader_connection = 0;
-        std::string serial;
-        std::uint32_t serial_unique = DTV_UNKNOWN;
-        std::deque<std::string> candidate_serial_storage;
         std::timed_mutex card_function_mutex;
         std::mutex card_t1_mutex;
         std::mutex card_t1_bgt_mutex;
@@ -304,7 +300,6 @@ struct EnclosureRegistry::State {
         std::uint32_t bus;
         std::uint32_t address;
         std::vector<std::uint8_t> port_path;
-        std::string serial;
         dtv_ungrouped_device object;
 
         UngroupedEntry(const UsbDeviceSnapshot &snapshot, std::uint64_t token,
@@ -315,11 +310,7 @@ struct EnclosureRegistry::State {
               vendor_id(snapshot.vendor_id), product_id(snapshot.product_id),
               bus(snapshot.bus_number), address(snapshot.device_address),
               port_path(snapshot.port_path),
-              serial(snapshot.serial_state == DTV_USB_SERIAL_PRESENT &&
-                             valid_public_serial(snapshot.serial_utf8)
-                         ? snapshot.serial_utf8 : std::string{}),
-              object{sizeof(dtv_ungrouped_device),
-                     serial.empty() ? nullptr : serial.c_str(),
+              object{sizeof(dtv_ungrouped_device), nullptr,
                      model.empty() ? nullptr : model.c_str(),
                      port.empty() ? nullptr : port.c_str(),
                      vendor_id, product_id, &bus, &address, DTV_UNGROUPED_UNKNOWN}
@@ -329,14 +320,9 @@ struct EnclosureRegistry::State {
         bool same_values(const UsbDeviceSnapshot &snapshot, const char *model_name) const
         {
             const std::string_view expected_model = model_name == nullptr ? "" : model_name;
-            const std::string expected_serial =
-                snapshot.serial_state == DTV_USB_SERIAL_PRESENT &&
-                        valid_public_serial(snapshot.serial_utf8)
-                    ? snapshot.serial_utf8 : std::string{};
             return vendor_id == snapshot.vendor_id && product_id == snapshot.product_id &&
                    bus == snapshot.bus_number && address == snapshot.device_address &&
-                   port_path == snapshot.port_path && model == expected_model &&
-                   serial == expected_serial;
+                   port_path == snapshot.port_path && model == expected_model;
         }
     };
 
@@ -357,9 +343,6 @@ struct EnclosureRegistry::State {
         std::shared_ptr<Root> root;
         std::size_t slot = DTV_MAX_ENCLOSURES;
         bool existed = false;
-        bool serial_known = false;
-        std::string serial;
-        std::uint32_t serial_unique = DTV_UNKNOWN;
     };
 
     struct QueuedEvent {
@@ -591,9 +574,7 @@ struct EnclosureRegistry::State {
             }
             by_key.emplace(key, group_index);
             groups.push_back({std::move(key), observation.product, observation.model,
-                              std::move(devices), std::move(selected_functions),
-                              nullptr, DTV_MAX_ENCLOSURES, false,
-                              observation.serial_known, observation.serial, DTV_UNKNOWN});
+                              std::move(devices), std::move(selected_functions)});
         }
         std::sort(groups.begin(), groups.end(), [](const auto &left, const auto &right) {
             return key_less(left.key, right.key);
@@ -725,17 +706,9 @@ struct EnclosureRegistry::State {
         for (std::size_t index = 0; index < root->devices.size(); ++index) {
             const auto &device = *root->devices[index];
             if (!candidate_connections.insert(device.connection).second) continue;
-            std::string candidate_serial;
-            if (device.snapshot.serial_state == DTV_USB_SERIAL_PRESENT &&
-                valid_public_serial(device.snapshot.serial_utf8)) {
-                candidate_serial = device.snapshot.serial_utf8;
-            }
-            root->candidate_serial_storage.push_back(std::move(candidate_serial));
-            const auto &stored_serial = root->candidate_serial_storage.back();
             root->candidate_storage.push_back(std::make_unique<dtv_candidate>(dtv_candidate{
                 sizeof(dtv_candidate), static_cast<std::uint32_t>(root->candidate_storage.size()),
-                stored_serial.empty() ? nullptr : stored_serial.c_str(),
-                &device.bus, &device.address,
+                nullptr, &device.bus, &device.address,
                 device.port.empty() ? nullptr : device.port.c_str()}));
         }
         root->candidate_view.reserve(root->candidate_storage.size() + 1);
@@ -783,15 +756,8 @@ struct EnclosureRegistry::State {
         complete = false;
         last_result_ok = false;
         clear_ungrouped_view();
-        /* refresh が失敗したら、走査が済んでいないので既知 NO 以外は UNKNOWN に戻す。 */
-        auto fail = [this](dtv_internal_result result) {
-            for (const auto &root : live_roots) {
-                if (root && root->serial_unique != DTV_NO) root->serial_unique = DTV_UNKNOWN;
-            }
-            return result;
-        };
         if (resource_limit) {
-            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0));
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
         }
         try {
             auto groups = prepare_groups(batch);
@@ -877,10 +843,6 @@ struct EnclosureRegistry::State {
                             throw std::invalid_argument("changed device functions");
                         }
                     }
-                    if (!group.serial_known && !group.root->serial.empty()) {
-                        group.serial_known = true;
-                        group.serial = group.root->serial;
-                    }
                 } else {
                     const auto free_slot = std::find(next_roots.begin(), next_roots.end(), nullptr);
                     if (free_slot == next_roots.end()) {
@@ -894,17 +856,6 @@ struct EnclosureRegistry::State {
                 }
                 next_index.emplace(group.key, group.slot);
             }
-            {
-                std::map<std::string, std::size_t> serial_counts;
-                for (const auto &group : groups) {
-                    if (group.serial_known) ++serial_counts[group.serial];
-                }
-                for (auto &group : groups) {
-                    group.serial_unique = !group.serial_known
-                        ? DTV_UNKNOWN
-                        : (serial_counts[group.serial] > 1 ? DTV_NO : DTV_YES);
-                }
-            }
 
             std::map<std::uint64_t, std::shared_ptr<UngroupedEntry>> next_ungrouped;
             std::vector<std::shared_ptr<UngroupedEntry>> retired_ungrouped_next;
@@ -913,9 +864,9 @@ struct EnclosureRegistry::State {
             retired_ungrouped_next.reserve(ungrouped_entries.size());
             for (const auto &observation : batch.ungrouped) {
                 if (observation.snapshot_index >= batch.snapshots.size() ||
-                    observation.connection_token == 0) return fail(invalid());
+                    observation.connection_token == 0) return invalid();
                 const auto &snapshot = batch.snapshots[observation.snapshot_index];
-                if (snapshot.connection_token != observation.connection_token) return fail(invalid());
+                if (snapshot.connection_token != observation.connection_token) return invalid();
                 const auto current = ungrouped_entries.find(observation.connection_token);
                 std::shared_ptr<UngroupedEntry> entry;
                 if (current != ungrouped_entries.end() &&
@@ -930,7 +881,7 @@ struct EnclosureRegistry::State {
                     }
                 }
                 if (!next_ungrouped.emplace(observation.connection_token, entry).second) {
-                    return fail(invalid());
+                    return invalid();
                 }
                 next_ungrouped_view.push_back(&entry->object);
             }
@@ -942,7 +893,7 @@ struct EnclosureRegistry::State {
             tombstones.reserve(tombstones.size() + removed_count);
             std::list<QueuedEvent> prepared_events;
             const auto event_result = prepare_events(pending, pending_count, prepared_events);
-            if (event_result.code != DTV_INTERNAL_RESULT_OK) return fail(event_result);
+            if (event_result.code != DTV_INTERNAL_RESULT_OK) return event_result;
 
             for (std::size_t slot = 0; slot < kCapacity; ++slot) {
                 if (!removed[slot]) continue;
@@ -963,10 +914,6 @@ struct EnclosureRegistry::State {
                         }
                     }
                 }
-                if (group.serial_known) {
-                    group.root->serial = group.serial;
-                }
-                group.root->serial_unique = group.serial_unique;
                 group.root->status = DTV_ENCLOSURE_READY;
                 group.root->slot = group.slot;
             }
@@ -1006,9 +953,9 @@ struct EnclosureRegistry::State {
             if (omitted_count != 0) log_capacity_overflow(omitted_count, kCapacity);
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         } catch (const std::invalid_argument &) {
-            return fail(invalid());
+            return invalid();
         } catch (...) {
-            return fail(exception_result());
+            return exception_result();
         }
     }
 
@@ -1212,22 +1159,6 @@ std::uint32_t EnclosureRegistry::card_generation(const dtv_enclosure *object) co
     std::lock_guard lock(state_->mutex);
     const auto root = state_->find_root(object);
     return root ? root->card_generation : 0;
-}
-
-const char *EnclosureRegistry::enclosure_serial(const dtv_enclosure *object) const
-{
-    std::lock_guard lock(state_->mutex);
-    const auto root = state_->find_root(object);
-    if (!root || root->serial.empty()) return nullptr;
-    return root->serial.c_str();
-}
-
-std::uint32_t EnclosureRegistry::serial_unique(const dtv_enclosure *object) const
-{
-    std::lock_guard lock(state_->mutex);
-    const auto root = state_->find_root(object);
-    if (!root || root->serial.empty()) return DTV_UNKNOWN;
-    return root->serial_unique;
 }
 
 dtv_device *EnclosureRegistry::card_reader_device(const dtv_enclosure *object) const
@@ -1668,17 +1599,6 @@ std::uint32_t EnclosureRegistry::device_id(const dtv_device *object) const
     std::lock_guard lock(state_->mutex);
     const auto *device = state_->find_device(object);
     return device ? device->id : 0;
-}
-
-const char *EnclosureRegistry::device_serial(const dtv_device *object) const
-{
-    std::lock_guard lock(state_->mutex);
-    const auto *device = state_->find_device(object);
-    if (device == nullptr || device->snapshot.serial_state != DTV_USB_SERIAL_PRESENT ||
-        !valid_public_serial(device->snapshot.serial_utf8)) {
-        return nullptr;
-    }
-    return device->snapshot.serial_utf8.c_str();
 }
 
 std::uint32_t EnclosureRegistry::device_id_for_mode_probe(
@@ -2398,10 +2318,6 @@ dtv_internal_result EnclosureRegistry::scan_failed()
     state_->complete = false;
     state_->last_result_ok = false;
     state_->clear_ungrouped_view();
-    /* 走査が済んでいないので、既知の重なり (NO) 以外は一意と言わない（決定 66）。 */
-    for (const auto &root : state_->live_roots) {
-        if (root && root->serial_unique != DTV_NO) root->serial_unique = DTV_UNKNOWN;
-    }
     if (state_->resource_limit) {
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
     }
@@ -2455,8 +2371,6 @@ dtv_internal_result DiscoverySession::scan_with_fds(
 {
     dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     auto snapshots = context_.enumerate_fds(descriptors, &result);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    result = observe_declared_serials(context_, snapshots);
     if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     return observe_loaded_product_groups(std::move(snapshots), out);
 }
@@ -3038,12 +2952,7 @@ struct PublicDiscoveryState {
                     snapshot.vendor_id, snapshot.product_id, snapshot.device_version,
                     snapshot.bus_number, snapshot.device_address, snapshot.port_path.data(),
                     static_cast<std::uint32_t>(snapshot.port_path.size()), interface_observations.data(),
-                    static_cast<std::uint32_t>(interface_observations.size()),
-                    snapshot.serial_state,
-                    snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-                        ? reinterpret_cast<const std::uint8_t *>(snapshot.serial_utf8.data()) : nullptr,
-                    snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-                        ? static_cast<std::uint32_t>(snapshot.serial_utf8.size()) : 0};
+                    static_cast<std::uint32_t>(interface_observations.size())};
                 dtv_open_args args{};
                 args.model = &model.model;
                 args.function = selection.function;
@@ -6525,16 +6434,8 @@ extern "C" const char *dtv_get_model(dtv_enclosure *object)
     catch (...) { return nullptr; }
 }
 
-extern "C" const char *dtv_get_enclosure_serial(dtv_enclosure *object)
-{
-    try { return public_discovery_state().registry.enclosure_serial(object); }
-    catch (...) { return nullptr; }
-}
-extern "C" std::uint32_t dtv_get_serial_unique(dtv_enclosure *object)
-{
-    try { return public_discovery_state().registry.serial_unique(object); }
-    catch (...) { return DTV_UNKNOWN; }
-}
+extern "C" const char *dtv_get_enclosure_serial(dtv_enclosure *) { return nullptr; }
+extern "C" std::uint32_t dtv_get_serial_unique(dtv_enclosure *) { return DTV_UNKNOWN; }
 extern "C" std::uint32_t dtv_get_status(dtv_enclosure *object)
 {
     try { return public_discovery_state().registry.status(object); }
@@ -7121,11 +7022,7 @@ extern "C" std::uint16_t dtv_get_pid(dtv_device *object)
     try { return public_discovery_state().registry.product_id(object); }
     catch (...) { return 0; }
 }
-extern "C" const char *dtv_get_device_serial(dtv_device *object)
-{
-    try { return public_discovery_state().registry.device_serial(object); }
-    catch (...) { return nullptr; }
-}
+extern "C" const char *dtv_get_device_serial(dtv_device *) { return nullptr; }
 extern "C" const std::uint32_t *dtv_get_bus(dtv_device *object)
 {
     try { return public_discovery_state().registry.bus(object); }
@@ -7686,12 +7583,7 @@ int32_t run_firmware_session(dtv_device *object, dtv_bytes package,
         input.snapshot.vendor_id, input.snapshot.product_id, input.snapshot.device_version,
         input.snapshot.bus_number, input.snapshot.device_address,
         input.snapshot.port_path.data(), static_cast<std::uint32_t>(input.snapshot.port_path.size()),
-        interface_observations.data(), static_cast<std::uint32_t>(interface_observations.size()),
-        input.snapshot.serial_state,
-        input.snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-            ? reinterpret_cast<const std::uint8_t *>(input.snapshot.serial_utf8.data()) : nullptr,
-        input.snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-            ? static_cast<std::uint32_t>(input.snapshot.serial_utf8.size()) : 0};
+        interface_observations.data(), static_cast<std::uint32_t>(interface_observations.size())};
     open_args.model = &description.model->model;
     open_args.function = target.function;
     open_args.timeout = timeout;
@@ -8545,12 +8437,7 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
                 snapshot.port_path.empty() ? nullptr : snapshot.port_path.data(),
                 static_cast<std::uint32_t>(snapshot.port_path.size()),
                 interface_view.empty() ? nullptr : interface_view.data(),
-                static_cast<std::uint32_t>(interface_view.size()),
-                snapshot.serial_state,
-                snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-                    ? reinterpret_cast<const std::uint8_t *>(snapshot.serial_utf8.data()) : nullptr,
-                snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-                    ? static_cast<std::uint32_t>(snapshot.serial_utf8.size()) : 0};
+                static_cast<std::uint32_t>(interface_view.size())};
         }
         std::vector<dtv::spi::PublicOpenPlan> plans(description.inputs.size());
         std::size_t plan_count = 0;

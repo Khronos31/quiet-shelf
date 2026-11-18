@@ -6,9 +6,6 @@
 #include <functional>
 #include <memory>
 #include <span>
-#include <string>
-#include <string_view>
-#include <utility>
 #include <vector>
 
 #include <dtv/dtv.h>
@@ -72,10 +69,6 @@ struct UsbDeviceSnapshot {
     std::uint64_t candidate_id = 0;
     std::uint64_t connection_token = 0;
     dtv_usb_token selection_token = 0;
-    /* 文字列記述子の観測結果。serial_utf8 は復号した lossless UTF-8。 */
-    std::uint8_t serial_number_index = 0;
-    std::uint32_t serial_state = DTV_USB_SERIAL_ABSENT;
-    std::string serial_utf8;
     std::vector<std::uint8_t> port_path;
     std::vector<UsbInterfaceSnapshot> interfaces;
 
@@ -206,13 +199,6 @@ public:
                                             void *token_user = nullptr) const;
     std::vector<UsbDeviceSnapshot> enumerate_fds(std::span<const std::int32_t>,
                                                  dtv_internal_result *result = nullptr) const;
-    /* declared に含まれる VID:PID の snapshot だけ、文字列記述子を読んで serial_* を埋める。
-     * claim/detach/reset はしない。成功した復号値は同じ接続の間 cache する。
-     * 予算切れ・open 失敗・timeout は観測失敗 (UNREADABLE) とし、走査全体を失敗にしない。 */
-    dtv_internal_result observe_serials(
-        std::vector<UsbDeviceSnapshot> &,
-        std::span<const std::pair<std::uint16_t, std::uint16_t>> declared,
-        std::uint64_t deadline_ns, std::uint32_t per_candidate_timeout_ms) const;
     dtv_internal_result acquire_claims(std::span<const UsbClaimDeviceInput>,
                                        const dtv_runtime_clock *, const dtv_cancel *,
                                        std::uint64_t deadline_ns,
@@ -256,9 +242,6 @@ private:
 /* The input descriptor is borrowed; the Core duplicates and owns its wrapper FD. */
 std::unique_ptr<UsbDevice> open_usb_fd(int descriptor, int interface_number,
                                        dtv_internal_result *result);
-
-/* 公開 serial の文字列規則（決定 66）：1..512 byte、strict UTF-8、NUL と制御文字を含まない。 */
-bool valid_public_serial(std::string_view text);
 
 }
 

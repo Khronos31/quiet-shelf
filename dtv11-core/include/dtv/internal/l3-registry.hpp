@@ -81,9 +81,6 @@ public:
     std::uint32_t status(const dtv_enclosure *) const;
     std::uint32_t card_state(const dtv_enclosure *) const;
     std::uint32_t card_generation(const dtv_enclosure *) const;
-    const char *enclosure_serial(const dtv_enclosure *) const;
-    std::uint32_t serial_unique(const dtv_enclosure *) const;
-    const char *device_serial(const dtv_device *) const;
     dtv_device *card_reader_device(const dtv_enclosure *) const;
     dtv_internal_result card_transport_context(const dtv_enclosure *,
                                               dtv::spi::CardTransportContext *) const;

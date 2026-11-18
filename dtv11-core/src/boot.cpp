@@ -143,12 +143,7 @@ dtv_usb_candidate_info candidate_view(const UsbDeviceSnapshot &snapshot,
     return {snapshot.candidate_id, snapshot.vendor_id, snapshot.product_id,
             snapshot.device_version, snapshot.bus_number, snapshot.device_address,
             snapshot.port_path.data(), static_cast<std::uint32_t>(snapshot.port_path.size()),
-            interfaces->data(), static_cast<std::uint32_t>(interfaces->size()),
-            snapshot.serial_state,
-            snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-                ? reinterpret_cast<const std::uint8_t *>(snapshot.serial_utf8.data()) : nullptr,
-            snapshot.serial_state == DTV_USB_SERIAL_PRESENT
-                ? static_cast<std::uint32_t>(snapshot.serial_utf8.size()) : 0};
+            interfaces->data(), static_cast<std::uint32_t>(interfaces->size())};
 }
 
 uint64_t deadline_after(uint64_t now, uint64_t timeout_ms)

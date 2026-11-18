@@ -3,12 +3,10 @@
 #include <dtv/spi/feature.hpp>
 #include <dtv/internal/discovery.hpp>
 #include <dtv/internal/l3.hpp>
-#include <dtv/internal/clock.hpp>
 #include <dtv/internal/result.hpp>
 #include <dtv/spi/device_ops.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -300,50 +298,6 @@ int32_t dispatch_reset_card(const char *product, const char *model, dtv_enclosur
 
 namespace dtv::internal {
 
-std::vector<std::pair<std::uint16_t, std::uint16_t>> loaded_device_identities()
-{
-    std::vector<std::pair<std::uint16_t, std::uint16_t>> identities;
-    std::lock_guard lock(products_mutex);
-    for (const auto &loaded : loaded_products) {
-        for (std::size_t index = 0; index < loaded.model_count; ++index) {
-            const auto *model = loaded.models[index];
-            if (model == nullptr) continue;
-            if (model->model != nullptr) {
-                identities.emplace_back(model->model->vid, model->model->pid);
-            }
-            const auto *discovery = model->discovery;
-            if (discovery == nullptr || discovery->cold_identities == nullptr) continue;
-            for (std::size_t cold = 0; cold < discovery->cold_identity_count; ++cold) {
-                identities.emplace_back(discovery->cold_identities[cold].vendor_id,
-                                        discovery->cold_identities[cold].product_id);
-            }
-        }
-    }
-    std::sort(identities.begin(), identities.end());
-    identities.erase(std::unique(identities.begin(), identities.end()), identities.end());
-    return identities;
-}
-
-dtv_internal_result observe_declared_serials(const UsbContext &context,
-                                             std::vector<UsbDeviceSnapshot> &snapshots)
-{
-    const auto identities = loaded_device_identities();
-    if (identities.empty()) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    std::uint64_t now = 0;
-    if (const auto *clock = system_runtime_clock();
-        clock != nullptr && clock->monotonic_now_ns != nullptr) {
-        now = clock->monotonic_now_ns(clock->user);
-    } else {
-        now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    }
-    /* 250 ms/候補・追加 2 s/走査は未測定の試値（決定 66 の実測待ち）。 */
-    constexpr std::uint64_t scan_budget_ns = 2'000'000'000;
-    constexpr std::uint32_t per_candidate_timeout_ms = 250;
-    return context.observe_serials(snapshots, identities, now + scan_budget_ns,
-                                   per_candidate_timeout_ms);
-}
-
 dtv_internal_result observe_loaded_product_groups(
     std::vector<UsbDeviceSnapshot> snapshots, CompleteGroupBatch *out)
 {
@@ -413,10 +367,6 @@ dtv_internal_result scan_loaded_product_groups(const UsbContext &context,
             return result;
         }
         auto snapshots = context.enumerate(&result, token_callback, token_user);
-        if (result.code != DTV_INTERNAL_RESULT_OK) {
-            return result;
-        }
-        result = observe_declared_serials(context, snapshots);
         if (result.code != DTV_INTERNAL_RESULT_OK) {
             return result;
         }
