@@ -783,8 +783,15 @@ struct EnclosureRegistry::State {
         complete = false;
         last_result_ok = false;
         clear_ungrouped_view();
+        /* refresh が失敗したら、走査が済んでいないので既知 NO 以外は UNKNOWN に戻す。 */
+        auto fail = [this](dtv_internal_result result) {
+            for (const auto &root : live_roots) {
+                if (root && root->serial_unique != DTV_NO) root->serial_unique = DTV_UNKNOWN;
+            }
+            return result;
+        };
         if (resource_limit) {
-            return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+            return fail(dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0));
         }
         try {
             auto groups = prepare_groups(batch);
@@ -906,9 +913,9 @@ struct EnclosureRegistry::State {
             retired_ungrouped_next.reserve(ungrouped_entries.size());
             for (const auto &observation : batch.ungrouped) {
                 if (observation.snapshot_index >= batch.snapshots.size() ||
-                    observation.connection_token == 0) return invalid();
+                    observation.connection_token == 0) return fail(invalid());
                 const auto &snapshot = batch.snapshots[observation.snapshot_index];
-                if (snapshot.connection_token != observation.connection_token) return invalid();
+                if (snapshot.connection_token != observation.connection_token) return fail(invalid());
                 const auto current = ungrouped_entries.find(observation.connection_token);
                 std::shared_ptr<UngroupedEntry> entry;
                 if (current != ungrouped_entries.end() &&
@@ -923,7 +930,7 @@ struct EnclosureRegistry::State {
                     }
                 }
                 if (!next_ungrouped.emplace(observation.connection_token, entry).second) {
-                    return invalid();
+                    return fail(invalid());
                 }
                 next_ungrouped_view.push_back(&entry->object);
             }
@@ -935,7 +942,7 @@ struct EnclosureRegistry::State {
             tombstones.reserve(tombstones.size() + removed_count);
             std::list<QueuedEvent> prepared_events;
             const auto event_result = prepare_events(pending, pending_count, prepared_events);
-            if (event_result.code != DTV_INTERNAL_RESULT_OK) return event_result;
+            if (event_result.code != DTV_INTERNAL_RESULT_OK) return fail(event_result);
 
             for (std::size_t slot = 0; slot < kCapacity; ++slot) {
                 if (!removed[slot]) continue;
@@ -999,9 +1006,9 @@ struct EnclosureRegistry::State {
             if (omitted_count != 0) log_capacity_overflow(omitted_count, kCapacity);
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         } catch (const std::invalid_argument &) {
-            return invalid();
+            return fail(invalid());
         } catch (...) {
-            return exception_result();
+            return fail(exception_result());
         }
     }
 

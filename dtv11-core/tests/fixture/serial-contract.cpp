@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 機種の宣言による筐体 serial の導出・L3 公開・一意性の契約 test（決定 66）。 */
 #include <array>
+#include <new>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -458,6 +459,35 @@ int main()
         dtv_drop_enclosure(root);
     }
 
+    /* 正常な refresh では、同じ筐体の一意性を毎回計算し直す。 */
+    {
+        derive_mode = 0;
+        dtv::internal::CompleteGroupBatch batch;
+        if (collect({snapshot(0x0301, 601, 2, DTV_USB_SERIAL_PRESENT, "RETRY")},
+                    &batch).code != DTV_INTERNAL_RESULT_OK ||
+            batch.groups.size() != 1) return 58;
+        if (publish(std::move(batch)) != 0) return 59;
+        auto *root = first_enclosure(&error);
+        if (root == nullptr || dtv_get_serial_unique(root) != DTV_YES) return 60;
+        dtv_hold_enclosure(root);
+        if (collect({snapshot(0x0301, 601, 2, DTV_USB_SERIAL_PRESENT, "RETRY"),
+                     snapshot(0x0301, 602, 3, DTV_USB_SERIAL_PRESENT, "RETRY")},
+                    &batch).code != DTV_INTERNAL_RESULT_OK ||
+            batch.groups.size() != 2) { dtv_drop_enclosure(root); return 61; }
+        if (publish(std::move(batch)) != 0 || dtv_get_serial_unique(root) != DTV_NO) {
+            dtv_drop_enclosure(root);
+            return 62;
+        }
+        if (collect({snapshot(0x0301, 601, 2, DTV_USB_SERIAL_PRESENT, "RETRY")},
+                    &batch).code != DTV_INTERNAL_RESULT_OK ||
+            batch.groups.size() != 1) { dtv_drop_enclosure(root); return 63; }
+        if (publish(std::move(batch)) != 0 || dtv_get_serial_unique(root) != DTV_YES) {
+            dtv_drop_enclosure(root);
+            return 64;
+        }
+        dtv_drop_enclosure(root);
+    }
+
     /* 容量を超えて省いた筐体も比較に入る。 */
     {
         derive_mode = 0;
@@ -480,6 +510,88 @@ int main()
             if (dtv_get_serial_unique(list[index]) != DTV_NO) return 37;
         }
         if (live != DTV_MAX_ENCLOSURES) return 38;
+    }
+
+    /* refresh の資源失敗でも、既知 NO 以外は UNKNOWN に戻し、旧 serial と非公開を保つ。 */
+    {
+        derive_mode = 0;
+        dtv::internal::CompleteGroupBatch batch;
+        if (collect({snapshot(0x0301, 901, 2, DTV_USB_SERIAL_PRESENT, "BEFORE-YES"),
+                     snapshot(0x0301, 911, 3, DTV_USB_SERIAL_PRESENT, "DUPNO"),
+                     snapshot(0x0301, 912, 4, DTV_USB_SERIAL_PRESENT, "DUPNO")},
+                    &batch).code != DTV_INTERNAL_RESULT_OK ||
+            batch.groups.size() != 3) return 39;
+        if (publish(std::move(batch)) != 0) return 40;
+        dtv_error list_error{};
+        list_error.struct_size = sizeof(list_error);
+        dtv_enclosure *const *list = dtv_list_enclosures(&list_error);
+        if (list == nullptr) return 41;
+        dtv_enclosure *root_yes = nullptr;
+        dtv_enclosure *root_no = nullptr;
+        std::size_t live = 0;
+        for (std::size_t index = 0; index < dtv_get_list_capacity(); ++index) {
+            if (list[index] == nullptr) continue;
+            ++live;
+            const char *serial = dtv_get_enclosure_serial(list[index]);
+            if (serial != nullptr && std::strcmp(serial, "BEFORE-YES") == 0) root_yes = list[index];
+            if (serial != nullptr && std::strcmp(serial, "DUPNO") == 0) root_no = list[index];
+        }
+        if (live != 3 || root_yes == nullptr || root_no == nullptr ||
+            dtv_get_serial_unique(root_yes) != DTV_YES ||
+            dtv_get_serial_unique(root_no) != DTV_NO) return 42;
+        dtv_hold_enclosure(root_yes);
+        dtv_hold_enclosure(root_no);
+
+        dtv::internal::CompleteGroupBatch failing;
+        if (collect({snapshot(0x0301, 901, 2, DTV_USB_SERIAL_PRESENT, "AFTER"),
+                     snapshot(0x0301, 902, 5, DTV_USB_SERIAL_PRESENT, "OTHER"),
+                     snapshot(0x0301, 911, 3, DTV_USB_SERIAL_PRESENT, "DUPNO"),
+                     snapshot(0x0301, 912, 4, DTV_USB_SERIAL_PRESENT, "DUPNO")},
+                    &failing).code != DTV_INTERNAL_RESULT_OK ||
+            failing.groups.size() != 4) {
+            dtv_drop_enclosure(root_yes);
+            dtv_drop_enclosure(root_no);
+            return 43;
+        }
+        dtv::internal::set_public_discovery_batch_for_test(std::move(failing));
+        dtv::internal::set_public_discovery_journal_hook_for_test(
+            [] { throw std::bad_alloc(); });
+        dtv_error fail_error{};
+        fail_error.struct_size = sizeof(fail_error);
+        if (dtv_list_enclosures(&fail_error) != nullptr) {
+            dtv::internal::set_public_discovery_journal_hook_for_test({});
+            dtv_drop_enclosure(root_yes);
+            dtv_drop_enclosure(root_no);
+            return 44;
+        }
+        if (dtv_get_scan_complete() != 0 ||
+            dtv_get_serial_unique(root_yes) != DTV_UNKNOWN ||
+            dtv_get_serial_unique(root_no) != DTV_NO ||
+            dtv_get_enclosure_serial(root_yes) == nullptr ||
+            std::strcmp(dtv_get_enclosure_serial(root_yes), "BEFORE-YES") != 0 ||
+            dtv_get_enclosure_serial(root_no) == nullptr ||
+            std::strcmp(dtv_get_enclosure_serial(root_no), "DUPNO") != 0) {
+            dtv::internal::set_public_discovery_journal_hook_for_test({});
+            dtv_drop_enclosure(root_yes);
+            dtv_drop_enclosure(root_no);
+            return 45;
+        }
+        dtv_enclosure *first = nullptr;
+        std::size_t live_after = 0;
+        for (std::size_t index = 0; index < dtv_get_list_capacity(); ++index) {
+            if (list[index] == nullptr) continue;
+            if (first == nullptr) first = list[index];
+            ++live_after;
+        }
+        if (first != list[0] || live_after != 3) {
+            dtv::internal::set_public_discovery_journal_hook_for_test({});
+            dtv_drop_enclosure(root_yes);
+            dtv_drop_enclosure(root_no);
+            return 46;
+        }
+        dtv::internal::set_public_discovery_journal_hook_for_test({});
+        dtv_drop_enclosure(root_yes);
+        dtv_drop_enclosure(root_no);
     }
 
     return 0;

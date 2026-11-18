@@ -1,9 +1,20 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# userland.discovery JSON 出力仕様
+# userland.discovery JSON 出力および CLI 接続仕様
 
-ヘッダーファイル `discovery_json.h` は、ハードウェアスキャン全体の観測結果を、公開仕様で定義された `userland.discovery` JSON 形式へとマッピング（変換出力）する。単一の `ListResponse` ではなく、スキャン全体の包括的な観測データ（scan envelope）を入力として受け取るため、同一スキャン内で観測された全デバイスにわたり、筐体のグルーピングおよびシリアル番号の一意性を整合性高く判定する。
+本文書は、正本 L1、L2 §9、L3、および L3 決定 62 / 64 / 65（正本 `209dab21`）に基づく、内部ヘッダー `include/dtv/internal/discovery-json.hpp`（名前空間 `dtv::internal`）および生成 CLI の `--list-json` オプションにおける `userland.discovery` JSON 出力および接続仕様を記録したものである。
 
-出力される JSON は、以下のとおり実機の物理的な階層構造を保持する。
+## 概要と位置づけ
+
+- **目的:** 単一製品 CLI `--list-json` などにおいて、1 回のハードウェア走査バッチから完全な筐体一覧、孤立 USB デバイス一覧、およびスキャン完了状態を整合して取得し、公開仕様で定義された `userland.discovery` JSON 形式として単一文書を標準出力（stdout）へ出力する。
+- **アーキテクチャと境界:**
+  - 生成 CLI は起動時に `dtv_load_<product>()` を呼び出して L3 モデル・製品メタデータを登録する。
+  - L3 の公開 getter から全 29 欄のデータを収集し、内部の借用型（`dtv::internal::DiscoveryJsonInput`）へ射影した上で、内部エンコーダ（`encode_discovery_json`）により JSON を生成する。
+  - 成功時は compact UTF-8 JSON 1 文書と末尾改行（`\n`）1 個を出力する。
+  - 内部失敗時（検証失敗・L3 走査失敗・エンコード失敗）は stdout に一切書き出さず（stdout 空）、stderr にエラーを出力して終了する。
+
+## JSON 出力例（実機の物理階層と決定 64 / 65 反映）
+
+出力される JSON は、以下のとおり実機の物理的な階層構造を保持する。位置情報（bus/address/port）は入れ子にせず平らに並べ（L3 決定 64）、容量超過等の問題配列は空配列 `[]` とする（L3 決定 65）。
 
 ```json
 {
@@ -13,8 +24,8 @@
   "enclosures": [{
     "id": 1,
     "model": "PX-Q3U4",
-    "serial": "serial-value",
-    "serial_unique": true,
+    "serial": null,
+    "serial_unique": null,
     "status": "ready",
     "lnb_15v_supported": null,
     "card_reader_supported": true,
@@ -22,7 +33,7 @@
     "devices": [{
       "id": 2,
       "usb": "0511:084a",
-      "serial": "usb-serial",
+      "serial": null,
       "bus": 1,
       "address": 6,
       "port": "1-2.3",
@@ -34,92 +45,146 @@
         "ts_scrambling": "scrambled"
       }]
     }],
-    "candidates": []
+    "candidates": [{
+      "device": 0,
+      "serial": null,
+      "bus": 1,
+      "address": 7,
+      "port": "1-2.4"
+    }]
   }],
-  "ungrouped_usb_devices": []
+  "ungrouped_usb_devices": [{
+    "serial": null,
+    "model": null,
+    "usb": "0511:084a",
+    "status": "usable",
+    "bus": 1,
+    "address": 8,
+    "port": "1-2.5"
+  }]
 }
 ```
 
-識別子（ID）は JSON の数値として出力する。VID および PID は小文字の 16 進数表記による `VID:PID` 文字列とする。受信機構成が未知のデバイスでは `receivers` フィールドを省略し、受信機が 0 個であることが確認されているデバイスでは空配列（`[]`）を出力する。本エンコーダ（`discovery_json`）はスキャン処理によって実際に提供された筐体およびデバイスのみを出力し、架空の要素を補完することはない。
+識別子（ID）は JSON の数値として出力する。VID および PID は小文字の 16 進数表記による 4 桁ゼロ詰めの `VID:PID` 文字列とする。受信機構成が未知のデバイスでは `receivers` フィールド自体を省略し、受信機が 0 個であることが確認されているデバイスでは空配列（`[]`）を出力する。
 
-## フィールド仕様
+## 走査収集契約と直列化・オブジェクト寿命
 
-### ルートオブジェクト
+1. **L3 登録順序と producer メタデータ:**
+   - 生成 CLI `main` が `dtv_load_<product>()` を呼び出し、L3 product / model を登録する。
+   - `producer.product` は L3 `dtv_list_models()` の先頭 `model.product` から取得する。筐体一覧が空（0 件）の場合であってもモデル宣言が存在するため確定的に取得可能である。
+   - `producer.version` は、CLI がビルド時に焼き込んだ設定値（CMake の `PRODUCT_VERSION`、`dtv_cli_config.version`）を使用する（正本 L2 §9 / L3 決定 62 の明示例外）。
+2. **一覧呼び出し順序（一覧 1 回契約）と寿命管理:**
+   - CLI `--list-json` の実行時は、`dtv_list_enclosures(&error)` を 1 回だけ呼び出す。NULL かつエラーの場合は即座に終了し、JSON は出力しない。
+   - 成功時は `dtv_get_list_capacity()` 個の全枠を走査し、NULL でない各筐体を `dtv_hold_enclosure()` で保持する。
+   - 直後に、同一の直列化区間内で各筐体の getter、孤立 USB デバイス（`dtv_list_ungrouped_devices()`）、および完了フラグ（`dtv_get_scan_complete()`）を読み取る。
+   - エンコード処理が完了した段階で、保持していた全筐体を `dtv_drop_enclosure()` で解放する。
+   - 走査バッチおよび getter 値はその時点の観測値であり、JSON 内に epoch フィールドは存在しない。架空の同一 epoch 値などを捏造せず、同一一覧走査・呼び出し側直列化・借用値の寿命規則（hold/drop）を厳格に順守する。次の一覧呼び出しや `dtv_wait_event` を重ねることはしない。
 
-| フィールド | 型 | 説明 |
-| --- | --- | --- |
-| `schema.name`, `schema.major`, `schema.minor` | 文字列、数値、数値 | `"userland.discovery"`、`1`、`0` |
-| `producer.product`, `producer.version` | 文字列、文字列 | 製品名（例: `"px4"`）およびバージョン文字列 |
-| `scan.complete` | 真偽値 | ハードウェアスキャンが完全に終了したかを示すフラグ |
-| `scan.issues` | オブジェクト配列 | スキャン中に検出された問題のリスト。固定エラーコード文字列と詳細メッセージを保持する |
-| `enclosures` | オブジェクト配列 | 観測・識別された筐体オブジェクトの配列 |
-| `ungrouped_usb_devices` | オブジェクト配列 | 特定の筐体に割り当てられなかった孤立 USB デバイスの配列 |
+## フィールド仕様（L3 公開 getter との全 29 欄マッピング）
 
-### 筐体オブジェクト（`enclosures[]`）
+本仕様では、L3 公開 getter から収集される全 29 欄を以下のように規定する。
 
-筐体の `id` および USB ファンクションの `id` は、STATUS JSON における各識別子と同じセマンティクスを持つ。
+| # | JSON フィールド | 型・許容値 | L3 公開 API / 供給元 | 変換・契約規則 |
+|---|---|---|---|---|
+| 1 | `schema.name` | 文字列 (`"userland.discovery"`) | 固定値 | L2 §9 固定仕様 |
+| 2 | `schema.major` | 数値 (`1`) | 固定値 | UDTV 1.1 仕様 |
+| 3 | `schema.minor` | 数値 (`0`) | 固定値 | UDTV 1.1 仕様 |
+| 4 | `producer.product` | 文字列 | `dtv_list_models()->product` | L3 モデル宣言メタデータ。空一覧時も取得可能 |
+| 5 | `producer.version` | 文字列 | `config->version` | ビルド時 `PRODUCT_VERSION`（L3 決定 62 例外） |
+| 6 | `scan.complete` | 真偽値 (`true`/`false`) | `dtv_get_scan_complete()` | 直前走査の完了フラグ。失敗一覧からは JSON を作らない |
+| 7 | `scan.issues` | 配列 (`[]`) | 固定空配列 | 現行 L3 に問題供給元はなく常に `[]`（L3 決定 65） |
+| 8 | `enclosures` | オブジェクト配列 | `dtv_list_enclosures()` | 全 capacity 枠走査。NULL 枠スキップ。0 件は `[]` |
+| 9 | `enclosures[].id` | 数値 (`uint32`) | `dtv_get_enclosure_id()` | 筐体識別子 |
+| 10 | `enclosures[].model` | 文字列 / `null` | `dtv_get_model()` | 公開モデル名。内部 ID は出力しない |
+| 11 | `enclosures[].serial` | 文字列 / `null` | `dtv_get_enclosure_serial()` | 現候補は NULL（serial backend は別作業・未実装） |
+| 12 | `enclosures[].serial_unique` | 真偽値 / `null` | `dtv_get_serial_unique()` | tri-state（YES: `true`, NO: `false`, UNKNOWN: `null`） |
+| 13 | `enclosures[].status` | 文字列 | `dtv_get_status()` | 語彙: `ready`, `duplicate`, `invalid_observation`, `unknown` |
+| 14 | `enclosures[].lnb_15v_supported` | 真偽値 / `null` | `dtv_get_enclosure_support(DTV_OP_LNB_POWER)` | tri-state。静的能力（動的給電状態とは別） |
+| 15 | `enclosures[].card_reader_supported` | 真偽値 / `null` | `dtv_get_enclosure_support(DTV_OP_CARD)` | tri-state。ホスト外部利用可否（内部利用機種は `false`） |
+| 16 | `enclosures[].card_reader_device` | 数値 / `null` | `dtv_get_card_reader_device()` | 親 USB ファンクション ID。存在しない/不明時は `null` |
+| 17 | `enclosures[].devices` | オブジェクト配列 | `dtv_get_devices()` | NULL 終端配列。0 件は `[]` |
+| 18 | `enclosures[].candidates` | オブジェクト配列 | `dtv_get_candidates()` | 重複代替観測。平坦 5 鍵（L3 決定 64）。0 件は `[]` |
+| 19 | `devices[].id` | 数値 (`uint32`) | `dtv_get_device_id()` | 親 USB ファンクション ID |
+| 20 | `devices[].usb` | 文字列 | `dtv_get_vid()`, `dtv_get_pid()` | 小文字 4 桁:4 桁 `VID:PID`（例: `"0511:084a"`） |
+| 21 | `devices[].serial` | 文字列 / `null` | `dtv_get_device_serial()` | 現候補は NULL（serial backend は別作業・未実装） |
+| 22 | `devices[].bus` | 数値 / `null` | `dtv_get_bus()` | 非 NULL 時数値、未観測時 `null`（数値 0 置換禁止） |
+| 23 | `devices[].address` | 数値 / `null` | `dtv_get_address()` | 非 NULL 時数値、未観測時 `null`（数値 0 置換禁止） |
+| 24 | `devices[].port` | 文字列 / `null` | `dtv_get_port()` | 物理トポロジ文字列（例: `"1-2.3"`） |
+| 25 | `devices[].receivers` | 配列 / 省略 | `dtv_get_receivers()` | 構成未知時は**鍵を省略**、既知 0 件時は `[]` |
+| 26 | `receivers[].receiver` | 数値 (`uint32`) | `dtv_get_index()` | 筐体内で一意な受信機番号 |
+| 27 | `receivers[].device` | 数値 (`uint32`) | 親 `dtv_get_device_id()` | 親 USB ファンクション ID |
+| 28 | `receivers[].local` | 数値 (`uint32`) | `dtv_get_local()` | 親デバイス内ローカル番号 |
+| 29 | `receivers[].systems` | 文字列配列 | `dtv_get_systems()` | bit 写像（`"ISDB-T"`, `"ISDB-S"`）。未知 bit は無視 |
+| 30 | `receivers[].ts_scrambling` | 文字列 / `null` | `dtv_get_ts_scrambling()` | 語彙: `"scrambled"`, `"descrambled"`, 不明時 `null` |
+| 31 | `candidates[].device` | 数値 (`uint32`) | `candidate->device` | 候補 slot 番号（確定 device ID への置換禁止） |
+| 32 | `candidates[].serial` | 文字列 / `null` | `candidate->serial` | 候補シリアル番号 |
+| 33 | `candidates[].bus` | 数値 / `null` | `candidate->bus` | 候補 USB バス番号（平坦鍵、L3 決定 64） |
+| 34 | `candidates[].address` | 数値 / `null` | `candidate->address` | 候補デバイスアドレス（平坦鍵、L3 決定 64） |
+| 35 | `candidates[].port` | 文字列 / `null` | `candidate->port` | 候補物理ポート（平坦鍵、L3 決定 64） |
+| 36 | `ungrouped_usb_devices` | オブジェクト配列 | `dtv_list_ungrouped_devices()` | 筐体を成さなかった孤立デバイス。0 件は `[]` |
+| 37 | `ungrouped_usb_devices[].serial` | 文字列 / `null` | `ungrouped->serial` | 孤立デバイスのシリアル番号（未観測時は `null`） |
+| 38 | `ungrouped_usb_devices[].model` | 文字列 / `null` | `ungrouped->model` | モデル名（未確定時 `null`） |
+| 39 | `ungrouped_usb_devices[].usb` | 文字列 | `ungrouped->vid`, `pid` | 小文字 4 桁:4 桁 `VID:PID` |
+| 40 | `ungrouped_usb_devices[].status` | 文字列 | `ungrouped->status` | 語彙: `usable`, `unsupported`, `invalid_serial` 等 |
+| 41 | `ungrouped_usb_devices[].bus` | 数値 / `null` | `ungrouped->bus` | 孤立 USB バス番号（平坦鍵、L3 決定 64） |
+| 42 | `ungrouped_usb_devices[].address` | 数値 / `null` | `ungrouped->address` | 孤立デバイスアドレス（平坦鍵、L3 決定 64） |
+| 43 | `ungrouped_usb_devices[].port` | 文字列 / `null` | `ungrouped->port` | 孤立物理ポート（平坦鍵、L3 決定 64） |
 
-| フィールド | 型 | 説明 |
-| --- | --- | --- |
-| `id` | 数値 | 筐体識別子 |
-| `model` | 文字列 / `null` | 公開モデル名文字列（形式例: `"PX-Q3U4"`）。内部 ID は出力しない |
-| `serial` | 文字列 / `null` | 筐体シリアル番号文字列 |
-| `serial_unique` | 真偽値 / `null` | 今回のスキャンで観測された筐体間におけるシリアル番号の一意性指標（後述） |
-| `status` | 文字列 | デバイスのグルーピング状態（`ready`、`incomplete`、`duplicate`、`invalid_observation`、`unknown`） |
-| `lnb_15v_supported` | 真偽値 / `null` | 筐体の静的な LNB 15V 給電能力。不明時は `null`。動的給電状態（`lnb_15v_enabled`）とは区別される |
-| `card_reader_supported` | 真偽値 / `null` | ホストからカードリーダーを扱えるか（スマートカード関連操作が可能か）を示す静的能力指標。対応時は `true`、非対応時は `false`、ファームウェア転送前など未確定・不明時は `null` |
-| `card_reader_device` | 数値 / `null` | カードリーダーが物理的に属する親 USB ファンクション（デバイス）の `id`。リーダーが存在しない場合や不明時は `null` |
-| `devices` | オブジェクト配列 | 筐体に属する USB ファンクション（デバイス）の配列 |
-| `candidates` | オブジェクト配列 | 重複観測における代替 USB 観測データ配列 |
+※ 上記の 43 行は、共通親オブジェクトおよび位置情報の詳細展開を含む。L3 getter から直接射影・収集される論理入力単位としては全 29 項目で構成される。
 
-#### カードリーダーの公開仕様
-旧仕様における `readers[]` 配列およびリーダー番号（0, 1 など）の公開は廃止された。カードリーダーは筐体ごとに 0 個または 1 個として扱われ、JSON 上にリーダー番号は露出しない。
-ホストからの外部リーダー利用可否（`card_reader_supported`）と、機器内部でのカード利用（例: DT181 などの内部カード処理）やカード挿入有無（card presence）は別概念である。DT181 のような内部カード利用機種は外部リーダー非対応（`card_reader_supported: false`、`card_reader_device: null`）として扱われる。
+### シリアル番号の一意性契約（`serial_unique`）（L3 決定 66）
 
-#### シリアル番号の一意性（`serial_unique`）
 `serial_unique` は、同一走査内で観測された完全な筐体間におけるシリアル番号の一意性指標である（正本 L3 §4.4 / 決定 66）:
-- `true` (`DTV_YES`): 自筐体のシリアル番号（1..512 バイトの strict UTF-8、NUL・制御文字なし）が確定しており、走査が完了しており、かつ同一走査内の他の完全な筐体（容量超過で省かれた筐体を含む）とシリアルの重複がないことを意味する。**他の筐体のシリアルが NULL または UNKNOWN であっても、自筐体の一意性（`true`）を妨げない**（シリアル不明な筐体はシリアル指定による選択対象にならないため。旧仕様の「他が未知なら YES 保留」は撤回・旧版仕様へ合致）。
+- `true` (`DTV_YES`): 自筐体のシリアル番号（1..512 バイトの strict UTF-8、NUL・制御文字なし）が確定しており、走査が完了しており、かつ同一走査内の他の完全な筐体（容量超過で省かれた筐体を含む）とシリアルの重複がないことを意味する。**他の筐体のシリアルが NULL または UNKNOWN であっても、自筐体の一意性（`true`）を妨げない**（シリアル不明な筐体はシリアル指定による特定対象外のため。旧仕様の「他が未知なら YES 保留」は撤回・旧版仕様へ合致）。
 - `false` (`DTV_NO`): 同一走査内の別の完全な筐体と同一のシリアル番号を持つことが確認された場合。走査が未完了であっても、重複が検出された段階で直ちに `false` となる。
 - `null` (`DTV_UNKNOWN`): 自筐体のシリアル番号自体が NULL であるか、あるいは走査が未完了・失敗で終了した場合（既知の重複がある場合を除く）。
 
 孤立 USB デバイス（`ungrouped_usb_devices`）は一意性比較の対象外である。なお、CLI や常駐デーモンによるシリアル番号指定選択機能は現時点では未接続・未実装であり、Core 合成テストの成功をもってシリアル機能の完成や SPI 安定とは呼ばない。
 
-#### 重複候補（`candidates`）
-`candidates` は重複した筐体観測に対する代替の USB 観測データを保持するが、それらが子デバイスとして確定したことを意味しない。各候補データはデバイススロット番号、null 許容のシリアル番号、および null 許容の bus/address/port 情報を保持する。候補（candidates）レコード内の `device` は、重複観測における旧来のデバイススロット番号であり、筐体 ID ではなく、また候補が直属の子デバイスであることを主張するものでもない。
+### 位置情報と平坦化規則（L3 決定 64）
 
-### デバイスオブジェクト（`enclosures[].devices[]`）
+正本 L3 決定 64 に従い、候補オブジェクト（`candidates[]`）および孤立デバイスオブジェクト（`ungrouped_usb_devices[]`）における位置情報（bus/address/port）は、`location` などの入れ子オブジェクトを作らず、親オブジェクト直下に平らに配置する。
+- `candidates[]` は `{device, serial, bus, address, port}` の平坦な 5 鍵とする。
+- `ungrouped_usb_devices[]` は `{serial, model, usb, status, bus, address, port}` の平坦な 7 鍵とする。
+- `bus` および `address` は、L3 getter が非 NULL を返す場合は数値（`uint32` 型域）、NULL の場合は JSON の `null` とする（未観測を数値 0 などで代用してはならない）。`port` は文字列または `null` とする。
 
-| フィールド | 型 | 説明 |
-| --- | --- | --- |
-| `id` | 数値 | 親 USB ファンクション ID |
-| `usb` | 文字列 | 小文字 16 進数表記による `VID:PID` 文字列 |
-| `serial` | 文字列 / `null` | USB デバイスのシリアル番号文字列 |
-| `bus`, `address` | 数値 | USB バス番号およびデバイスアドレス |
-| `port` | 文字列 / `null` | USB 物理ポートトポロジ文字列（例: `"1-2.3"`） |
-| `receivers` | オブジェクト配列 | デバイスが収容する受信機（チューナー）の配列。構成未知時は省略、0 個確認時は `[]` |
+### 受信機の未知省略と 0 件配列
 
-### 受信機オブジェクト（`devices[].receivers[]`）
+- `dtv_get_receivers(device)` の戻り値が `nullptr` の場合、当該デバイスの受信機構成は未判明（未知）であり、JSON 出力において `receivers` **鍵自体を省略**する。
+- 戻り値配列の先頭要素が `nullptr`（要素数 0）の場合、受信機が存在しない（0 件）ことが確認済みであり、空配列 `[]` を出力する。
 
-| フィールド | 型 | 説明 |
-| --- | --- | --- |
-| `receiver` | 数値 | 同一筐体内全体を通じて重複なく一意な受信機番号 |
-| `device` | 数値 | その受信機を収容している親 USB ファンクション ID |
-| `local` | 数値 | 親デバイス（USB ファンクション）内部でのローカルインデックス |
-| `systems` | 文字列配列 | 受信機が対応する放送方式の配列（例: `["ISDB-T"]`、`["ISDB-T", "ISDB-S"]`） |
-| `ts_scrambling` | 文字列 / `null` | 受信部が出力する放送 TS のスクランブル状態（後述） |
+## 内部エンコーダの契約（`discovery_json_size` / `encode_discovery_json`）
 
-#### TS スクランブル状態（`ts_scrambling`）
-`ts_scrambling` は、受信機が出力する TS のスクランブル状態を示す:
-- `"scrambled"`: スクランブルされた生の放送 TS を出力する。B-CAS 処理（B25）は利用者が行う。
-- `"descrambled"`: 機器内部でスクランブルを解除した TS を出力する（例: PIX 公式ファームウェア運用時）。
-- `null`: ファームウェア転送前、または状態が判明する前（不明時）。
+内部 C++ API `include/dtv/internal/discovery-json.hpp`（名前空間 `dtv::internal`）は以下の契約を提供する。
 
-本フィールドは製品変換後の放送 TS のスクランブル状態を表すものであり、USB 転送路の保護（USB AES 等）の有無は含まない（AES 暗号化は製品ライブラリ内部で透過的に解除される）。
+1. **2 段階処理（サイズ計測とエンコード）:**
+   - `discovery_json_size(input, &bytes)`:
+     入力データ全体の UTF-8 検証、ID 重複チェック、列挙値検証、および末尾改行（`\n`）を含む正確な byte 数を計測する。
+   - `encode_discovery_json(input, output)`:
+     出力を `output->data` へ書き込み、実際に書き込んだバイト数を `output->size` に設定する。
+2. **失敗時の無変更保証:**
+   - 入力検証失敗（`invalid_argument`）または出力先バッファ容量不足（`buffer_too_small`）が発生した場合、エンコーダは出力先バッファの内容を一切変更せず、`output->size` も変更しない。
+3. **追加ターゲット非新設:**
+   - 本エンコーダは Core ライブラリの内部実装として組み込まれ、出力専用の外部バイナリターゲット等は新設しない。
 
-### 孤立 USB デバイス（`ungrouped_usb_devices[]`）
+## CLI `--list-json` の呼び出し・出力・終了規則
 
-特定の筐体に割り当てられなかった孤立 USB デバイスは `ungrouped_usb_devices` に留まり、`serial`（null 許容）、`model`（null 許容）、`location`（null 許容）、`usb`（小文字 `VID:PID`）、およびデバイス状態（`usable`、`unsupported`、`invalid_serial`、`insufficient_speed`、`invalid_topology`、`open_failed`、`unknown` のいずれか）を出力する。
+1. **引数優先順位:**
+   - 生成 CLI において、引数は `--help` (`-h`) → `--version` → `--list-json` → `--models` の順に優先して評価される。
+   - `--list-json` は単独実行のほか、他の不正引数チェックよりも優先して実行される（`--models` のように他引数との併用を理由とする即時拒否 `argc != 2` 規則はない）。未知の引数のみが渡された場合は exit 2 となる。
+2. **出力と stdout 失敗の区別:**
+   - 成功時は compact UTF-8 JSON 1 文書と末尾改行（`\n`）1 個を stdout へ書き出し、exit 0 で正常終了する。
+   - 内部検証失敗、L3 走査失敗、メモリ不足等の内部失敗時は、stdout への出力を一切開始せず（stdout 空）、stderr にエラーを出力して exit コード（L3 エラー写像、または 70）で終了する。
+   - 一方、完成したバッファを stdout へ書き込む際の物理的な書込み失敗（`fwrite` 失敗または `fflush` 失敗）が発生した場合は、prefix 回収不能として exit 70 とする。内部失敗時の「部分出力なし（stdout 空）」と、物理 I/O 障害時の途中失敗を明確に区別する。
 
-## エンコーダの出力保証
+## 接点および未接続・未実装境界
 
-`discovery_json_size` は入力データ全体を検証した上で出力電文のバイトサイズを正確に計測する。エンコーダは実際の書き込みに先立ち完全な検証とサイズ計測を実行し、出力先バッファが不足している場合は `BUFFER_TOO_SMALL` を返し、いずれの失敗時にも出力先バッファの内容を変更しない。この API は `dtv::json` ライブラリの一部として提供され、出力専用の追加バイナリターゲットを新設することはない。スキャン結果の配列は借用されたポインタと要素数のペアとして渡されるため、アダプター層は固定の検出件数上限に縛られることなく観測された全筐体データを引き渡すことができる。関数の実行期間中、ポインタが指し示す入力配列の内容を変更してはならない。
+- **Serial Backend および実機境界（L3 決定 66）:**
+  - Core において USB STRING 記述子の共通観測・lossless UTF-8 復号、機種導出 SPI（`dtv_derive_enclosure_serial_fn`）、および公開 getter（`dtv_get_enclosure_serial`, `dtv_get_serial_unique`, `dtv_get_device_serial`）の実装と合成契約テストは完了している。
+  - 一方で、実機 PX-Q3U4 における 2 function raw 観測、14 桁 base 導出、製品（px4-userland）側コールバック宣言、および CLI / daemon でのシリアル指定機器選択動作は未確認・未接続である。Core 単体合成成功をもって「シリアル機能完成」や「SPI 安定」とは呼ばない。
+  - JSON 出力例における `serial: null` や `serial_unique: null` は、シリアル未観測・未宣言環境における合法な出力例として維持される。
+- **容量超過と scan.issues（L3 決定 65）:**
+  - 一覧の最大容量（既定 128 筐体）を超過して筐体が除外された場合、Core 内部の警告ログ出力および `scan.complete = true` の維持にとどまり、`scan.issues` には載せない（常に `[]`）。
+  - 未決の `scan.issues` コード（`capacity_omitted` 等）や公開 getter（`dtv_get_scan_omitted_count` 等）は採用しない。
+- **後続コンポーネント:**
+  - 別プロセスの常駐 daemon 統合や CLI daemon 動作は本 PR には含まれず、未実装のままである。
