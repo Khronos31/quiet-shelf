@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include <dtv/internal/wire-list-response.hpp>
 
 #include <array>
