@@ -57,8 +57,7 @@ add_library(dtv-userland STATIC
     src/usb.cpp
     src/wire-envelope.cpp
     src/wire-subset.cpp
-    src/wire-lnb-power.cpp
-    src/status-json.cpp)
+    src/wire-lnb-power.cpp)
 add_library(dtv::userland ALIAS dtv-userland)
 target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
@@ -104,7 +103,4 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(wire_lnb_power_contract tests/wire-lnb-power.cpp)
     target_link_libraries(wire_lnb_power_contract PRIVATE dtv::userland)
     add_test(NAME wire_lnb_power_contract COMMAND wire_lnb_power_contract)
-    add_executable(status_json_contract tests/status-json.cpp)
-    target_link_libraries(status_json_contract PRIVATE dtv::userland)
-    add_test(NAME status_json_contract COMMAND status_json_contract)
 endif()

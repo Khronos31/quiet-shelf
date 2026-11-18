@@ -100,13 +100,13 @@ int main()
     const WireHeader event{0x80f0, 0, 0, 4};
     const std::array<WireHeader, 4> headers{request, response, error, event};
     const std::array<std::array<std::uint8_t, 20>, 4> golden{{
-        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x01, 0x00, 0x10, 0x00,
          0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0x03, 0x00, 0x00, 0x00},
-        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x01, 0x00, 0x10, 0x00,
          0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x02, 0x00, 0x00, 0x00},
-        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x00, 0x00, 0x11, 0x00,
+        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x01, 0x00, 0x11, 0x00,
          0x03, 0x00, 0x44, 0x33, 0x22, 0x11, 0x01, 0x00, 0x00, 0x00},
-        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x00, 0x00, 0xf0, 0x80,
+        {0x55, 0x44, 0x54, 0x56, 0x01, 0x00, 0x01, 0x00, 0xf0, 0x80,
          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00},
     }};
 
@@ -125,7 +125,7 @@ int main()
     const WireHeader unknown_request{0x1234, 0, 9, 0};
     const WireHeader unknown_event{0x8abc, 0, 0, 0};
     for (const auto &header : {unknown_request, unknown_event}) {
-        const auto bytes = raw_header({'U', 'D', 'T', 'V'}, 1, 0, header);
+        const auto bytes = raw_header({'U', 'D', 'T', 'V'}, 1, 1, header);
         WireHeader decoded;
         if (int failed = check(decode(bytes, &decoded) == WireFrameCode::ok &&
                                    same_header(decoded, header),
@@ -144,19 +144,20 @@ int main()
         WireHeader header;
         WireFrameCode expected;
     };
-    const std::array<BadHeader, 12> bad_headers{{
-        {{'P', 'X', '4', 'U'}, 1, 0, request, WireFrameCode::protocol_error},
-        {{'A', 'S', 'C', 'N'}, 1, 0, request, WireFrameCode::protocol_error},
+    const std::array<BadHeader, 13> bad_headers{{
+        {{'P', 'X', '4', 'U'}, 1, 1, request, WireFrameCode::protocol_error},
+        {{'A', 'S', 'C', 'N'}, 1, 1, request, WireFrameCode::protocol_error},
         {{'U', 'D', 'T', 'V'}, 2, 0, request, WireFrameCode::version_mismatch},
-        {{'U', 'D', 'T', 'V'}, 1, 1, request, WireFrameCode::version_mismatch},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x0010, 2, 1, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x0010, 4, 1, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x0010, 0, 0, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x0010, 1, 0, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x0011, 3, 0, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x80f0, 1, 1, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x80f0, 0, 1, 0}, WireFrameCode::protocol_error},
-        {{'U', 'D', 'T', 'V'}, 1, 0, {0x80f0, 3, 0, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 0, request, WireFrameCode::version_mismatch},
+        {{'U', 'D', 'T', 'V'}, 1, 2, request, WireFrameCode::version_mismatch},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x0010, 2, 1, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x0010, 4, 1, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x0010, 0, 0, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x0010, 1, 0, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x0011, 3, 0, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x80f0, 1, 1, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x80f0, 0, 1, 0}, WireFrameCode::protocol_error},
+        {{'U', 'D', 'T', 'V'}, 1, 1, {0x80f0, 3, 0, 0}, WireFrameCode::protocol_error},
     }};
     for (const auto &bad : bad_headers) {
         const auto bytes = raw_header(bad.magic, bad.major, bad.minor, bad.header);
@@ -177,7 +178,7 @@ int main()
         {{0x8001, 0, 0, 65537}, WireFrameCode::protocol_error},
     }};
     for (const auto &cap : cap_cases) {
-        const auto bytes = raw_header({'U', 'D', 'T', 'V'}, 1, 0, cap.header);
+        const auto bytes = raw_header({'U', 'D', 'T', 'V'}, 1, 1, cap.header);
         WireHeader decoded;
         if (int failed = check(decode(bytes, &decoded) == cap.expected, 6)) return failed;
         std::array<std::uint8_t, 20> encoded{};
@@ -377,7 +378,7 @@ int main()
     {
         FrameReceiver receiver(storage_view);
         Collected collected;
-        const auto too_long = raw_header({'U', 'D', 'T', 'V'}, 1, 0,
+        const auto too_long = raw_header({'U', 'D', 'T', 'V'}, 1, 1,
                                          WireHeader{0x0010, 0, 1, 65537});
         if (int failed = check(receiver.feed(dtv_bytes{too_long.data(), too_long.size()},
                                              collect_frame, &collected) ==
@@ -417,7 +418,7 @@ int main()
     {
         FrameReceiver receiver(storage_view);
         Collected collected;
-        const auto bad_magic = raw_header({'P', 'X', '4', 'U'}, 1, 0, response);
+        const auto bad_magic = raw_header({'P', 'X', '4', 'U'}, 1, 1, response);
         std::vector<std::uint8_t> mixed = first;
         mixed.insert(mixed.end(), bad_magic.begin(), bad_magic.end());
         if (int failed = check(receiver.feed(dtv_bytes{mixed.data(), mixed.size()},
@@ -457,8 +458,8 @@ int main()
                                33)) return failed;
     }
     {
-        const auto bad_magic = raw_header({'X', 'D', 'T', 'V'}, 1, 0, request);
-        const auto bad_version = raw_header({'U', 'D', 'T', 'V'}, 2, 0, request);
+        const auto bad_magic = raw_header({'X', 'D', 'T', 'V'}, 1, 1, request);
+        const auto bad_version = raw_header({'U', 'D', 'T', 'V'}, 1, 0, request);
         FrameReceiver poisoned(storage_view);
         Collected collected;
         if (int failed = check(poisoned.feed(dtv_bytes{bad_magic.data(), bad_magic.size()},
@@ -477,6 +478,23 @@ int main()
                                    WireFrameCode::ok &&
                                    collected.headers.size() == 1,
                                36)) return failed;
+    }
+    {
+        const auto old_version_header = raw_header({'U', 'D', 'T', 'V'}, 1, 0, request);
+        std::vector<std::uint8_t> old_version_frame(old_version_header.begin(),
+                                                    old_version_header.end());
+        old_version_frame.insert(old_version_frame.end(), request_payload.begin(),
+                                 request_payload.end());
+        FrameReceiver receiver(storage_view);
+        Collected collected;
+        if (int failed = check(receiver.feed(
+                                   dtv_bytes{old_version_frame.data(), old_version_frame.size()},
+                                   collect_frame, &collected) ==
+                                   WireFrameCode::version_mismatch &&
+                                   receiver.status() == WireFrameCode::version_mismatch &&
+                                   receiver.pending_size() == dtv::internal::kWireHeaderSize &&
+                                   collected.headers.empty() && collected.payloads.empty(),
+                               37)) return failed;
     }
 
     return 0;

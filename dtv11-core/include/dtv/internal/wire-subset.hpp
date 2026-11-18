@@ -50,7 +50,7 @@ WireFrameCode decode_acquire_request(dtv_bytes payload, AcquireRequest *value);
 WireFrameCode encode_acquire_request(const AcquireRequest &value, dtv_buffer *output);
 WireFrameCode decode_acquire_response(dtv_bytes payload, AcquireResponse *value);
 WireFrameCode encode_acquire_response(const AcquireResponse &value, dtv_buffer *output);
-/* min <= 1.0 <= max のときだけ 1.0 を返す。逆転した範囲は INVALID_ARGUMENT。 */
+/* min <= 1.1 <= max のときだけ 1.1 を返す。逆転した範囲は INVALID_ARGUMENT。 */
 WireFrameCode negotiate_hello_version(const HelloRequest &value, WireVersion *version);
 
 }

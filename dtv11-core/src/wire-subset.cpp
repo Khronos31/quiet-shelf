@@ -160,10 +160,10 @@ WireFrameCode negotiate_hello_version(const HelloRequest &value, WireVersion *ve
     if (version == nullptr) return WireFrameCode::invalid_argument;
     if (!hello_range_valid(value)) return WireFrameCode::invalid_argument;
     const bool includes =
-        !version_less(1, 0, value.min_major, value.min_minor) &&
-        !version_less(value.max_major, value.max_minor, 1, 0);
+        !version_less(1, 1, value.min_major, value.min_minor) &&
+        !version_less(value.max_major, value.max_minor, 1, 1);
     if (!includes) return WireFrameCode::version_mismatch;
-    *version = WireVersion{1, 0};
+    *version = WireVersion{1, 1};
     return WireFrameCode::ok;
 }
 

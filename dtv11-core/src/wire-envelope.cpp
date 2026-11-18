@@ -66,7 +66,7 @@ void write_header(const WireHeader &header, std::uint8_t *output)
     output[2] = 'T';
     output[3] = 'V';
     write_u16(output + 4, 1);
-    write_u16(output + 6, 0);
+    write_u16(output + 6, 1);
     write_u16(output + 8, header.opcode);
     write_u16(output + 10, header.flags);
     write_u32(output + 12, header.request_id);
@@ -82,7 +82,7 @@ WireFrameCode decode_header(dtv_bytes input, WireHeader *header)
     const auto *data = input.data;
     const bool magic = data[0] == 'U' && data[1] == 'D' && data[2] == 'T' && data[3] == 'V';
     if (!magic) return WireFrameCode::protocol_error;
-    if (read_u16(data + 4) != 1 || read_u16(data + 6) != 0) {
+    if (read_u16(data + 4) != 1 || read_u16(data + 6) != 1) {
         return WireFrameCode::version_mismatch;
     }
     WireHeader decoded;

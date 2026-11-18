@@ -103,9 +103,9 @@ std::vector<std::uint8_t> frame_with_payload(const WireHeader &header,
 
 int main()
 {
-    const HelloRequest hello{1, 0, 1, 0, 0x0102030405060708ull, 0x1112131415161718ull};
+    const HelloRequest hello{1, 1, 1, 1, 0x0102030405060708ull, 0x1112131415161718ull};
     const std::array<std::uint8_t, 24> hello_golden{
-        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
         0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
     };
@@ -152,27 +152,27 @@ int main()
     {
         WireVersion version;
         if (int failed = check(
-                negotiate_hello_version(HelloRequest{1, 0, 1, 0}, &version) ==
+                negotiate_hello_version(HelloRequest{1, 1, 1, 1}, &version) ==
                         WireFrameCode::ok &&
-                    version.major == 1 && version.minor == 0,
+                    version.major == 1 && version.minor == 1,
                 6)) return failed;
-        if (int failed = check(negotiate_hello_version(HelloRequest{0, 9, 1, 1}, &version) ==
-                                   WireFrameCode::ok &&
-                               version.major == 1 && version.minor == 0,
+        if (int failed = check(negotiate_hello_version(HelloRequest{1, 0, 1, 0}, &version) ==
+                                   WireFrameCode::version_mismatch,
                                7)) return failed;
         if (int failed = check(negotiate_hello_version(HelloRequest{2, 0, 3, 0}, &version) ==
                                    WireFrameCode::version_mismatch &&
                                negotiate_hello_version(HelloRequest{0, 1, 0, 9}, &version) ==
                                    WireFrameCode::version_mismatch &&
                                negotiate_hello_version(HelloRequest{1, 1, 2, 0}, &version) ==
-                                   WireFrameCode::version_mismatch,
+                                   WireFrameCode::ok &&
+                               version.major == 1 && version.minor == 1,
                                8)) return failed;
         if (int failed = check(negotiate_hello_version(HelloRequest{2, 0, 1, 0}, &version) ==
                                    WireFrameCode::invalid_argument &&
                                negotiate_hello_version(HelloRequest{1, 1, 1, 0}, &version) ==
                                    WireFrameCode::invalid_argument,
                                9)) return failed;
-        if (int failed = check(negotiate_hello_version(HelloRequest{1, 0, 1, 0}, nullptr) ==
+        if (int failed = check(negotiate_hello_version(HelloRequest{1, 1, 1, 1}, nullptr) ==
                                    WireFrameCode::invalid_argument,
                                10)) return failed;
     }
