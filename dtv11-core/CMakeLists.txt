@@ -59,7 +59,7 @@ add_library(dtv-userland STATIC
     src/wire-envelope.cpp
     src/wire-error-response.cpp
     src/wire-hello-list.cpp
-    src/wire-list-response.cpp
+    src/wire-status-request.cpp
     src/wire-subset.cpp
     src/wire-lnb-power.cpp
     src/status-json.cpp)
@@ -111,9 +111,9 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(wire_hello_list_contract tests/wire-hello-list.cpp)
     target_link_libraries(wire_hello_list_contract PRIVATE dtv::userland)
     add_test(NAME wire_hello_list_contract COMMAND wire_hello_list_contract)
-    add_executable(wire_list_response_contract tests/wire-list-response.cpp)
-    target_link_libraries(wire_list_response_contract PRIVATE dtv::userland)
-    add_test(NAME wire_list_response_contract COMMAND wire_list_response_contract)
+    add_executable(wire_status_request_contract tests/wire-status-request.cpp)
+    target_link_libraries(wire_status_request_contract PRIVATE dtv::userland)
+    add_test(NAME wire_status_request_contract COMMAND wire_status_request_contract)
     add_executable(wire_subset_contract tests/wire-subset.cpp)
     target_link_libraries(wire_subset_contract PRIVATE dtv::userland)
     add_test(NAME wire_subset_contract COMMAND wire_subset_contract)
