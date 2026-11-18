@@ -96,7 +96,7 @@
 | 8 | `enclosures` | オブジェクト配列 | `dtv_list_enclosures()` | 全 capacity 枠走査。NULL 枠スキップ。0 件は `[]` |
 | 9 | `enclosures[].id` | 数値 (`uint32`) | `dtv_get_enclosure_id()` | 筐体識別子 |
 | 10 | `enclosures[].model` | 文字列 / `null` | `dtv_get_model()` | 公開モデル名。内部 ID は出力しない |
-| 11 | `enclosures[].serial` | 文字列 / `null` | `dtv_get_enclosure_serial()` | 現候補は NULL（serial backend は別作業・未実装） |
+| 11 | `enclosures[].serial` | 文字列 / `null` | `dtv_get_enclosure_serial()` | 筐体シリアル番号（未観測時は `null`） |
 | 12 | `enclosures[].serial_unique` | 真偽値 / `null` | `dtv_get_serial_unique()` | tri-state（YES: `true`, NO: `false`, UNKNOWN: `null`） |
 | 13 | `enclosures[].status` | 文字列 | `dtv_get_status()` | 語彙: `ready`, `duplicate`, `invalid_observation`, `unknown` |
 | 14 | `enclosures[].lnb_15v_supported` | 真偽値 / `null` | `dtv_get_enclosure_support(DTV_OP_LNB_POWER)` | tri-state。静的能力（動的給電状態とは別） |
@@ -106,7 +106,7 @@
 | 18 | `enclosures[].candidates` | オブジェクト配列 | `dtv_get_candidates()` | 重複代替観測。平坦 5 鍵（L3 決定 64）。0 件は `[]` |
 | 19 | `devices[].id` | 数値 (`uint32`) | `dtv_get_device_id()` | 親 USB ファンクション ID |
 | 20 | `devices[].usb` | 文字列 | `dtv_get_vid()`, `dtv_get_pid()` | 小文字 4 桁:4 桁 `VID:PID`（例: `"0511:084a"`） |
-| 21 | `devices[].serial` | 文字列 / `null` | `dtv_get_device_serial()` | 現候補は NULL（serial backend は別作業・未実装） |
+| 21 | `devices[].serial` | 文字列 / `null` | `dtv_get_device_serial()` | デバイスシリアル番号（未観測時は `null`） |
 | 22 | `devices[].bus` | 数値 / `null` | `dtv_get_bus()` | 非 NULL 時数値、未観測時 `null`（数値 0 置換禁止） |
 | 23 | `devices[].address` | 数値 / `null` | `dtv_get_address()` | 非 NULL 時数値、未観測時 `null`（数値 0 置換禁止） |
 | 24 | `devices[].port` | 文字列 / `null` | `dtv_get_port()` | 物理トポロジ文字列（例: `"1-2.3"`） |
