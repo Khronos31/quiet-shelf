@@ -372,6 +372,7 @@ struct EnclosureRegistry::State {
     std::map<std::uint64_t, std::shared_ptr<UngroupedEntry>> ungrouped_entries;
     std::vector<std::shared_ptr<UngroupedEntry>> retired_ungrouped;
     std::vector<const dtv_ungrouped_device *> ungrouped_view{nullptr};
+    bool last_result_ok = false;
     std::function<void()> before_ungrouped_allocation;
     std::function<void()> before_token_allocation;
     std::function<void()> before_receiver_allocation;
@@ -381,6 +382,16 @@ struct EnclosureRegistry::State {
     mutable std::mutex mutex;
     bool complete = false;
     bool resource_limit = false;
+
+    void clear_ungrouped_view()
+    {
+        if (ungrouped_view.empty()) {
+            ungrouped_view.push_back(nullptr);
+        } else {
+            ungrouped_view[0] = nullptr;
+            ungrouped_view.resize(1);
+        }
+    }
 
     void begin_boundary()
     {
@@ -743,6 +754,8 @@ struct EnclosureRegistry::State {
         std::unique_lock lock(mutex);
         begin_boundary();
         complete = false;
+        last_result_ok = false;
+        clear_ungrouped_view();
         if (resource_limit) {
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
         }
@@ -847,37 +860,35 @@ struct EnclosureRegistry::State {
             std::map<std::uint64_t, std::shared_ptr<UngroupedEntry>> next_ungrouped;
             std::vector<std::shared_ptr<UngroupedEntry>> retired_ungrouped_next;
             std::vector<const dtv_ungrouped_device *> next_ungrouped_view;
-            if (!fd_selection_batch) {
-                next_ungrouped_view.reserve(batch.ungrouped.size() + 1);
-                retired_ungrouped_next.reserve(ungrouped_entries.size());
-                for (const auto &observation : batch.ungrouped) {
-                    if (observation.snapshot_index >= batch.snapshots.size() ||
-                        observation.connection_token == 0) return invalid();
-                    const auto &snapshot = batch.snapshots[observation.snapshot_index];
-                    if (snapshot.connection_token != observation.connection_token) return invalid();
-                    const auto current = ungrouped_entries.find(observation.connection_token);
-                    std::shared_ptr<UngroupedEntry> entry;
-                    if (current != ungrouped_entries.end() &&
-                        current->second->same_values(snapshot, observation.model)) {
-                        entry = current->second;
-                    } else {
-                        if (before_ungrouped_allocation) before_ungrouped_allocation();
-                        entry = std::make_shared<UngroupedEntry>(
-                            snapshot, observation.connection_token, observation.model);
-                        if (current != ungrouped_entries.end()) {
-                            retired_ungrouped_next.push_back(current->second);
-                        }
+            next_ungrouped_view.reserve(batch.ungrouped.size() + 1);
+            retired_ungrouped_next.reserve(ungrouped_entries.size());
+            for (const auto &observation : batch.ungrouped) {
+                if (observation.snapshot_index >= batch.snapshots.size() ||
+                    observation.connection_token == 0) return invalid();
+                const auto &snapshot = batch.snapshots[observation.snapshot_index];
+                if (snapshot.connection_token != observation.connection_token) return invalid();
+                const auto current = ungrouped_entries.find(observation.connection_token);
+                std::shared_ptr<UngroupedEntry> entry;
+                if (current != ungrouped_entries.end() &&
+                    current->second->same_values(snapshot, observation.model)) {
+                    entry = current->second;
+                } else {
+                    if (before_ungrouped_allocation) before_ungrouped_allocation();
+                    entry = std::make_shared<UngroupedEntry>(
+                        snapshot, observation.connection_token, observation.model);
+                    if (current != ungrouped_entries.end()) {
+                        retired_ungrouped_next.push_back(current->second);
                     }
-                    if (!next_ungrouped.emplace(observation.connection_token, entry).second) {
-                        return invalid();
-                    }
-                    next_ungrouped_view.push_back(&entry->object);
                 }
-                for (const auto &[connection, entry] : ungrouped_entries) {
-                    if (!next_ungrouped.contains(connection)) retired_ungrouped_next.push_back(entry);
+                if (!next_ungrouped.emplace(observation.connection_token, entry).second) {
+                    return invalid();
                 }
-                next_ungrouped_view.push_back(nullptr);
+                next_ungrouped_view.push_back(&entry->object);
             }
+            for (const auto &[connection, entry] : ungrouped_entries) {
+                if (!next_ungrouped.contains(connection)) retired_ungrouped_next.push_back(entry);
+            }
+            next_ungrouped_view.push_back(nullptr);
             retired_ungrouped.reserve(retired_ungrouped.size() + retired_ungrouped_next.size());
             tombstones.reserve(tombstones.size() + removed_count);
             std::list<QueuedEvent> prepared_events;
@@ -919,15 +930,12 @@ struct EnclosureRegistry::State {
                     token_view[selected->second] = &live_roots[selected->second]->object;
                 }
             }
-            if (fd_selection_batch) {
-                fd_selection.swap(next_fd_selection);
-            } else {
-                for (auto &entry : retired_ungrouped_next) {
-                    retired_ungrouped.push_back(std::move(entry));
-                }
-                ungrouped_entries.swap(next_ungrouped);
-                ungrouped_view.swap(next_ungrouped_view);
+            for (auto &entry : retired_ungrouped_next) {
+                retired_ungrouped.push_back(std::move(entry));
             }
+            ungrouped_entries.swap(next_ungrouped);
+            ungrouped_view.swap(next_ungrouped_view);
+            if (fd_selection_batch) fd_selection.swap(next_fd_selection);
             fd_view.fill(nullptr);
             for (const auto &key : fd_selection) {
                 const auto selected = live_index.find(key);
@@ -940,6 +948,7 @@ struct EnclosureRegistry::State {
             }
             events.splice(events.end(), prepared_events);
             complete = true;
+            last_result_ok = true;
             lock.unlock();
             if (omitted_count != 0) log_capacity_overflow(omitted_count, kCapacity);
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
@@ -1032,6 +1041,7 @@ const std::array<dtv_enclosure *, DTV_MAX_ENCLOSURES> &EnclosureRegistry::live_s
 const dtv_ungrouped_device *const *EnclosureRegistry::ungrouped_view() const
 {
     std::lock_guard lock(state_->mutex);
+    if (!state_->last_result_ok) return nullptr;
     return state_->ungrouped_view.data();
 }
 
@@ -2306,6 +2316,8 @@ dtv_internal_result EnclosureRegistry::scan_failed()
     std::lock_guard lock(state_->mutex);
     state_->begin_boundary();
     state_->complete = false;
+    state_->last_result_ok = false;
+    state_->clear_ungrouped_view();
     if (state_->resource_limit) {
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
     }
@@ -6287,8 +6299,6 @@ extern "C" const dtv_ungrouped_device *const *dtv_list_ungrouped_devices(void)
         std::lock_guard lock(state.api_mutex);
         state.list_started = true;
         state.registry.begin_public_boundary();
-        const auto result = state.refresh_and_project();
-        if (result.code != DTV_INTERNAL_RESULT_OK) return nullptr;
         return state.registry.ungrouped_view();
     } catch (...) {
         return nullptr;

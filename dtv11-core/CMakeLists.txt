@@ -57,7 +57,6 @@ add_library(dtv-userland STATIC
     src/usb.cpp
     src/wire-envelope.cpp
     src/wire-error-response.cpp
-    src/wire-hello-list.cpp
     src/wire-subset.cpp
     src/wire-lnb-power.cpp)
 add_library(dtv::userland ALIAS dtv-userland)
@@ -102,9 +101,6 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(wire_error_response_contract tests/wire-error-response.cpp)
     target_link_libraries(wire_error_response_contract PRIVATE dtv::userland)
     add_test(NAME wire_error_response_contract COMMAND wire_error_response_contract)
-    add_executable(wire_hello_list_contract tests/wire-hello-list.cpp)
-    target_link_libraries(wire_hello_list_contract PRIVATE dtv::userland)
-    add_test(NAME wire_hello_list_contract COMMAND wire_hello_list_contract)
     add_executable(wire_subset_contract tests/wire-subset.cpp)
     target_link_libraries(wire_subset_contract PRIVATE dtv::userland)
     add_test(NAME wire_subset_contract COMMAND wire_subset_contract)

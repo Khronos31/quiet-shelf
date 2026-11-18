@@ -17,6 +17,7 @@ void fd_test_group_error(unsigned);
 int fd_test_last_descriptor(void);
 unsigned fd_test_closed(void);
 void dtv_load_scanfixture(void);
+void dtv_ungrouped_test_batch(unsigned mode);
 
 static int valid_fd(int fd)
 {
@@ -105,6 +106,20 @@ int main(void)
         error.code != DTV_ERROR_INVALID_ARGUMENT || dtv_get_status(root) != DTV_ENCLOSURE_READY) return 18;
     if (dtv_list_enclosures_by_fds(NULL, 1, &error) != NULL ||
         error.code != DTV_ERROR_INVALID_ARGUMENT) return 8;
+
+    dtv_ungrouped_test_batch(0);
+    normal = dtv_list_enclosures(&error);
+    if (normal == NULL || error.code != DTV_ERROR_OK || normal[0] != NULL) return 19;
+    const dtv_ungrouped_device *const *ungrouped = dtv_list_ungrouped_devices();
+    if (ungrouped == NULL || ungrouped[0] == NULL) return 20;
+    fd_test_reset();
+    selected = dtv_list_enclosures_by_fds(fds, 2, &error);
+    if (selected == NULL || error.code != DTV_ERROR_OK) return 21;
+    const unsigned closed_after_fd = fd_test_closed();
+    ungrouped = dtv_list_ungrouped_devices();
+    if (ungrouped == NULL || ungrouped[0] != NULL || dtv_get_scan_complete() != 1 ||
+        fd_test_closed() != closed_after_fd) return 22;
+
     close(first[0]); close(first[1]); close(second[0]); close(second[1]);
     return 0;
 }

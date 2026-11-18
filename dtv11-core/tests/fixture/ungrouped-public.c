@@ -18,8 +18,17 @@ static uint32_t count_devices(const dtv_ungrouped_device *const *devices, uint32
     return UINT32_MAX;
 }
 
+static int refresh_list(void)
+{
+    dtv_error error = {0};
+    error.struct_size = sizeof(error);
+    dtv_enclosure *const *list = dtv_list_enclosures(&error);
+    return list != NULL && error.code == DTV_ERROR_OK;
+}
+
 static int empty_success(void)
 {
+    if (!refresh_list()) return 0;
     const dtv_ungrouped_device *const *devices = dtv_list_ungrouped_devices();
     return devices != NULL && devices[0] == NULL && dtv_get_scan_complete() == 1;
 }
@@ -46,6 +55,8 @@ int main(void)
     dtv_load_scanfixture();
     dtv_event event;
     dtv_call_options timeout = {sizeof(timeout), 1};
+    dtv_error error = {0};
+    error.struct_size = sizeof(error);
 
     dtv_ungrouped_test_batch(5);
     if (!empty_success()) return 1;
@@ -53,36 +64,45 @@ int main(void)
     if (!empty_success()) return 2;
     dtv_load_fixture();
     dtv_ungrouped_test_batch(6);
+    if (!refresh_list()) return 30;
     const dtv_ungrouped_device *const *devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, 3) != 1 || devices[0]->model == NULL ||
         strcmp(devices[0]->model, "Fixture One") != 0) return 3;
 
     dtv_ungrouped_test_batch(7);
+    if (!refresh_list()) return 31;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, 3) != 1 || devices[0]->vid != 0x1234 ||
         devices[0]->pid != 0x0001) return 4;
 
     dtv_ungrouped_test_batch(8);
+    if (!refresh_list()) return 32;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, dtv_get_list_capacity() + 2) !=
                                dtv_get_list_capacity() + 1) return 5;
 
     dtv_ungrouped_test_batch(0);
+    if (!refresh_list()) return 33;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, 3) != 1 ||
         !scan_fixture_entry(devices[0], 1, 7, "1-1.7")) return 6;
+    const dtv_ungrouped_device *first_entry = devices[0];
 
     dtv_ungrouped_test_batch(10);
+    devices = dtv_list_ungrouped_devices();
+    if (devices == NULL || devices[0] != first_entry || dtv_get_scan_complete() != 1) return 29;
+    if (!refresh_list()) return 34;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, 3) != 1 ||
         !unique_scan_fixture_entry(devices[0])) return 24;
 
     dtv_ungrouped_test_batch(0);
+    if (!refresh_list()) return 35;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, 3) != 1 ||
         !scan_fixture_entry(devices[0], 1, 7, "1-1.7")) return 25;
     const dtv_ungrouped_device *old = devices[0];
-    dtv_error error = {0};
+    error = (dtv_error){0};
     error.struct_size = sizeof(error);
     dtv_enclosure *const *common = dtv_list_enclosures(&error);
     dtv_enclosure *const *product = dtv_list_enclosures_scanfixture(&error);
@@ -91,6 +111,7 @@ int main(void)
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || devices[0] != old) return 27;
     dtv_ungrouped_test_batch(1);
+    if (!refresh_list()) return 36;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || devices[0] != old) return 7;
     if (dtv_wait_event(&event, &timeout, NULL) != DTV_ERROR_TIMEOUT) return 23;
@@ -99,38 +120,49 @@ int main(void)
 
     dtv_ungrouped_test_batch(2);
     dtv_ungrouped_test_fail_allocation(1);
-    if (dtv_list_ungrouped_devices() != NULL || dtv_get_scan_complete() != 0 ||
+    error = (dtv_error){0};
+    error.struct_size = sizeof(error);
+    if (dtv_list_enclosures(&error) != NULL ||
+        dtv_list_ungrouped_devices() != NULL || dtv_get_scan_complete() != 0 ||
         !scan_fixture_entry(old, 1, 7, "1-1.7")) return 8;
     dtv_ungrouped_test_fail_allocation(0);
+    if (!scan_fixture_entry(old, 1, 7, "1-1.7")) return 9;
+    if (!refresh_list()) return 37;
     devices = dtv_list_ungrouped_devices();
-    if (devices == NULL || count_devices(devices, 3) != 1 || devices[0] == old ||
-        !scan_fixture_entry(devices[0], 2, 8, "2-2.8") ||
-        !scan_fixture_entry(old, 1, 7, "1-1.7")) return 9;
+    if (devices == NULL || count_devices(devices, 3) != 1 ||
+        !scan_fixture_entry(devices[0], 2, 8, "2-2.8")) return 9;
 
     const dtv_ungrouped_device *changed = devices[0];
     dtv_ungrouped_test_scan_error(1);
-    if (dtv_list_ungrouped_devices() != NULL || dtv_get_scan_complete() != 0 ||
+    error = (dtv_error){0};
+    error.struct_size = sizeof(error);
+    if (dtv_list_enclosures(&error) != NULL || error.code != DTV_ERROR_USB_IO ||
+        dtv_list_ungrouped_devices() != NULL || dtv_get_scan_complete() != 0 ||
         !scan_fixture_entry(changed, 2, 8, "2-2.8")) return 10;
     dtv_ungrouped_test_scan_error(0);
+    if (!refresh_list()) return 38;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || devices[0] != changed) return 11;
 
     dtv_ungrouped_test_batch(4);
+    if (!scan_fixture_entry(changed, 2, 8, "2-2.8")) return 12;
+    if (!refresh_list()) return 39;
     devices = dtv_list_ungrouped_devices();
-    if (devices == NULL || devices[0] != NULL ||
-        !scan_fixture_entry(changed, 2, 8, "2-2.8")) return 12;
+    if (devices == NULL || devices[0] != NULL) return 12;
     if (dtv_wait_event(&event, &timeout, NULL) != DTV_ERROR_TIMEOUT) return 13;
 
     dtv_ungrouped_test_batch(9);
+    if (!refresh_list()) return 40;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || count_devices(devices, 3) != 1 ||
         !scan_fixture_entry(devices[0], 1, 7, "1-1.7")) return 14;
     const dtv_ungrouped_device *reinserted = devices[0];
 
     dtv_ungrouped_test_batch(3);
+    if (!scan_fixture_entry(reinserted, 1, 7, "1-1.7")) return 15;
+    if (!refresh_list()) return 41;
     devices = dtv_list_ungrouped_devices();
-    if (devices == NULL || devices[0] != NULL ||
-        !scan_fixture_entry(reinserted, 1, 7, "1-1.7")) return 15;
+    if (devices == NULL || devices[0] != NULL) return 15;
 
     common = dtv_list_enclosures(&error);
     product = dtv_list_enclosures_scanfixture(&error);
@@ -148,6 +180,7 @@ int main(void)
     if (dtv_wait_event(&event, &timeout, &error) != DTV_ERROR_TIMEOUT) return 19;
     dtv_hold_enclosure(root);
     dtv_ungrouped_test_batch(4);
+    if (!refresh_list()) return 42;
     devices = dtv_list_ungrouped_devices();
     if (devices == NULL || devices[0] != NULL ||
         dtv_get_status(root) != DTV_ENCLOSURE_DISCONNECTED) return 20;
