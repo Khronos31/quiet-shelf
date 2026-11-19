@@ -12,5 +12,6 @@ dtv_add_product(NAME ${PRODUCT_NAME}
                 COMMAND ${PRODUCT_COMMAND}
                 VERSION ${PRODUCT_VERSION}
                 DEFAULT_MODEL "${PRODUCT_DEFAULT_MODEL}"
-                MODELS px_w3u3
+                MODELS px_w3u3 px_w3u2
+                SOURCES src/ground_tune_common.cpp src/px_w3u3_tune.cpp src/px_w3u3_satellite.cpp src/px_w3u2_tune.cpp src/px_w3u3_v2_tune.cpp src/px_s3u_tune.cpp
                 FIRMWARE asicen_loader=firmware/asicen-loader.bin)

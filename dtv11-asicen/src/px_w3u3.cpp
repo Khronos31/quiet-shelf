@@ -6,6 +6,8 @@
 #include <dtv/spi/device_ops.hpp>
 #include <dtv/spi/feature.hpp>
 
+#include "asicen_group.hpp"
+
 namespace {
 
 using receiver_information = dtv::spi::model_information::receiver_information;
@@ -26,6 +28,17 @@ constexpr device_receiver_information runtime_devices[] = {
     {1, true, secondary_receivers, 2},
 };
 
+dtv_internal_result select_group(
+    const dtv_usb_candidate_info *candidates, std::uint32_t candidate_count,
+    std::uint32_t anchor_candidate_index, dtv_usb_function_selection *selections,
+    std::uint32_t selection_capacity, std::uint32_t *selection_count,
+    dtv_usb_group_match *match)
+{
+    return asicen::detail::select_runtime_pair(
+        candidates, candidate_count, anchor_candidate_index, selections,
+        selection_capacity, selection_count, match, 0x0005);
+}
+
 }
 
 DTV_PRODUCT(asicen, DTV_FEATURES());
@@ -40,6 +53,7 @@ extern const ModelEntry px_w3u3_model{
     .model = {"PX-W3U3", 0x0b06, 0x0005},
     .firmware = nullptr,
     .firmware_count = 0,
+    .select_usb_group = select_group,
     .source_stride_bytes = 188,
     .source_sync_offset_bytes = 0,
     .runtime_device_receivers = runtime_devices,
