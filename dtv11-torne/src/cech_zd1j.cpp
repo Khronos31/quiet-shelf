@@ -1,12 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
 #include <span>
-#include <utility>
 #include <vector>
 
 #include <dtv/spi/device_ops.hpp>
@@ -38,11 +36,16 @@ constexpr std::uint32_t kCore1ImageOffset = 1504;
 constexpr std::size_t kCore1ImageSize = 1924;
 constexpr std::uint32_t kCore0ImageOffset = 172;
 constexpr std::size_t kCore0ImageSize = 1332;
-constexpr std::array<std::uint32_t, 5> kPatchAddresses{
+struct AddressValue {
+    std::uint32_t address;
+    std::uint32_t data;
+};
+
+constexpr std::uint32_t kPatchAddresses[]{
     0x000E9AC0, 0x000E9AC4, 0x000E9E0C, 0x000E9E10, 0x000E9D94};
-constexpr std::array<std::uint32_t, 5> kPristinePatchWords{
+constexpr std::uint32_t kPristinePatchWords[]{
     0x9B800000, 0xAA04E40F, 0x9B800000, 0xAA04E40D, 0xB4279F8D};
-constexpr std::array<std::uint32_t, 5> kCandidatePatchWords{
+constexpr std::uint32_t kCandidatePatchWords[]{
     0x9BEC1020, 0x970C9FA0, 0x9BEC1064, 0x970C9FA0, 0x9FA09F8D};
 
 struct CeChState {
@@ -151,16 +154,16 @@ void write_be32(std::uint8_t *bytes, std::uint32_t value)
 
 dtv_internal_result read_word(CeChState *state, std::uint32_t address, std::uint32_t *value)
 {
-    std::array<std::uint8_t, 4> bytes{};
+    std::uint8_t bytes[4]{};
     auto transferred = control_read(state, address, bytes, address >= 0x01000000);
-    if (transferred.code == DTV_INTERNAL_RESULT_OK) *value = read_be32(bytes.data());
+    if (transferred.code == DTV_INTERNAL_RESULT_OK) *value = read_be32(bytes);
     return transferred;
 }
 
 dtv_internal_result write_word(CeChState *state, std::uint32_t address, std::uint32_t value)
 {
-    std::array<std::uint8_t, 4> bytes{};
-    write_be32(bytes.data(), value);
+    std::uint8_t bytes[4]{};
+    write_be32(bytes, value);
     return control_write(state, address, bytes, address >= 0x01000000);
 }
 
@@ -176,11 +179,11 @@ dtv_internal_result write_wide_image(CeChState *state, std::uint32_t address,
         auto transferred = control_write(state, address + static_cast<std::uint32_t>(offset), block, true);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
         if (verify) {
-            std::array<std::uint8_t, 64> readback{};
+            std::uint8_t readback[64]{};
             transferred = control_read(state, address + static_cast<std::uint32_t>(offset),
-                std::span<std::uint8_t>(readback.data(), count), true);
+                std::span<std::uint8_t>(readback, count), true);
             if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-            if (!std::equal(block.begin(), block.end(), readback.begin()))
+            if (!std::equal(block.begin(), block.end(), readback))
                 return result(DTV_INTERNAL_RESULT_USB_IO);
         }
         offset += count;
@@ -189,21 +192,21 @@ dtv_internal_result write_wide_image(CeChState *state, std::uint32_t address,
 }
 
 dtv_internal_result read_widen_patches(CeChState *state,
-                                       std::array<std::uint32_t, 5> *values)
+                                       std::uint32_t values[5])
 {
-    for (std::size_t index = 0; index < kPatchAddresses.size(); ++index) {
-        auto transferred = read_word(state, kPatchAddresses[index], &(*values)[index]);
+    for (std::size_t index = 0; index < sizeof(kPatchAddresses) / sizeof(kPatchAddresses[0]); ++index) {
+        auto transferred = read_word(state, kPatchAddresses[index], &values[index]);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     }
     return result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result read_widen_image(CeChState *state,
-                                     std::array<std::uint8_t, kWidenSize> *image)
+                                     std::uint8_t image[kWidenSize])
 {
-    for (std::size_t offset = 0; offset < image->size(); offset += 4) {
+    for (std::size_t offset = 0; offset < kWidenSize; offset += 4) {
         auto transferred = control_read(state, kWidenBase + static_cast<std::uint32_t>(offset),
-            std::span<std::uint8_t>(image->data() + offset, 4), false);
+            std::span<std::uint8_t>(image + offset, 4), false);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     }
     return result(DTV_INTERNAL_RESULT_OK);
@@ -216,40 +219,40 @@ std::span<const std::uint8_t> default_widen()
 
 dtv_internal_result recognize_widen(CeChState *state, bool *pristine, bool *candidate)
 {
-    std::array<std::uint32_t, 5> words{};
-    auto transferred = read_widen_patches(state, &words);
+    std::uint32_t words[5]{};
+    auto transferred = read_widen_patches(state, words);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    *pristine = words == kPristinePatchWords;
+    *pristine = std::equal(words, words + 5, kPristinePatchWords);
     *candidate = false;
     if (*pristine) return result(DTV_INTERNAL_RESULT_OK);
-    if (words != kCandidatePatchWords) return result(DTV_INTERNAL_RESULT_OK);
+    if (!std::equal(words, words + 5, kCandidatePatchWords)) return result(DTV_INTERNAL_RESULT_OK);
 
     const auto expected = state->candidate_widen.empty()
         ? default_widen()
         : std::span<const std::uint8_t>(state->candidate_widen);
     if (expected.size() != kWidenSize) return result(DTV_INTERNAL_RESULT_OK);
-    std::array<std::uint8_t, kWidenSize> readback{};
-    transferred = read_widen_image(state, &readback);
+    std::uint8_t readback[kWidenSize]{};
+    transferred = read_widen_image(state, readback);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    *candidate = std::equal(expected.begin(), expected.end(), readback.begin());
+    *candidate = std::equal(expected.begin(), expected.end(), readback);
     return result(DTV_INTERNAL_RESULT_OK);
 }
 
-dtv_internal_result read_core1_info(CeChState *state, std::array<std::uint8_t, 64> *info)
+dtv_internal_result read_core1_info(CeChState *state, std::uint8_t info[64])
 {
-    return control_read(state, kInfoAddress, *info, true);
+    return control_read(state, kInfoAddress, std::span<std::uint8_t>(info, 64), true);
 }
 
-bool valid_core1_info(const std::array<std::uint8_t, 64> &info)
+bool valid_core1_info(const std::uint8_t info[64])
 {
-    return read_be32(info.data()) == 0x54493243 &&
-           (read_be32(info.data() + 4) >> 16) == 1 &&
-           read_be32(info.data() + 8) == 0xFC662BD9 &&
-           read_be32(info.data() + 12) == 1 &&
-           read_be32(info.data() + 16) != 0 &&
-           read_be32(info.data() + 20) == kCore1ImageSize &&
-           read_be32(info.data() + 24) == 0x000A3800 &&
-           read_be32(info.data() + 28) == 0x00040000;
+    return read_be32(info) == 0x54493243 &&
+           (read_be32(info + 4) >> 16) == 1 &&
+           read_be32(info + 8) == 0xFC662BD9 &&
+           read_be32(info + 12) == 1 &&
+           read_be32(info + 16) != 0 &&
+           read_be32(info + 20) == kCore1ImageSize &&
+           read_be32(info + 24) == 0x000A3800 &&
+           read_be32(info + 28) == 0x00040000;
 }
 
 dtv_internal_result identify_device(dtv_context *context, dtv_identify_info *identity,
@@ -269,8 +272,8 @@ dtv_internal_result identify_device(dtv_context *context, dtv_identify_info *ide
         return result(DTV_INTERNAL_RESULT_OK);
     }
     if (!candidate) return result(DTV_INTERNAL_RESULT_OK);
-    std::array<std::uint8_t, 64> info{};
-    transferred = read_core1_info(state, &info);
+    std::uint8_t info[64]{};
+    transferred = read_core1_info(state, info);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     identity->state = valid_core1_info(info) ? DTV_IDENTIFY_RUNTIME : DTV_IDENTIFY_LOADER;
     return result(DTV_INTERNAL_RESULT_OK);
@@ -296,12 +299,12 @@ std::uint64_t now_ns(CeChState *state)
 dtv_internal_result wait_core1(CeChState *state, std::uint32_t expected_session)
 {
     const auto deadline = now_ns(state) + 100000000;
-    std::array<std::uint8_t, 64> info{};
+    std::uint8_t info[64]{};
     for (;;) {
-        auto transferred = read_core1_info(state, &info);
+        auto transferred = read_core1_info(state, info);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-        if (read_be32(info.data()) == 0x54493243) {
-            if (!valid_core1_info(info) || read_be32(info.data() + 16) != expected_session)
+        if (read_be32(info) == 0x54493243) {
+            if (!valid_core1_info(info) || read_be32(info + 16) != expected_session)
                 return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
             break;
         }
@@ -326,10 +329,10 @@ dtv_internal_result wait_core1(CeChState *state, std::uint32_t expected_session)
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     }
 
-    std::array<std::uint8_t, 64> control{};
-    write_be32(control.data(), expected_session);
-    write_be32(control.data() + 4, 1);
-    write_be32(control.data() + 8, 0);
+    std::uint8_t control[64]{};
+    write_be32(control, expected_session);
+    write_be32(control + 4, 1);
+    write_be32(control + 8, 0);
     transferred = control_write(state, kControlAddress, control, true);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     const auto nop_deadline = now_ns(state) + 100000000;
@@ -360,9 +363,9 @@ dtv_internal_result initialize_i2c_engine(CeChState *state)
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     transferred = write_word(state, 0x00FD8014, value & ~0x10u);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 7> writes{{
+    constexpr AddressValue writes[]{
         {0x00FD80C0, 1}, {0x00FD80C0, 0}, {0x00FD80C4, 0}, {0x00090114, 0x80080000},
-        {0x00FD8FF8, 6}, {0x00FD8FF4, 8}, {0x00FD8FE8, 0x3C}}};
+        {0x00FD8FF8, 6}, {0x00FD8FF4, 8}, {0x00FD8FE8, 0x3C}};
     for (const auto &[address, data] : writes) {
         transferred = write_word(state, address, data);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
@@ -372,10 +375,10 @@ dtv_internal_result initialize_i2c_engine(CeChState *state)
 
 dtv_internal_result initialize_clocks(CeChState *state)
 {
-    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 6> writes{{
+    constexpr AddressValue writes[]{
         {0x00F1010C, 0x82010000}, {0x00F10114, 0x80080000},
         {0x00F10118, 0xFFFF0000}, {0x00F1011C, 0x00060000},
-        {0x00F10128, 0x60000000}, {0x00F1012C, 0x40070000}}};
+        {0x00F10128, 0x60000000}, {0x00F1012C, 0x40070000}};
     for (const auto &[address, data] : writes) {
         auto transferred = write_word(state, address, data);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
@@ -390,10 +393,11 @@ dtv_internal_result install_widen(CeChState *state, std::span<const std::uint8_t
     auto transferred = recognize_widen(state, &pristine, &candidate);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     if (candidate) {
-        std::array<std::uint32_t, 5> unchanged{};
-        transferred = read_widen_patches(state, &unchanged);
+        std::uint32_t unchanged[5]{};
+        transferred = read_widen_patches(state, unchanged);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-        if (unchanged != kCandidatePatchWords) return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        if (!std::equal(unchanged, unchanged + 5, kCandidatePatchWords))
+            return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
         const auto expected = state->candidate_widen.empty()
             ? default_widen()
             : std::span<const std::uint8_t>(state->candidate_widen);
@@ -408,17 +412,18 @@ dtv_internal_result install_widen(CeChState *state, std::span<const std::uint8_t
             image.subspan(offset, 4), false);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     }
-    std::array<std::uint8_t, kWidenSize> readback{};
-    transferred = read_widen_image(state, &readback);
+    std::uint8_t readback[kWidenSize]{};
+    transferred = read_widen_image(state, readback);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    if (!std::equal(image.begin(), image.end(), readback.begin()))
+    if (!std::equal(image.begin(), image.end(), readback))
         return result(DTV_INTERNAL_RESULT_USB_IO);
-    std::array<std::uint32_t, 5> unchanged{};
-    transferred = read_widen_patches(state, &unchanged);
+    std::uint32_t unchanged[5]{};
+    transferred = read_widen_patches(state, unchanged);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    if (unchanged != kPristinePatchWords) return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+    if (!std::equal(unchanged, unchanged + 5, kPristinePatchWords))
+        return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
 
-    for (std::size_t index = 0; index < kPatchAddresses.size(); ++index) {
+    for (std::size_t index = 0; index < sizeof(kPatchAddresses) / sizeof(kPatchAddresses[0]); ++index) {
         transferred = write_word(state, kPatchAddresses[index], kCandidatePatchWords[index]);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
         std::uint32_t observed = 0;
@@ -451,15 +456,16 @@ dtv_internal_result boot_core1(CeChState *state, std::span<const std::uint8_t> c
     transferred = write_word(state, kCore1Hold, 0xFFFFFFFF);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
 
-    std::array<std::uint8_t, 64> probe{};
-    for (std::size_t index = 0; index < probe.size(); ++index)
+    std::uint8_t probe[64]{};
+    for (std::size_t index = 0; index < 64; ++index)
         probe[index] = static_cast<std::uint8_t>(0xA5 + index);
     transferred = control_write(state, 0x017A3FC0, probe, true);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    std::array<std::uint8_t, 64> probe_readback{};
+    std::uint8_t probe_readback[64]{};
     transferred = control_read(state, 0x017A3FC0, probe_readback, true);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    if (probe != probe_readback) return result(DTV_INTERNAL_RESULT_USB_IO);
+    if (!std::equal(probe, probe + 64, probe_readback))
+        return result(DTV_INTERNAL_RESULT_USB_IO);
     std::uint32_t ignored = 0;
     transferred = read_word(state, 0x00F1010C, &ignored);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
@@ -476,13 +482,13 @@ dtv_internal_result boot_core1(CeChState *state, std::span<const std::uint8_t> c
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     transferred = write_word(state, 0x017FFFFC, 0x000A0000);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    std::array<std::uint8_t, 64> zeroes{};
-    for (std::size_t offset = 0; offset < 0x800; offset += zeroes.size()) {
+    std::uint8_t zeroes[64]{};
+    for (std::size_t offset = 0; offset < 0x800; offset += sizeof(zeroes)) {
         transferred = control_write(state, kSharedAddress + static_cast<std::uint32_t>(offset), zeroes, true);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     }
-    std::array<std::uint8_t, 64> control{};
-    write_be32(control.data(), session);
+    std::uint8_t control[64]{};
+    write_be32(control, session);
     transferred = control_write(state, kControlAddress, control, true);
     if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
     transferred = write_wide_image(state, kCore1Base, code, true);

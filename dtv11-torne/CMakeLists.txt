@@ -7,5 +7,5 @@ dtv_add_product(NAME torne
                 VERSION 2.0.0
                 DEFAULT_MODEL ""
                 MODELS cech_zd1j
-                SOURCES src/product.cpp
+                SOURCES src/product.cpp src/cech_tune_signal.cpp src/cech_tune_io.cpp
                 FIRMWARE torne_fr30_v1=firmware/torne-fr30-v1.bin)

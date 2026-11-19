@@ -4,11 +4,11 @@ if(NOT DEFINED CLI)
 endif()
 
 set(cases
-    [[help|--help|0|Usage: fixturectl [--help] [--version] [--models]\nShow product metadata. Other operations are not implemented yet.\n|@empty@]]
-    [[help_unknown|--help,--unknown|0|Usage: fixturectl [--help] [--version] [--models]\nShow product metadata. Other operations are not implemented yet.\n|@empty@]]
-    [[version_help|--version,--help|0|Usage: fixturectl [--help] [--version] [--models]\nShow product metadata. Other operations are not implemented yet.\n|@empty@]]
-    [[help_version|--help,--version|0|Usage: fixturectl [--help] [--version] [--models]\nShow product metadata. Other operations are not implemented yet.\n|@empty@]]
-    [[models_help|--models,--help|0|Usage: fixturectl [--help] [--version] [--models]\nShow product metadata. Other operations are not implemented yet.\n|@empty@]]
+    [[help|--help|0|Usage: fixturectl [--help] [--version] [--models] [--list-json]\nShow product metadata or the discovery JSON.\n|@empty@]]
+    [[help_unknown|--help,--unknown|0|Usage: fixturectl [--help] [--version] [--models] [--list-json]\nShow product metadata or the discovery JSON.\n|@empty@]]
+    [[version_help|--version,--help|0|Usage: fixturectl [--help] [--version] [--models] [--list-json]\nShow product metadata or the discovery JSON.\n|@empty@]]
+    [[help_version|--help,--version|0|Usage: fixturectl [--help] [--version] [--models] [--list-json]\nShow product metadata or the discovery JSON.\n|@empty@]]
+    [[models_help|--models,--help|0|Usage: fixturectl [--help] [--version] [--models] [--list-json]\nShow product metadata or the discovery JSON.\n|@empty@]]
     [[version|--version|0|fixture 1.2.3\n|@empty@]]
     [[version_unknown|--version,--unknown|0|fixture 1.2.3\n|@empty@]]
     [[models_version|--models,--version|0|fixture 1.2.3\n|@empty@]]
@@ -16,6 +16,8 @@ set(cases
     [[unknown_subcommand|tune|2|@empty@|fixturectl: unknown argument\n]]
     [[unknown_option|--unknown|2|@empty@|fixturectl: unknown argument\n]]
     [[models_unknown|--models,--unknown|2|@empty@|fixturectl: --models cannot be combined with other arguments\n]]
+    [[list_help|--list-json,--help|0|Usage: fixturectl [--help] [--version] [--models] [--list-json]\nShow product metadata or the discovery JSON.\n|@empty@]]
+    [[list_version|--list-json,--version|0|fixture 1.2.3\n|@empty@]]
     [[models_models|--models,--models|2|@empty@|fixturectl: --models cannot be combined with other arguments\n]]
 )
 

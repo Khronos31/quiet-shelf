@@ -1664,7 +1664,41 @@ dtv_internal_result scan_tune_by_frequency(dtv_context *, const dtv::spi::Public
     const auto mode = scan_tune_mode.load(std::memory_order_acquire);
     if (mode == 1) return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
     std::uint64_t operation_epoch = 0;
-    auto result = session->begin_effect(session->user, &operation_epoch);
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    if (mode == 5) {
+        if (session->io == nullptr || session->io->control == nullptr ||
+            session->io->bulk_out == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        unsigned char command[]{0x41, 0x42};
+        dtv_buffer buffer{command, sizeof(command), sizeof(command)};
+        result = session->io->control(session->io->user, 0x40, 0x01, 0, 0, &buffer,
+                                      request->timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        const unsigned char packet[]{0x51, 0x52};
+        result = session->io->bulk_out(session->io->user, 0x01,
+            dtv_bytes{packet, sizeof(packet)}, request->timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        result = session->begin_effect(session->user, &operation_epoch);
+    } else if (mode == 4) {
+        if (session->io == nullptr || session->io->control == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        unsigned char command[]{0x43};
+        dtv_buffer buffer{command, sizeof(command), sizeof(command)};
+        const dtv_timeout io_timeout{25, 0};
+        result = session->io->control(session->io->user, 0x40, 0x02, 0, 0, &buffer,
+                                      io_timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) {
+            auto effect_result = session->begin_effect(session->user, &operation_epoch);
+            if (effect_result.code == DTV_INTERNAL_RESULT_OK) {
+                scan_tune_epochs[receiver_index].store(operation_epoch, std::memory_order_release);
+                scan_tune_effects.fetch_add(1, std::memory_order_release);
+            }
+            return result;
+        }
+        result = session->begin_effect(session->user, &operation_epoch);
+    } else {
+        result = session->begin_effect(session->user, &operation_epoch);
+    }
     if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     scan_tune_epochs[receiver_index].store(operation_epoch, std::memory_order_release);
     scan_tune_effects.fetch_add(1, std::memory_order_release);
