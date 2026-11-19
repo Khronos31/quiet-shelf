@@ -7768,6 +7768,62 @@ int32_t run_firmware_session(dtv_device *object, dtv_bytes package,
 
 }
 
+int32_t send_default_firmware_for_product(const char *expected_product,
+    dtv_device *object, const dtv_call_options *options, dtv_error *error)
+{
+    if (object == nullptr || (options != nullptr && options->struct_size < sizeof(*options))) {
+        set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
+        return DTV_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto &state = dtv::internal::public_discovery_state();
+        dtv::internal::FirmwareTarget target;
+        const auto target_result = state.registry.firmware_target(object, &target);
+        if (target_result.code != DTV_INTERNAL_RESULT_OK) {
+            const auto code = dtv::internal::public_error_code(target_result);
+            dtv::internal::set_public_error(error, code, nullptr, &target_result);
+            return code;
+        }
+        if (target.mode == DTV_DEVICE_UNKNOWN) {
+            dtv::internal::set_public_error(error, DTV_ERROR_NOT_READY);
+            return DTV_ERROR_NOT_READY;
+        }
+        const auto *product = target.model != nullptr && target.model->model != nullptr
+            ? target.model->model->product : nullptr;
+        const auto *model = target.model != nullptr && target.model->model != nullptr
+            ? target.model->model->name : nullptr;
+        if (product == nullptr || model == nullptr) {
+            dtv::internal::set_public_error(error, DTV_ERROR_NOT_READY);
+            return DTV_ERROR_NOT_READY;
+        }
+        int32_t result = DTV_ERROR_OK;
+        if (expected_product == nullptr) {
+            result = dtv::internal::dispatch_send_default_firmware_product(
+                product, object, options, error);
+        } else {
+            if (std::string_view(product) != expected_product) {
+                dtv::internal::set_public_error(error, DTV_ERROR_UNSUPPORTED);
+                return DTV_ERROR_UNSUPPORTED;
+            }
+            result = dtv::internal::dispatch_send_default_firmware(
+                product, model, object, options, error);
+        }
+        dtv::internal::set_public_error(error, result);
+        return result;
+    } catch (...) {
+        const auto result = dtv::internal::exception_result();
+        const auto code = dtv::internal::public_error_code(result);
+        dtv::internal::set_public_error(error, code, nullptr, &result);
+        return code;
+    }
+}
+
+extern "C" int32_t dtv_send_default_firmware(dtv_device *object,
+    const dtv_call_options *options, dtv_error *error)
+{
+    return dtv::internal::send_default_firmware_for_product(nullptr, object, options, error);
+}
+
 extern "C" std::uint32_t dtv_get_mode(dtv_device *object)
 {
     try {

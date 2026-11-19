@@ -1536,35 +1536,54 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
 
 
 
-## 正規runtime VID:PIDのグループ探索アンカー接続（PR84、内部基盤）
+## 公開default firmware転送関数と製品別生成口（PR85、内部基盤）
 
-PR84 では、ファームウェア転送（cold boot）を持たない正規 runtime 宣言のみを持つ機器（`cold_identity_count == 0` かつ `cold_identities == nullptr`）を一般グループ探索（`observe_loaded_product_groups` / `collect_complete_groups`）へ接続する限定修正を導入している。
+PR85 では、公開 C ABI として宣言されながら Core 内に実体定義が欠落していた `dtv_send_default_firmware()` の実装を補完し、製品別生成口 `dtv_send_default_firmware_<PRODUCT_NAME>()` および LoadedProduct レジストリへの接続を導入している。
 
-### 1. 概要とアンカー判定の拡張
+### 1. 概要とシンボル構造
 
-- **目的と背景:**
-  - 従来の一般グループ探索におけるアンカー判定（`src/discovery.cpp: identity_matches`）は明示的な cold ID（`model.cold_identities`）のみを照合していたため、ファームウェア不要で正規 runtime VID:PID のみを宣言する機種はアンカー候補として合致せず、`select_usb_group` コールバックに到達しなかった。
-  - 本修正により、明示 cold ID 集合に加えて、登録済み `ModelEntry` が宣言する正規 runtime VID:PID（`model.model.vendor_id == candidate.vendor_id && model.model.product_id == candidate.product_id`）もアンカー候補として照合される。
+- **Core generic 公開シンボル (`dtv_send_default_firmware`):**
+  - 公開ヘッダ（`include/dtv/dtv.h`）で宣言済みの非接尾辞シンボル。
+  - 渡された `dtv_device` から内部の所有モード・製品・機種（`FirmwareTarget`）を解決し、登録済み製品レジストリ（`loaded_products`）経由で当該製品の default callback へ振り分ける。
+- **製品別生成シンボル (`dtv_send_default_firmware_<PRODUCT_NAME>`):**
+  - CMake の `dtv_add_product` により、各製品の生成ヘッダ（`<product>_api.h`）へ宣言が、生成レジストリソース（`<product>_registry.cpp`）へ定義が出力される。
+  - 所属製品の一致（境界判定）を検証した後、既存の機種別ディスパッチャ（`dispatch_send_default_firmware`）へ引き渡す。
+- **手書き `to_all` との区別:**
+  - 全機器一括送信関数 `dtv_send_default_firmware_to_all_<product>` は従来通り製品側での手書き実装例外のままであり、自動生成されない（本 PR でも変更なし）。
 
-### 2. 一般グループ探索と公開 projection への接続
+### 2. 判定・振分けルーティングと戻り値契約
 
-- **selector による確定と未登録 ID の除外:**
-  - アンカーとして照合された候補に対し、機種の `select_usb_group` コールバックが呼び出される。
-  - コールバックが `DTV_USB_GROUP_COMPLETE` と判定した観測値（`CompleteGroupObservation`）のみが `collect_complete_groups` により抽出され、公開 projection（`dtv_list_enclosures` / `live_slots`）へ渡される。
-  - 部分一致（`INCOMPLETE`）、不一致（`NO_MATCH`）、曖昧一致（`AMBIGUOUS`）は除外され、出力には含まれない。
-  - 登録済み `ModelEntry` に存在しない未登録の VID:PID を持つデバイスは、アンカー判定を通過せず、機種として追加されることなく確実に除外される（selector にも到達しない）。
+- **無効引数:** `device == nullptr` または `options` の構造体サイズ不正時は直ちに `DTV_ERROR_INVALID_ARGUMENT` を返す。
+- **UNKNOWN 機種 (`DTV_DEVICE_UNKNOWN`):**
+  - 対象デバイスの機種・製品が特定されていない場合、製品コールバックへのディスパッチ前に直ちに `DTV_ERROR_NOT_READY` を返す。
+  - バックエンド USB オープンや claim、転送 I/O は発生しない。
+- **製品境界判定（製品別口での他製品拒否）:**
+  - `dtv_send_default_firmware_<PRODUCT_NAME>` に対し、他製品に属するデバイスが渡された場合、`DTV_ERROR_UNSUPPORTED` で安全に処理を拒否・中断する（I/O なし）。
+- **no-FW 機種 (`DTV_NO_FIRMWARE`):**
+  - ファームウェア不要機種（fake runtime デバイス等）に対しては、既存の no-FW ハンドラが何もしないまま `DTV_ERROR_OK` で成功を返す（I/O なし）。
+- **埋め込みファームウェア機種 (`DTV_FIRMWARE`):**
+  - 機種の `DTV_FIRMWARE(<asset>)` 宣言から生成された既存 default wrapper を呼び出し、埋め込み資産バイト列を取り出して既存の手書き機種実装（`dtv_model_impl_send_firmware_*`）へ引き渡す。
 
-### 3. boot 専用経路との厳密な分離
+### 3. 転送経路の再利用と不変事項
 
-- **明示 cold ID 限定の維持:**
-  - ファームウェア送信のための boot 専用経路（`src/boot.cpp` の `cold_identity_matches`、`boot_selected_candidate`、`open_boot_group`）は、**明示的な cold ID（`model.cold_identities`）限定のまま変更なく維持される**。
-  - したがって、runtime 宣言のみ（`cold_identity_count == 0`）のグループが誤って `open_boot_group` に渡された場合でも、`DTV_INTERNAL_RESULT_UNSUPPORTED` で安全に拒否され、USB provider が open されることはない。
+- **既存トランスポート・セッションの再利用:**
+  - 機種別 default wrapper から既存の generic firmware callback / session / claim lease 経路を再利用する。
+  - 本 PR で新しい USB 経路や転送トランスポートは追加していない。
+- **事前検査（preflight）の範囲外:**
+  - ファームウェアバイト列の内容検証、サイズ検査、ハッシュ照合、パッケージ preflight などの検査処理は追加していない。
+- **公開仕様・正本の不変:**
+  - `include/dtv/dtv.h` の既存公開宣言、L3 正本仕様、および製品共通ディスパッチャの構造は変更していない。
 
 ### 4. 検証状況と境界
 
-- **単体契約テスト検証:**
-  - 既存内部 fixture（`tests/i2c1-partial-boot.cpp` / CTest: `i2c1_partial_boot_contract`）により、runtime-only（`cold_identity_count = 0`）の入力において、修正前の `selector_calls = 0`, `group = 0` から、修正後の `selector_calls = 1`, `DTV_USB_GROUP_COMPLETE group = 1` への変化を確認済みである。
-  - 同じ runtime-only group を `open_boot_group` へ渡した場合の `DTV_INTERNAL_RESULT_UNSUPPORTED` 拒否、および未登録 ID（`0x5678:0x0002`）が group なし・`selector_calls = 0` で除外されることを確認済みである。
+- **作者検証（単体 fixture 検証）:**
+  - 既存内部 fixture（`tests/fixture/firmware-contract.cpp`, `tests/fixture/usb-claim-lease.cpp`）を拡張し、以下を確認済みである:
+    1. クライアント側の公開 Core generic シンボルおよび生成製品シンボルへのリンク成立
+    2. `device == nullptr` での `INVALID_ARGUMENT` 拒否
+    3. UNKNOWN デバイスでの `NOT_READY` 拒否（I/O なし）
+    4. fake runtime デバイスでの no-FW `DTV_ERROR_OK` 成功（I/O なし）
+    5. 別製品デバイスでの `UNSUPPORTED` 拒否（I/O なし）
+    6. `nm -g --defined-only` によるシンボル実体定義の存在確認
 - **未実施境界と位置づけ:**
-  - 公開 C API（`dtv_list_enclosures`）を直接呼び出す統合試験、製品実体（ASICEN 等）との結合、および USB 実機での動的確認は本 PR では未実施である。
-  - 本限定修正をもって「特定機種の完成」や「SPI 安定版」とは呼ばない。
+  - 本検証はリンク成立と代表振分けの確認にとどまり、cold boot からのファームウェア送信、PIX-DT295 等の実機ハードウェアでの成功、および Windows / NDK / CTest フルスイートでの動作は未確認である。
+  - 本 ABI/リンク補完をもって「公開ファームウェア転送の完全動作」や「実機対応完了」とは呼ばない。

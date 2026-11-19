@@ -25,6 +25,7 @@ struct LoadedProduct {
     std::size_t model_count;
     const dtv::spi::ProductEntry *discovery_product;
     int32_t (*send_to_all)(const dtv_call_options *, dtv_error *);
+    int32_t (*send_default_firmware)(dtv_device *, const dtv_call_options *, dtv_error *);
 };
 std::vector<LoadedProduct> loaded_products;
 std::deque<dtv_model> model_storage;
@@ -98,6 +99,29 @@ bool model_supports(const dtv::spi::l3_model_record &model, uint32_t operation)
 
 }
 
+int32_t dtv::internal::dispatch_send_default_firmware_product(const char *product_name,
+    dtv_device *device, const dtv_call_options *options, dtv_error *error)
+{
+    if (product_name == nullptr || device == nullptr) {
+        set_error(error, DTV_ERROR_INVALID_ARGUMENT);
+        return DTV_ERROR_INVALID_ARGUMENT;
+    }
+    int32_t (*send_default_firmware)(dtv_device *, const dtv_call_options *, dtv_error *) = nullptr;
+    {
+        std::lock_guard lock(products_mutex);
+        const auto product = std::find_if(loaded_products.begin(), loaded_products.end(),
+                                          [product_name](const auto &loaded) {
+                                              return loaded.name == product_name;
+                                          });
+        if (product != loaded_products.end()) send_default_firmware = product->send_default_firmware;
+    }
+    if (send_default_firmware == nullptr) {
+        set_error(error, DTV_ERROR_NOT_FOUND);
+        return DTV_ERROR_NOT_FOUND;
+    }
+    return send_default_firmware(device, options, error);
+}
+
 extern "C" uint32_t dtv_get_api_version(void)
 {
     return UINT32_C(0x00020000);
@@ -113,10 +137,12 @@ extern "C" const dtv_model *const *dtv_list_models(void)
 extern "C" void dtv_l3_register_product(
     const char *product_name, const dtv::spi::l3_model_record *const *models,
     std::size_t model_count, const dtv::spi::ProductEntry *discovery_product,
-    int32_t (*send_to_all)(const dtv_call_options *, dtv_error *))
+    int32_t (*send_to_all)(const dtv_call_options *, dtv_error *),
+    int32_t (*send_default_firmware)(dtv_device *, const dtv_call_options *, dtv_error *))
 {
     if (product_name == nullptr || models == nullptr || discovery_product == nullptr ||
-        send_to_all == nullptr || discovery_product->product_id == nullptr ||
+        send_to_all == nullptr || send_default_firmware == nullptr ||
+        discovery_product->product_id == nullptr ||
         std::strcmp(product_name, discovery_product->product_id) != 0 ||
         discovery_product->model_count != model_count ||
         (model_count != 0 && discovery_product->models == nullptr)) return;
@@ -130,7 +156,8 @@ extern "C" void dtv_l3_register_product(
                                         return loaded.name == product_name;
                                     });
     if (found == loaded_products.end()) {
-        loaded_products.push_back({product_name, models, model_count, discovery_product, send_to_all});
+        loaded_products.push_back({product_name, models, model_count, discovery_product, send_to_all,
+                                   send_default_firmware});
         for (std::size_t index = 0; index < model_count; ++index) {
             if (models[index] != nullptr && models[index]->model != nullptr) {
                 model_storage.push_back(*models[index]->model);

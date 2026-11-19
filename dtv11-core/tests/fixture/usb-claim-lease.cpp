@@ -25,6 +25,8 @@
 #include <dtv/internal/clock.hpp>
 #include <dtv/internal/l3-registry.hpp>
 #include <dtv/spi/device_ops.hpp>
+#include <i0_asicen_fixture_api.h>
+#include <scanfixture_api.h>
 
 #include "usb-transfer-backend.hpp"
 
@@ -2285,12 +2287,33 @@ int public_lnb_unsupported()
     }
     auto *root = enclosures[0];
     dtv_hold_enclosure(root);
+    auto *const *devices = dtv_get_devices(root);
+    if (devices == nullptr || devices[0] == nullptr) return 3;
+    const auto output_count = backend->output_snapshot().size();
+    dtv_error default_error{};
+    default_error.struct_size = sizeof(default_error);
+    const auto default_result = dtv_send_default_firmware(devices[0], nullptr, &default_error);
+    dtv_error product_default_error{};
+    product_default_error.struct_size = sizeof(product_default_error);
+    const auto product_default_result = dtv_send_default_firmware_scanfixture(
+        devices[0], nullptr, &product_default_error);
+    dtv_error other_product_error{};
+    other_product_error.struct_size = sizeof(other_product_error);
+    const auto other_product_result = dtv_send_default_firmware_i0_asicen_fixture(
+        devices[0], nullptr, &other_product_error);
     const auto before = backend->endpoint_submission_count(0x02);
     std::uint32_t support = DTV_UNKNOWN;
-    if (dtv_get_enclosure_support(root, DTV_OP_LNB_POWER, &support, &error) != DTV_ERROR_OK ||
+    if (dtv_get_mode(devices[0]) != DTV_DEVICE_RUNTIME ||
+        default_result != DTV_ERROR_OK || default_error.code != DTV_ERROR_OK ||
+        product_default_result != DTV_ERROR_OK || product_default_error.code != DTV_ERROR_OK ||
+        other_product_result != DTV_ERROR_UNSUPPORTED ||
+        other_product_error.code != DTV_ERROR_UNSUPPORTED ||
+        backend->output_snapshot().size() != output_count || backend->submit_calls != 0 ||
+        backend->open_count != 0 || backend->claim_count != 0 ||
+        dtv_get_enclosure_support(root, DTV_OP_LNB_POWER, &support, &error) != DTV_ERROR_OK ||
         support != DTV_NO || dtv_lnb_on(root, nullptr, &error) != DTV_ERROR_UNSUPPORTED ||
         error.code != DTV_ERROR_UNSUPPORTED ||
-        backend->endpoint_submission_count(0x02) != before) return 3;
+        backend->endpoint_submission_count(0x02) != before) return 4;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
     dtv::internal::set_public_discovery_batch_for_test({});
@@ -2455,17 +2478,28 @@ int public_firmware_unknown_no_io()
     }
     const std::array<unsigned char, 3> package{1, 2, 3};
     const auto identify_before = scan_firmware_identify_calls();
+    dtv_error firmware_error{};
+    firmware_error.struct_size = sizeof(firmware_error);
+    const auto firmware_result = unknown == nullptr ? DTV_ERROR_INTERNAL
+        : dtv_send_firmware(unknown, package.data(), package.size(), nullptr, &firmware_error);
     dtv_error send_error{};
     send_error.struct_size = sizeof(send_error);
     const auto result = unknown == nullptr ? DTV_ERROR_INTERNAL
-        : dtv_send_firmware(unknown, package.data(), package.size(), nullptr, &send_error);
+        : dtv_send_default_firmware(unknown, nullptr, &send_error);
+    dtv_error product_error{};
+    product_error.struct_size = sizeof(product_error);
+    const auto product_result = unknown == nullptr ? DTV_ERROR_INTERNAL
+        : dtv_send_default_firmware_scanfixture(unknown, nullptr, &product_error);
     const bool no_io = backend->submit_calls == 0 && backend->open_count == 0 &&
         backend->claim_count == 0;
     const bool remains_unknown = unknown != nullptr && dtv_get_mode(unknown) == DTV_DEVICE_UNKNOWN;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
     dtv::internal::set_public_discovery_batch_for_test({});
-    return result == DTV_ERROR_NOT_READY && send_error.code == DTV_ERROR_NOT_READY &&
+    return firmware_result == DTV_ERROR_NOT_READY &&
+        firmware_error.code == DTV_ERROR_NOT_READY && result == DTV_ERROR_NOT_READY &&
+        send_error.code == DTV_ERROR_NOT_READY &&
+        product_result == DTV_ERROR_NOT_READY && product_error.code == DTV_ERROR_NOT_READY &&
         no_io && remains_unknown && scan_firmware_identify_calls() == identify_before ? 0 : 4;
 }
 

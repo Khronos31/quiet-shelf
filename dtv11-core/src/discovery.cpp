@@ -19,10 +19,6 @@ namespace {
 bool identity_matches(const dtv::spi::ModelEntry &model,
                       const dtv_usb_candidate_info &candidate)
 {
-    if (model.model.vendor_id == candidate.vendor_id &&
-        model.model.product_id == candidate.product_id) {
-        return true;
-    }
     for (std::size_t i = 0; i < model.cold_identity_count; ++i) {
         if (model.cold_identities == nullptr) {
             return false;

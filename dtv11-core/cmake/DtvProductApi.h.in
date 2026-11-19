@@ -14,6 +14,7 @@ int32_t @PRODUCT_SUPPORT_SYMBOL@(uint32_t operation, uint32_t *out_tribool, dtv_
 int32_t @MODEL_SUPPORT_SYMBOL@(const char *model, uint32_t operation,
                                 uint32_t *out_tribool, dtv_error *err);
 int32_t @PRODUCT_TO_ALL_SYMBOL@(const dtv_call_options *, dtv_error *err);
+int32_t @PRODUCT_DEFAULT_FIRMWARE_SYMBOL@(dtv_device *, const dtv_call_options *, dtv_error *err);
 dtv_enclosure *const *@PRODUCT_LIST_ENCLOSURES_SYMBOL@(dtv_error *err);
 dtv_enclosure *const *@PRODUCT_LIST_ENCLOSURES_BY_TOKENS_SYMBOL@(
     const dtv_usb_token *tokens, uint32_t token_count, dtv_error *err);
