@@ -323,6 +323,7 @@ struct PublicTunePlan {
     bool supported = false;
     bool ready = false;
     bool arguments_valid = false;
+    std::size_t handle_index = 0;
     std::span<const std::uint64_t> resource_keys;
 };
 
@@ -330,6 +331,7 @@ struct PublicTuneSession {
     void *user = nullptr;
     /* Call immediately before the first device-visible effect; this advances the receiver tune epoch. */
     dtv_internal_result (*begin_effect)(void *, std::uint64_t *) = nullptr;
+    const dtv_usb_io *io = nullptr;
 };
 
 struct PublicOpenOps {

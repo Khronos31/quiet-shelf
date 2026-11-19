@@ -3,6 +3,8 @@
 #define PIX_DT295_INTERNAL_HPP
 
 #include <array>
+#include <optional>
+#include <span>
 
 #include <dtv/spi/device_ops.hpp>
 
@@ -25,6 +27,18 @@ struct ReadOnlyObservation {
     std::array<uint32_t, 2> secondary_heartbeat{};
 };
 
+struct TerrestrialTuneParameters {
+    uint64_t frequency_hz;
+    uint16_t pll_divider;
+    bool high_band;
+};
+
+enum class TerrestrialLockState {
+    unknown,
+    unlocked,
+    locked,
+};
+
 struct State {
     dtv_device_id device;
     dtv_usb_io io{};
@@ -44,6 +58,13 @@ struct State {
 dtv_internal_result open(dtv_context *, const dtv_usb_io *, const dtv_open_args *);
 dtv_internal_result identify(dtv_context *, dtv_identify_info *, dtv_timeout);
 dtv_internal_result close(dtv_context *, dtv_timeout);
+dtv_internal_result plan_tune(dtv_context *, const dtv::spi::PublicTuneRequest *,
+                              dtv::spi::PublicTunePlan *);
+dtv_internal_result tune_by_frequency(dtv_context *, const dtv::spi::PublicTuneRequest *,
+                                      dtv::spi::PublicTuneSession *);
+std::optional<TerrestrialTuneParameters> terrestrial_tune_parameters(uint64_t);
+TerrestrialLockState terrestrial_lock_state(uint8_t, uint8_t);
+std::optional<uint32_t> terrestrial_raw_cn(std::span<const uint8_t>);
 dtv_internal_result select_usb_group(const dtv_usb_candidate_info *, uint32_t, uint32_t,
                                      dtv_usb_function_selection *, uint32_t, uint32_t *,
                                      dtv_usb_group_match *);

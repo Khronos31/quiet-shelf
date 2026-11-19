@@ -24,6 +24,7 @@
 - **エンコード (`encode_list_request`):**
   - 出力先バッファの容量（`output->capacity`）が 16 byte 未満の場合、`WireFrameCode::buffer_too_small` を返却し、**出力先バッファの内容および `output->size` を一切変更しない（無変更失敗保証）**。
   - 成功時のみ 16 byte を書き込み、`output->size = 16` を設定。
+- **対応する LIST 応答ペイロード仕様:** `docs/wire-list-response.md` を参照。
 
 ## 2. HELLO 応答ペイロード仕様
 

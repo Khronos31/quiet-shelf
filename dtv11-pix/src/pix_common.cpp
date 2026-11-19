@@ -788,6 +788,104 @@ dtv_internal_result prepare_hardware(State &state, dtv_timeout timeout)
     return result;
 }
 
+}
+
+dtv_internal_result plan_tune(dtv_context *context,
+                              const dtv::spi::PublicTuneRequest *request,
+                              dtv::spi::PublicTunePlan *plan)
+{
+    if (context == nullptr || request == nullptr || plan == nullptr) {
+        return make_result(kInvalid);
+    }
+    *plan = {};
+    if (request->system != DTV_SYSTEM_ISDB_T) {
+        return make_result(kOk);
+    }
+    plan->supported = !request->has_tune_options ||
+        (request->tune_options.selector == DTV_TUNE_SELECTOR_NONE &&
+         request->tune_options.lna == DTV_LNA_DEFAULT);
+    const auto parameters = terrestrial_tune_parameters(request->frequency_hz);
+    plan->arguments_valid = parameters.has_value();
+    auto *state = static_cast<State *>(context);
+    plan->ready = state->device_state == DeviceState::runtime &&
+                  state->prepared && state->lease && !state->failed;
+    plan->handle_index = 0;
+    return make_result(kOk);
+}
+
+dtv_internal_result tune_by_frequency(dtv_context *context,
+                                      const dtv::spi::PublicTuneRequest *request,
+                                      dtv::spi::PublicTuneSession *session)
+{
+    if (context == nullptr || request == nullptr || session == nullptr ||
+        session->io == nullptr || session->io->control == nullptr ||
+        session->begin_effect == nullptr) {
+        return make_result(kInvalid);
+    }
+    auto *state = static_cast<State *>(context);
+    if (request->system != DTV_SYSTEM_ISDB_T ||
+        (request->has_tune_options &&
+         (request->tune_options.selector != DTV_TUNE_SELECTOR_NONE ||
+          request->tune_options.lna != DTV_LNA_DEFAULT))) {
+        return make_result(kUnsupported);
+    }
+    const auto parameters = terrestrial_tune_parameters(request->frequency_hz);
+    if (!parameters.has_value()) {
+        return make_result(kInvalid);
+    }
+    if (state->device_state != DeviceState::runtime || !state->prepared ||
+        !state->lease || state->failed) {
+        return make_result(kNotReady);
+    }
+
+    uint64_t operation_epoch = 0;
+    auto result = session->begin_effect(session->user, &operation_epoch);
+    if (!succeeded(result)) {
+        return result;
+    }
+    (void)operation_epoch;
+    const auto &io = *session->io;
+    const auto timeout = request->timeout;
+    result = rf_write(io, 0x0B, 0x01, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x12, 0x01, timeout);
+    if (succeeded(result)) result = delay_ms(io, timeout, 20);
+    if (succeeded(result)) result = demod_write(io, 0x03, 0x00, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x1D, 0xAA, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x1E, 0xAA, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x1F, 0xAA, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x25, 0x00, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x23, 0x4D, timeout);
+    if (succeeded(result)) result = rf_mask_write(io, 0x0D, 0xFE, 0x00, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x0F, 0x20, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x10,
+        static_cast<uint8_t>(parameters->pll_divider), timeout);
+    if (succeeded(result)) result = rf_write(io, 0x11,
+        static_cast<uint8_t>(parameters->pll_divider >> 8), timeout);
+    if (succeeded(result)) result = rf_write(io, 0x00, 0x01, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x31,
+        parameters->high_band ? 0x91 : 0x81, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x00, 0x00, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x7C,
+        parameters->high_band ? 0x9F : 0x1F, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x12, 0x00, timeout);
+    if (succeeded(result)) result = rf_mask_write(io, 0x6E, 0xFF, 0x80, timeout);
+    if (succeeded(result)) result = rf_mask_write(io, 0x14, 0xDF, 0x00, timeout);
+    if (succeeded(result)) result = rf_write(io, 0x12, 0x01, timeout);
+    if (succeeded(result)) result = delay_ms(io, timeout, 20);
+    if (succeeded(result)) result = rf_mask_write(io, 0x6E, 0x7F, 0x00, timeout);
+    if (succeeded(result)) result = demod_mask_write(io, 0x0E, 0x70, 0x01, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x0F, 0x10, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x01, 0x40, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x23, 0x4C, timeout);
+    if (succeeded(result)) result = delay_ms(io, timeout, 100);
+    if (succeeded(result)) result = demod_write(io, 0x1D, 0x02, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x1E, 0x2A, timeout);
+    if (succeeded(result)) result = demod_write(io, 0x1F, 0x8A, timeout);
+    return result;
+}
+
+namespace {
+
 dtv_internal_result read_descriptor(const dtv_usb_io &io, dtv_timeout timeout)
 {
     uint32_t command = 0;
