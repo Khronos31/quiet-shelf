@@ -1534,3 +1534,37 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - USB 記述子読取の実測遅延、実機 USB での権限・BUSY 挙動、およびアクティブな TS ストリームへの影響は未測定である。走査予算（250ms / 2s）は未測定の試値であり、実測に基づく見直しが後続課題として残されている。
   - 既存 CLI および daemon との接続は本 PR の対象外であり、未接続・未実装である。
 
+
+
+## 正規runtime VID:PIDのグループ探索アンカー接続（PR84、内部基盤）
+
+PR84 では、ファームウェア転送（cold boot）を持たない正規 runtime 宣言のみを持つ機器（`cold_identity_count == 0` かつ `cold_identities == nullptr`）を一般グループ探索（`observe_loaded_product_groups` / `collect_complete_groups`）へ接続する限定修正を導入している。
+
+### 1. 概要とアンカー判定の拡張
+
+- **目的と背景:**
+  - 従来の一般グループ探索におけるアンカー判定（`src/discovery.cpp: identity_matches`）は明示的な cold ID（`model.cold_identities`）のみを照合していたため、ファームウェア不要で正規 runtime VID:PID のみを宣言する機種はアンカー候補として合致せず、`select_usb_group` コールバックに到達しなかった。
+  - 本修正により、明示 cold ID 集合に加えて、登録済み `ModelEntry` が宣言する正規 runtime VID:PID（`model.model.vendor_id == candidate.vendor_id && model.model.product_id == candidate.product_id`）もアンカー候補として照合される。
+
+### 2. 一般グループ探索と公開 projection への接続
+
+- **selector による確定と未登録 ID の除外:**
+  - アンカーとして照合された候補に対し、機種の `select_usb_group` コールバックが呼び出される。
+  - コールバックが `DTV_USB_GROUP_COMPLETE` と判定した観測値（`CompleteGroupObservation`）のみが `collect_complete_groups` により抽出され、公開 projection（`dtv_list_enclosures` / `live_slots`）へ渡される。
+  - 部分一致（`INCOMPLETE`）、不一致（`NO_MATCH`）、曖昧一致（`AMBIGUOUS`）は除外され、出力には含まれない。
+  - 登録済み `ModelEntry` に存在しない未登録の VID:PID を持つデバイスは、アンカー判定を通過せず、機種として追加されることなく確実に除外される（selector にも到達しない）。
+
+### 3. boot 専用経路との厳密な分離
+
+- **明示 cold ID 限定の維持:**
+  - ファームウェア送信のための boot 専用経路（`src/boot.cpp` の `cold_identity_matches`、`boot_selected_candidate`、`open_boot_group`）は、**明示的な cold ID（`model.cold_identities`）限定のまま変更なく維持される**。
+  - したがって、runtime 宣言のみ（`cold_identity_count == 0`）のグループが誤って `open_boot_group` に渡された場合でも、`DTV_INTERNAL_RESULT_UNSUPPORTED` で安全に拒否され、USB provider が open されることはない。
+
+### 4. 検証状況と境界
+
+- **単体契約テスト検証:**
+  - 既存内部 fixture（`tests/i2c1-partial-boot.cpp` / CTest: `i2c1_partial_boot_contract`）により、runtime-only（`cold_identity_count = 0`）の入力において、修正前の `selector_calls = 0`, `group = 0` から、修正後の `selector_calls = 1`, `DTV_USB_GROUP_COMPLETE group = 1` への変化を確認済みである。
+  - 同じ runtime-only group を `open_boot_group` へ渡した場合の `DTV_INTERNAL_RESULT_UNSUPPORTED` 拒否、および未登録 ID（`0x5678:0x0002`）が group なし・`selector_calls = 0` で除外されることを確認済みである。
+- **未実施境界と位置づけ:**
+  - 公開 C API（`dtv_list_enclosures`）を直接呼び出す統合試験、製品実体（ASICEN 等）との結合、および USB 実機での動的確認は本 PR では未実施である。
+  - 本限定修正をもって「特定機種の完成」や「SPI 安定版」とは呼ばない。

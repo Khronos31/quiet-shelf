@@ -50,6 +50,7 @@ bool force_invalid_alternate = false;
 bool force_complete = false;
 bool visible_one = false;
 bool include_other_device = false;
+std::uint32_t selector_calls = 0;
 dtv_function force_unknown_role = 0;
 std::mutex close_mutex;
 std::condition_variable close_condition;
@@ -280,6 +281,7 @@ dtv_internal_result select_group(const dtv_usb_candidate_info *, std::uint32_t c
                                  std::uint32_t capacity, std::uint32_t *out_count,
                                  dtv_usb_group_match *match)
 {
+    ++selector_calls;
     if (force_no_match) {
         *out_count = 0;
         *match = DTV_USB_GROUP_NO_MATCH;
@@ -417,9 +419,34 @@ bool partial_and_ambiguous()
     auto runtime_only_snapshot = make_snapshot(1);
     runtime_only_snapshot.vendor_id = model.model.vendor_id;
     runtime_only_snapshot.product_id = model.model.product_id;
+    auto runtime_model = model;
+    runtime_model.cold_identities = nullptr;
+    runtime_model.cold_identity_count = 0;
+    const dtv::spi::ModelEntry *runtime_models[]{&runtime_model};
+    const dtv::spi::ProductEntry runtime_product{"fixture-runtime", runtime_models, 1};
+    const dtv::spi::ProductEntry *runtime_products[]{&runtime_product};
+    selector_calls = 0;
+    force_complete = true;
     const auto runtime_only = dtv::internal::discover_boot_candidates(
-        std::array{runtime_only_snapshot}, products);
-    if (!runtime_only.empty()) return false;
+        std::array{runtime_only_snapshot}, runtime_products);
+    force_complete = false;
+    if (runtime_only.size() != 1 || runtime_only.front().match != DTV_USB_GROUP_COMPLETE ||
+        selector_calls != 1) return false;
+    FakeProvider runtime_provider;
+    dtv::internal::UsbContext runtime_usb;
+    dtv_internal_result runtime_result{};
+    auto runtime_boot = dtv::internal::open_boot_group(
+        runtime_usb, runtime_only.front(), 1, {1000, 0}, nullptr, nullptr,
+        &runtime_provider, &runtime_result);
+    if (runtime_boot || runtime_result.code != DTV_INTERNAL_RESULT_UNSUPPORTED ||
+        !runtime_provider.opened_candidates.empty()) return false;
+    auto unknown_snapshot = runtime_only_snapshot;
+    unknown_snapshot.vendor_id = 0x5678;
+    unknown_snapshot.product_id = 0x0002;
+    selector_calls = 0;
+    const auto unknown = dtv::internal::discover_boot_candidates(
+        std::array{unknown_snapshot}, runtime_products);
+    if (!unknown.empty() || selector_calls != 0) return false;
     force_duplicate_selection = true;
     dtv_internal_result discovery_result{};
     const auto invalid_group = dtv::internal::discover_boot_candidates(
