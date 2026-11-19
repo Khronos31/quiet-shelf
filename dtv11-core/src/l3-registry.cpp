@@ -3174,6 +3174,7 @@ struct PublicStreamState {
     std::size_t pending_callbacks = 0;
     std::uint64_t dropped_bytes = 0;
     std::uint64_t desyncs = 0;
+    bool pending_framer_skip = false;
     std::atomic<bool> cancelled{false};
     bool closing = false;
     bool closed = false;
@@ -3229,7 +3230,12 @@ dtv_internal_result deliver_stream_message(const std::shared_ptr<PublicStreamSta
                 } else {
                     std::vector<unsigned char> aligned(message.payload.size() + pending_bytes +
                         state->source_stride_bytes);
-                    const auto framed = state->framer->feed(message.payload, aligned);
+                    std::vector<std::size_t> skipped_before_units;
+                    const auto framed = state->framer->feed(message.payload, aligned,
+                                                             &skipped_before_units);
+                    const auto stats = state->framer->stats();
+                    state->dropped_bytes = stats.dropped_bytes;
+                    state->desyncs = stats.desyncs;
                     if (framed.code != dtv::internal::TsFramerCode::ok ||
                         framed.consumed != message.payload.size()) {
                         result = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
@@ -3243,29 +3249,46 @@ dtv_internal_result deliver_stream_message(const std::shared_ptr<PublicStreamSta
                                 result = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
                             } else {
                                 std::vector<unsigned char> output(source_units * 188);
+                                std::vector<std::size_t> transform_skips;
+                                auto append_skip = [&](std::size_t unit_index) {
+                                    if (transform_skips.empty() || transform_skips.back() != unit_index)
+                                        transform_skips.push_back(unit_index);
+                                };
+                                if (source_units != 0 && state->pending_framer_skip) {
+                                    append_skip(0);
+                                    state->pending_framer_skip = false;
+                                }
+                                for (const auto unit_index : skipped_before_units) {
+                                    if (unit_index < source_units) {
+                                        append_skip(unit_index);
+                                    } else if (unit_index == source_units) {
+                                        state->pending_framer_skip = true;
+                                    }
+                                }
                                 std::size_t consumed = 0;
                                 std::size_t produced = 0;
                                 if (framed.produced == 0) {
                                     result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-                                } else if (state->source_stride_bytes == 188 &&
-                                           state->source_sync_offset_bytes == 0) {
-                                    std::copy_n(aligned.begin(), framed.produced, output.begin());
-                                    consumed = framed.produced;
-                                    produced = output.size();
-                                    result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
                                 } else if (state->slot->ops->transform_stream != nullptr) {
-                                    const auto request = stream_request(*state);
+                                    auto request = stream_request(*state);
+                                    request.source_sync_skips_before_units = transform_skips;
                                     result = dtv::internal::call_callback([&] {
                                         return state->slot->ops->transform_stream(
                                             state->slot->product_instance->context(), &request,
                                             std::span<const unsigned char>(aligned.data(), framed.produced),
                                             output, &consumed, &produced);
                                     });
+                                } else if (state->source_stride_bytes == 188 &&
+                                           state->source_sync_offset_bytes == 0) {
+                                    std::copy_n(aligned.begin(), framed.produced, output.begin());
+                                    consumed = framed.produced;
+                                    produced = output.size();
+                                    result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
                                 } else {
                                     result = dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
                                 }
                                 if (result.code == DTV_INTERNAL_RESULT_OK &&
-                                    (consumed != framed.produced || produced != output.size() ||
+                                    (consumed != framed.produced || produced > output.size() ||
                                      produced % 188 != 0)) {
                                     result = dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0);
                                 }
@@ -3283,9 +3306,6 @@ dtv_internal_result deliver_stream_message(const std::shared_ptr<PublicStreamSta
                                         available - available % 188);
                                     state->bytes.insert(state->bytes.end(), output.begin(),
                                         output.begin() + accepted);
-                                    const auto stats = state->framer->stats();
-                                    state->dropped_bytes = stats.dropped_bytes;
-                                    state->desyncs = stats.desyncs;
                                     if (accepted != produced) {
                                         state->terminal = true;
                                         state->terminal_error = DTV_ERROR_SLOW_CONSUMER;
@@ -7766,62 +7786,6 @@ int32_t run_firmware_session(dtv_device *object, dtv_bytes package,
     return DTV_ERROR_OK;
 }
 
-}
-
-int32_t send_default_firmware_for_product(const char *expected_product,
-    dtv_device *object, const dtv_call_options *options, dtv_error *error)
-{
-    if (object == nullptr || (options != nullptr && options->struct_size < sizeof(*options))) {
-        set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
-        return DTV_ERROR_INVALID_ARGUMENT;
-    }
-    try {
-        auto &state = dtv::internal::public_discovery_state();
-        dtv::internal::FirmwareTarget target;
-        const auto target_result = state.registry.firmware_target(object, &target);
-        if (target_result.code != DTV_INTERNAL_RESULT_OK) {
-            const auto code = dtv::internal::public_error_code(target_result);
-            dtv::internal::set_public_error(error, code, nullptr, &target_result);
-            return code;
-        }
-        if (target.mode == DTV_DEVICE_UNKNOWN) {
-            dtv::internal::set_public_error(error, DTV_ERROR_NOT_READY);
-            return DTV_ERROR_NOT_READY;
-        }
-        const auto *product = target.model != nullptr && target.model->model != nullptr
-            ? target.model->model->product : nullptr;
-        const auto *model = target.model != nullptr && target.model->model != nullptr
-            ? target.model->model->name : nullptr;
-        if (product == nullptr || model == nullptr) {
-            dtv::internal::set_public_error(error, DTV_ERROR_NOT_READY);
-            return DTV_ERROR_NOT_READY;
-        }
-        int32_t result = DTV_ERROR_OK;
-        if (expected_product == nullptr) {
-            result = dtv::internal::dispatch_send_default_firmware_product(
-                product, object, options, error);
-        } else {
-            if (std::string_view(product) != expected_product) {
-                dtv::internal::set_public_error(error, DTV_ERROR_UNSUPPORTED);
-                return DTV_ERROR_UNSUPPORTED;
-            }
-            result = dtv::internal::dispatch_send_default_firmware(
-                product, model, object, options, error);
-        }
-        dtv::internal::set_public_error(error, result);
-        return result;
-    } catch (...) {
-        const auto result = dtv::internal::exception_result();
-        const auto code = dtv::internal::public_error_code(result);
-        dtv::internal::set_public_error(error, code, nullptr, &result);
-        return code;
-    }
-}
-
-extern "C" int32_t dtv_send_default_firmware(dtv_device *object,
-    const dtv_call_options *options, dtv_error *error)
-{
-    return dtv::internal::send_default_firmware_for_product(nullptr, object, options, error);
 }
 
 extern "C" std::uint32_t dtv_get_mode(dtv_device *object)

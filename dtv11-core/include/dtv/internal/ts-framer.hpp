@@ -38,7 +38,8 @@ public:
     bool valid() const { return valid_; }
     /* Input/output spans are borrowed only for this call; output is not retained. */
     TsFramerResult feed(std::span<const std::uint8_t> input,
-                        std::span<std::uint8_t> output);
+                        std::span<std::uint8_t> output,
+                        std::vector<std::size_t> *skip_before_units = nullptr);
     /* A new generation discards carry and gate state and restarts both counters. */
     void reset(std::uint64_t generation);
 
@@ -48,8 +49,9 @@ public:
 
 private:
     bool process(std::span<std::uint8_t> output, std::size_t &produced,
-                 bool &output_full);
-    void discard_one();
+                 bool &output_full, std::vector<std::size_t> *skip_before_units);
+    void discard_one(std::size_t produced,
+                     std::vector<std::size_t> *skip_before_units);
     void lose_sync();
 
     std::uint16_t stride_bytes_;

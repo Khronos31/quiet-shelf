@@ -173,6 +173,7 @@ struct PublicStreamRequest {
     std::uint8_t source_sync_offset_bytes = 0;
     std::size_t queue_capacity = 0;
     const std::atomic<bool> *cancelled = nullptr;
+    std::span<const std::size_t> source_sync_skips_before_units{};
 };
 
 struct PublicStreamPlan {

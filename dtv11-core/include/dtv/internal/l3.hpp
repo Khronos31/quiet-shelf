@@ -29,10 +29,6 @@ int32_t dispatch_send_firmware(const char *, const char *, dtv_device *, const u
                                const dtv_call_options *, dtv_error *);
 int32_t dispatch_send_default_firmware(const char *, const char *, dtv_device *,
                                        const dtv_call_options *, dtv_error *);
-int32_t dispatch_send_default_firmware_product(const char *, dtv_device *,
-                                               const dtv_call_options *, dtv_error *);
-int32_t send_default_firmware_for_product(const char *, dtv_device *,
-                                          const dtv_call_options *, dtv_error *);
 int32_t dispatch_reset_card(const char *, const char *, dtv_enclosure *, const dtv_call_options *,
                             std::vector<std::uint8_t> *, dtv_error *);
 

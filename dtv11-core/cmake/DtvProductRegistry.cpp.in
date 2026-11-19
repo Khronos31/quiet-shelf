@@ -28,15 +28,12 @@ extern const ProductEntry @PRODUCT_ENTRY_SYMBOL@{
 }
 
 extern "C" int32_t @PRODUCT_TO_ALL_SYMBOL@(const dtv_call_options *, dtv_error *);
-extern "C" int32_t @PRODUCT_DEFAULT_FIRMWARE_SYMBOL@(
-    dtv_device *, const dtv_call_options *, dtv_error *);
 @l3_model_declarations@
 
 extern "C" void dtv_l3_register_product(
     const char *, const dtv::spi::l3_model_record *const *, std::size_t,
     const dtv::spi::ProductEntry *,
-    int32_t (*)(const dtv_call_options *, dtv_error *),
-    int32_t (*)(dtv_device *, const dtv_call_options *, dtv_error *));
+    int32_t (*)(const dtv_call_options *, dtv_error *));
 
 extern "C" void @PRODUCT_LOAD_SYMBOL@(void)
 {
@@ -44,15 +41,7 @@ extern "C" void @PRODUCT_LOAD_SYMBOL@(void)
 @l3_model_values@    };
     dtv_l3_register_product("@PRODUCT_NAME@", models, @PRODUCT_MODELS_COUNT@,
                             &dtv::spi::@PRODUCT_ENTRY_SYMBOL@,
-                            &@PRODUCT_TO_ALL_SYMBOL@,
-                            &@PRODUCT_DEFAULT_FIRMWARE_SYMBOL@);
-}
-
-extern "C" int32_t @PRODUCT_DEFAULT_FIRMWARE_SYMBOL@(
-    dtv_device *device, const dtv_call_options *options, dtv_error *error)
-{
-    return dtv::internal::send_default_firmware_for_product(
-        "@PRODUCT_NAME@", device, options, error);
+                            &@PRODUCT_TO_ALL_SYMBOL@);
 }
 
 extern "C" const dtv_model *const *@PRODUCT_LIST_MODELS_SYMBOL@(void)

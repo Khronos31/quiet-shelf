@@ -1536,54 +1536,40 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
 
 
 
-## 公開default firmware転送関数と製品別生成口（PR85、内部基盤）
+## runtime TS transform の3欠口補完（PR86、内部基盤）
 
-PR85 では、公開 C ABI として宣言されながら Core 内に実体定義が欠落していた `dtv_send_default_firmware()` の実装を補完し、製品別生成口 `dtv_send_default_firmware_<PRODUCT_NAME>()` および LoadedProduct レジストリへの接続を導入している。
+PR86 では、Core の整列後 TS ストリーミングと機種 SPI `transform_stream` の接続において、実機・暗号ストリーム適用に向けた 3 つの欠落条件（188/0 登録到達、可変長・zero produced 契約、framer discard 境界伝達）を補完している。
 
-### 1. 概要とシンボル構造
+### 1. 3欠口の補完と契約仕様
 
-- **Core generic 公開シンボル (`dtv_send_default_firmware`):**
-  - 公開ヘッダ（`include/dtv/dtv.h`）で宣言済みの非接尾辞シンボル。
-  - 渡された `dtv_device` から内部の所有モード・製品・機種（`FirmwareTarget`）を解決し、登録済み製品レジストリ（`loaded_products`）経由で当該製品の default callback へ振り分ける。
-- **製品別生成シンボル (`dtv_send_default_firmware_<PRODUCT_NAME>`):**
-  - CMake の `dtv_add_product` により、各製品の生成ヘッダ（`<product>_api.h`）へ宣言が、生成レジストリソース（`<product>_registry.cpp`）へ定義が出力される。
-  - 所属製品の一致（境界判定）を検証した後、既存の機種別ディスパッチャ（`dispatch_send_default_firmware`）へ引き渡す。
-- **手書き `to_all` との区別:**
-  - 全機器一括送信関数 `dtv_send_default_firmware_to_all_<product>` は従来通り製品側での手書き実装例外のままであり、自動生成されない（本 PR でも変更なし）。
+- **1. 188/0 登録 transform への到達:**
+  - `source_stride_bytes == 188 && source_sync_offset_bytes == 0` の標準ストライドであっても、登録済み機種が `PublicOpenOps::transform_stream` コールバックを宣言・保持している場合は runtime caller から確実に呼び出されるよう接続。
+  - **不変条件:** 未登録時の 188/0 透過（pass-through、ダイレクトコピー）、および 192/4 等の非 188/0 ストライドにおける `transform_stream` 登録必須条件（未登録なら `DTV_ERROR_NOT_READY`）は変更なく維持される。
+- **2. 出力容量範囲と 188 倍数契約（zero produced の許容）:**
+  - transform コールバックは渡された全入力（`framed.produced` バイト）を完全に消費する（全 input consume）。
+  - 出力 `produced` は `0 .. output.size()`（`source_units * 188`）の範囲内で、かつ 188 の整数倍（`produced % 188 == 0`）を出力する契約。容量超過、非 188 倍数、または入力未消費時は `DTV_INTERNAL_RESULT_INTERNAL`。
+  - **zero output の成功:** `produced == 0`（暗号 marker 待ちやヘッダ解析中など）は正常な成功であり、終端（EOF）やエラーとは扱われない。実際に `produced` された有効範囲のみが sync 検証（先頭 `0x47`）を経て公開キューへ配送される。
+- **3. Framer discard (skip) 境界の unit index 順伝達:**
+  - `TsFramer` における同期喪失やノイズによるパケット破棄（discard）境界を、整列済み unit index 順の配列として `PublicStreamRequest::source_sync_skips_before_units`（`std::span<const std::size_t>`）経由で transform コールバックへ通知。
+  - **同 feed 内の順序保持:** skip 前の unit → skip 発生 → skip 後の unit という時間的前後関係を index 列で正確に伝達。
+  - **次 feed への繰越し (carry):** feed 末尾（`unit_index == source_units`）で発生した保留 skip は次回 feed の先頭（unit 0 の前）へ持ち越して伝達。
+  - **世代分離 (generation isolation):** 保留 skip がある状態でストリームが閉じられ、新しい世代（generation）で再オープンされた場合、保留 skip は持ち越されず確実に破棄・分離される。
 
-### 2. 判定・振分けルーティングと戻り値契約
+### 2. 統計カウンタと暗号非混入契約
 
-- **無効引数:** `device == nullptr` または `options` の構造体サイズ不正時は直ちに `DTV_ERROR_INVALID_ARGUMENT` を返す。
-- **UNKNOWN 機種 (`DTV_DEVICE_UNKNOWN`):**
-  - 対象デバイスの機種・製品が特定されていない場合、製品コールバックへのディスパッチ前に直ちに `DTV_ERROR_NOT_READY` を返す。
-  - バックエンド USB オープンや claim、転送 I/O は発生しない。
-- **製品境界判定（製品別口での他製品拒否）:**
-  - `dtv_send_default_firmware_<PRODUCT_NAME>` に対し、他製品に属するデバイスが渡された場合、`DTV_ERROR_UNSUPPORTED` で安全に処理を拒否・中断する（I/O なし）。
-- **no-FW 機種 (`DTV_NO_FIRMWARE`):**
-  - ファームウェア不要機種（fake runtime デバイス等）に対しては、既存の no-FW ハンドラが何もしないまま `DTV_ERROR_OK` で成功を返す（I/O なし）。
-- **埋め込みファームウェア機種 (`DTV_FIRMWARE`):**
-  - 機種の `DTV_FIRMWARE(<asset>)` 宣言から生成された既存 default wrapper を呼び出し、埋め込み資産バイト列を取り出して既存の手書き機種実装（`dtv_model_impl_send_firmware_*`）へ引き渡す。
+- **公開 dropped_bytes / desyncs の帰属:**
+  - 公開される `dtv_get_dropped_bytes()` および `dtv_get_desyncs()` は、`TsFramer` のアライメント discard 統計のみを保持する。
+  - 暗号 marker や IV パケット等の未出力パケット、未配送パケットは混入しない。新しい公開統計や API は追加していない。
 
-### 3. 転送経路の再利用と不変事項
+### 3. 検証状況と未完成・未実施境界
 
-- **既存トランスポート・セッションの再利用:**
-  - 機種別 default wrapper から既存の generic firmware callback / session / claim lease 経路を再利用する。
-  - 本 PR で新しい USB 経路や転送トランスポートは追加していない。
-- **事前検査（preflight）の範囲外:**
-  - ファームウェアバイト列の内容検証、サイズ検査、ハッシュ照合、パッケージ preflight などの検査処理は追加していない。
-- **公開仕様・正本の不変:**
-  - `include/dtv/dtv.h` の既存公開宣言、L3 正本仕様、および製品共通ディスパッチャの構造は変更していない。
-
-### 4. 検証状況と境界
-
-- **作者検証（単体 fixture 検証）:**
-  - 既存内部 fixture（`tests/fixture/firmware-contract.cpp`, `tests/fixture/usb-claim-lease.cpp`）を拡張し、以下を確認済みである:
-    1. クライアント側の公開 Core generic シンボルおよび生成製品シンボルへのリンク成立
-    2. `device == nullptr` での `INVALID_ARGUMENT` 拒否
-    3. UNKNOWN デバイスでの `NOT_READY` 拒否（I/O なし）
-    4. fake runtime デバイスでの no-FW `DTV_ERROR_OK` 成功（I/O なし）
-    5. 別製品デバイスでの `UNSUPPORTED` 拒否（I/O なし）
-    6. `nm -g --defined-only` によるシンボル実体定義の存在確認
-- **未実施境界と位置づけ:**
-  - 本検証はリンク成立と代表振分けの確認にとどまり、cold boot からのファームウェア送信、PIX-DT295 等の実機ハードウェアでの成功、および Windows / NDK / CTest フルスイートでの動作は未確認である。
-  - 本 ABI/リンク補完をもって「公開ファームウェア転送の完全動作」や「実機対応完了」とは呼ばない。
+- **作者検証（単体 fixture / caller 検証）:**
+  - 既存内部 fixture（`tests/fixture/src/scan_model.cpp`, `tests/fixture/usb-claim-lease.cpp`, `tests/ts-framer.cpp`）を拡張して検証。
+  - 初期 checkpoint で fulltarget 成功（188/0 到達確認）。
+  - 全条件追加後の初回 CTest では別々の 2 回の同期喪失（desyncs 期待値 1 -> 2）による return 17 を検出し、テスト期待値を訂正。
+  - 短い caller 確認で zero-output 時の呼出し回数（入力あたり 1 回呼出し）による return 25 を検出し、テスト期待値を訂正。
+  - 最終的に短い caller で return 0、`ts_framer_contract` で 1/1 PASS を確認済み。
+- **未完成・未実施境界:**
+  - DT181（3同期）や ASICEN（4同期）の追加接合、機種固有の crypto / TS 算法、および標準 TS ヘッダの scrambling control パケット計数 API・統計は本 PR では追加しておらず、未完成である。
+  - 長い修正後の全 target 再走、全 CTest suite、Windows / NDK、GitHub Actions、実機 / USB、および製品実体 QA は作者環境では未実施である。
+  - 本 PR86 は未マージのまま親/ユーザー判断へ提出する。

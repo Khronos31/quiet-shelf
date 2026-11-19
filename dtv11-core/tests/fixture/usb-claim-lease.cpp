@@ -25,8 +25,6 @@
 #include <dtv/internal/clock.hpp>
 #include <dtv/internal/l3-registry.hpp>
 #include <dtv/spi/device_ops.hpp>
-#include <i0_asicen_fixture_api.h>
-#include <scanfixture_api.h>
 
 #include "usb-transfer-backend.hpp"
 
@@ -66,6 +64,10 @@ void set_scan_card_t1_receive_capacity(bool, std::size_t, std::uint64_t, std::ui
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
+unsigned scan_stream_transform_call_count();
+void set_scan_stream_transform_mode(unsigned);
+void set_scan_stream_transform_test_active(bool);
+void set_scan_stream_transform_source_phase(unsigned);
 void set_scan_stream_failure_modes(unsigned, unsigned, unsigned, unsigned);
 void set_scan_stream_generation_override(std::uint64_t);
 std::uint64_t scan_stream_previous_generation();
@@ -944,7 +946,7 @@ int public_open_lifecycle()
             DTV_ERROR_BUFFER_TOO_SMALL || output_size != 0) return 42;
     if (dtv_read_stream(stream, packets.data(), packets.size(), nullptr, &output_size, &error) !=
             DTV_ERROR_OK || output_size != packets.size() || packets[0] != 0x47 ||
-        packets[188] != 0x47) return 44;
+        packets[188] != 0x47 || scan_stream_transform_call_count() == 0) return 44;
     if (dtv_read_stream(stream, packets.data(), packets.size(), nullptr, &output_size, &error) !=
             DTV_ERROR_OK || output_size != 0) return 45;
     if (dtv_open_stream(receivers[0], nullptr, &next_stream, &error) != DTV_ERROR_BUSY ||
@@ -1066,6 +1068,94 @@ int public_open_192_stream()
             DTV_ERROR_OK || output_size != 0) return 12;
     if (dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 13;
     dtv_release_stream(stream);
+
+    set_scan_stream_transform_test_active(true);
+    set_scan_stream_transform_mode(0);
+    set_scan_stream_transform_source_phase(0);
+    auto complete_source = [&](unsigned phase) {
+        set_scan_stream_transform_source_phase(phase);
+        const auto before = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x81);
+        return backend->wait_for_callbacks(before + 1);
+    };
+    auto read_markers = [&](dtv_stream *target,
+                            std::initializer_list<unsigned char> markers) {
+        std::array<unsigned char, 3 * 188> actual{};
+        const auto expected_size = markers.size() * 188;
+        std::uint64_t actual_size = 0;
+        if (dtv_read_stream(target, actual.data(), expected_size, &read_wait,
+                &actual_size, &error) != DTV_ERROR_OK || actual_size != expected_size)
+            return false;
+        std::size_t unit = 0;
+        for (const auto marker : markers) {
+            if (actual[unit * 188] != 0x47 || actual[unit * 188 + 1] != marker) return false;
+            ++unit;
+        }
+        return true;
+    };
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(0) ||
+        !read_markers(stream, {0x11, 0x12})) return 15;
+    const auto transform_calls = scan_stream_transform_call_count();
+    if (!complete_source(1) || !read_markers(stream, {0x21, 0xfa, 0xfa}) ||
+        scan_stream_transform_call_count() != transform_calls + 1 ||
+        dtv_get_dropped_bytes(stream) != 190 || dtv_get_desyncs(stream) != 1) return 16;
+    const auto phase2_completed = complete_source(2);
+    const auto phase2_read = phase2_completed && read_markers(stream, {0x31});
+    const auto phase2_dropped = dtv_get_dropped_bytes(stream);
+    const auto phase2_desyncs = dtv_get_desyncs(stream);
+    if (!phase2_completed || !phase2_read || phase2_dropped != 192 || phase2_desyncs != 2) {
+        std::fprintf(stderr, "runtime transform deferred skip: completed=%d read=%d dropped=%llu desyncs=%llu\n",
+            phase2_completed, phase2_read, static_cast<unsigned long long>(phase2_dropped),
+            static_cast<unsigned long long>(phase2_desyncs));
+        return 17;
+    }
+    if (!complete_source(3) || !read_markers(stream, {0xfa, 0xfa}) ||
+        dtv_get_dropped_bytes(stream) != 380 || dtv_get_desyncs(stream) != 2) return 18;
+    if (!complete_source(4) || !read_markers(stream, {0x51}) ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 19;
+    dtv_release_stream(stream);
+    set_scan_stream_transform_source_phase(5);
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(5) ||
+        !read_markers(stream, {0x61, 0x62}) ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 20;
+    dtv_release_stream(stream);
+
+    set_scan_stream_transform_mode(1);
+    set_scan_stream_transform_source_phase(0);
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(0)) return 21;
+    std::array<unsigned char, 188> shortened{};
+    if (dtv_read_stream(stream, shortened.data(), shortened.size(), &read_wait,
+            &output_size, &error) != DTV_ERROR_OK || output_size != shortened.size() ||
+        shortened[0] != 0x47 || shortened[1] != 0x11) return 22;
+    const dtv_call_options short_wait{sizeof(dtv_call_options), 10};
+    if (dtv_read_stream(stream, shortened.data(), shortened.size(), &short_wait,
+            &output_size, &error) != DTV_ERROR_TIMEOUT || output_size != 0 ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 23;
+    dtv_release_stream(stream);
+
+    set_scan_stream_transform_mode(2);
+    set_scan_stream_transform_source_phase(0);
+    const auto calls_before_zero = scan_stream_transform_call_count();
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(0)) return 24;
+    const auto zero_read = dtv_read_stream(stream, shortened.data(), shortened.size(), &short_wait,
+        &output_size, &error);
+    const auto calls_after_zero = scan_stream_transform_call_count();
+    const auto zero_close = dtv_close_stream(stream, nullptr, &error);
+    if (zero_read != DTV_ERROR_TIMEOUT || output_size != 0 ||
+        calls_after_zero != calls_before_zero + 1 || zero_close != DTV_CLOSE_CLOSED) {
+        std::fprintf(stderr, "runtime transform zero output: read=%d size=%llu calls=%u/%u close=%d\n",
+            zero_read, static_cast<unsigned long long>(output_size), calls_before_zero,
+            calls_after_zero, zero_close);
+        return 25;
+    }
+    dtv_release_stream(stream);
+    set_scan_stream_transform_test_active(false);
+    set_scan_stream_transform_mode(0);
+
     if (dtv_close_enclosure(root, nullptr, &error) != DTV_CLOSE_CLOSED) return 14;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
@@ -2287,33 +2377,12 @@ int public_lnb_unsupported()
     }
     auto *root = enclosures[0];
     dtv_hold_enclosure(root);
-    auto *const *devices = dtv_get_devices(root);
-    if (devices == nullptr || devices[0] == nullptr) return 3;
-    const auto output_count = backend->output_snapshot().size();
-    dtv_error default_error{};
-    default_error.struct_size = sizeof(default_error);
-    const auto default_result = dtv_send_default_firmware(devices[0], nullptr, &default_error);
-    dtv_error product_default_error{};
-    product_default_error.struct_size = sizeof(product_default_error);
-    const auto product_default_result = dtv_send_default_firmware_scanfixture(
-        devices[0], nullptr, &product_default_error);
-    dtv_error other_product_error{};
-    other_product_error.struct_size = sizeof(other_product_error);
-    const auto other_product_result = dtv_send_default_firmware_i0_asicen_fixture(
-        devices[0], nullptr, &other_product_error);
     const auto before = backend->endpoint_submission_count(0x02);
     std::uint32_t support = DTV_UNKNOWN;
-    if (dtv_get_mode(devices[0]) != DTV_DEVICE_RUNTIME ||
-        default_result != DTV_ERROR_OK || default_error.code != DTV_ERROR_OK ||
-        product_default_result != DTV_ERROR_OK || product_default_error.code != DTV_ERROR_OK ||
-        other_product_result != DTV_ERROR_UNSUPPORTED ||
-        other_product_error.code != DTV_ERROR_UNSUPPORTED ||
-        backend->output_snapshot().size() != output_count || backend->submit_calls != 0 ||
-        backend->open_count != 0 || backend->claim_count != 0 ||
-        dtv_get_enclosure_support(root, DTV_OP_LNB_POWER, &support, &error) != DTV_ERROR_OK ||
+    if (dtv_get_enclosure_support(root, DTV_OP_LNB_POWER, &support, &error) != DTV_ERROR_OK ||
         support != DTV_NO || dtv_lnb_on(root, nullptr, &error) != DTV_ERROR_UNSUPPORTED ||
         error.code != DTV_ERROR_UNSUPPORTED ||
-        backend->endpoint_submission_count(0x02) != before) return 4;
+        backend->endpoint_submission_count(0x02) != before) return 3;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
     dtv::internal::set_public_discovery_batch_for_test({});
@@ -2478,28 +2547,17 @@ int public_firmware_unknown_no_io()
     }
     const std::array<unsigned char, 3> package{1, 2, 3};
     const auto identify_before = scan_firmware_identify_calls();
-    dtv_error firmware_error{};
-    firmware_error.struct_size = sizeof(firmware_error);
-    const auto firmware_result = unknown == nullptr ? DTV_ERROR_INTERNAL
-        : dtv_send_firmware(unknown, package.data(), package.size(), nullptr, &firmware_error);
     dtv_error send_error{};
     send_error.struct_size = sizeof(send_error);
     const auto result = unknown == nullptr ? DTV_ERROR_INTERNAL
-        : dtv_send_default_firmware(unknown, nullptr, &send_error);
-    dtv_error product_error{};
-    product_error.struct_size = sizeof(product_error);
-    const auto product_result = unknown == nullptr ? DTV_ERROR_INTERNAL
-        : dtv_send_default_firmware_scanfixture(unknown, nullptr, &product_error);
+        : dtv_send_firmware(unknown, package.data(), package.size(), nullptr, &send_error);
     const bool no_io = backend->submit_calls == 0 && backend->open_count == 0 &&
         backend->claim_count == 0;
     const bool remains_unknown = unknown != nullptr && dtv_get_mode(unknown) == DTV_DEVICE_UNKNOWN;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
     dtv::internal::set_public_discovery_batch_for_test({});
-    return firmware_result == DTV_ERROR_NOT_READY &&
-        firmware_error.code == DTV_ERROR_NOT_READY && result == DTV_ERROR_NOT_READY &&
-        send_error.code == DTV_ERROR_NOT_READY &&
-        product_result == DTV_ERROR_NOT_READY && product_error.code == DTV_ERROR_NOT_READY &&
+    return result == DTV_ERROR_NOT_READY && send_error.code == DTV_ERROR_NOT_READY &&
         no_io && remains_unknown && scan_firmware_identify_calls() == identify_before ? 0 : 4;
 }
 

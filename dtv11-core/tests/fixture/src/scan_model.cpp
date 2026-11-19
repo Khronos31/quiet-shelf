@@ -137,6 +137,11 @@ std::atomic<unsigned> scan_stream_drain_mode{0};
 std::atomic<std::size_t> scan_stream_192_offset{0};
 std::atomic<bool> scan_stream_192_end_sent{false};
 std::atomic<unsigned> scan_stream_receiver{0};
+std::atomic<unsigned> scan_stream_transform_calls{0};
+std::atomic<unsigned> scan_stream_transform_mode{0};
+std::atomic<bool> scan_stream_transform_test_active{false};
+std::atomic<std::size_t> scan_stream_transform_source_size{0};
+std::array<unsigned char, 754> scan_stream_transform_source{};
 std::array<unsigned char, 963> scan_stream_192_source{};
 std::array<std::atomic<std::uint64_t>, 3> scan_tune_epochs{};
 std::atomic<std::uint64_t> scan_shared_lock_epoch_override{UINT64_MAX};
@@ -1129,6 +1134,16 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     const auto stream_generation = scan_stream_generation.load(std::memory_order_acquire);
+    if (scan_stream_transform_test_active.load(std::memory_order_acquire) &&
+        stream_generation != 0 && packet->endpoint == 0x81) {
+        message->kind = dtv::spi::PublicOpenMessageKind::source_chunk;
+        message->receiver_index = 0;
+        message->stream_generation = stream_generation;
+        message->generation = packet->generation;
+        const auto size = scan_stream_transform_source_size.load(std::memory_order_acquire);
+        message->payload = std::span<const unsigned char>(scan_stream_transform_source).first(size);
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
     if (scan_public_open_case == 16 && packet->endpoint == 0x81) {
         bool pending = false;
         {
@@ -1779,8 +1794,31 @@ dtv_internal_result scan_transform_stream(dtv_context *,
     const dtv::spi::PublicStreamRequest *request, std::span<const unsigned char> input,
     std::span<unsigned char> output, std::size_t *consumed, std::size_t *produced)
 {
-    if (request == nullptr || consumed == nullptr || produced == nullptr ||
-        request->source_stride_bytes != 192 || request->source_sync_offset_bytes != 4 ||
+    if (request == nullptr || consumed == nullptr || produced == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    scan_stream_transform_calls.fetch_add(1, std::memory_order_acq_rel);
+    if (request->source_stride_bytes == 188 && request->source_sync_offset_bytes == 0) {
+        if (input.size() % 188 != 0 || output.size() != input.size())
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+        std::size_t skip_index = 0;
+        bool skipped = false;
+        for (std::size_t offset = 0; offset < input.size(); offset += 188) {
+            while (skip_index < request->source_sync_skips_before_units.size() &&
+                   request->source_sync_skips_before_units[skip_index] == offset / 188) {
+                skipped = true;
+                ++skip_index;
+            }
+            std::copy_n(input.begin() + offset, 188, output.begin() + offset);
+            if (skipped) output[offset + 1] = 0xfa;
+        }
+        if (skip_index != request->source_sync_skips_before_units.size())
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+        *consumed = input.size();
+        const auto mode = scan_stream_transform_mode.load(std::memory_order_acquire);
+        *produced = mode == 1 ? 188 : mode == 2 ? 0 : output.size();
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    if (request->source_stride_bytes != 192 || request->source_sync_offset_bytes != 4 ||
         input.size() % 192 != 0 || output.size() != input.size() / 192 * 188)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     for (std::size_t source_offset = 0, output_offset = 0;
@@ -1827,6 +1865,10 @@ void set_scan_public_open_case(unsigned value)
     scan_stream_192_offset.store(0, std::memory_order_release);
     scan_stream_192_end_sent.store(false, std::memory_order_release);
     scan_stream_receiver.store(0, std::memory_order_release);
+    scan_stream_transform_calls.store(0, std::memory_order_release);
+    scan_stream_transform_mode.store(0, std::memory_order_release);
+    scan_stream_transform_test_active.store(false, std::memory_order_release);
+    scan_stream_transform_source_size.store(0, std::memory_order_release);
     scan_open_identify_calls.store(0, std::memory_order_release);
     scan_open_identify_blocked.store(false, std::memory_order_release);
     scan_open_identify_release.store(value != 8, std::memory_order_release);
@@ -1911,6 +1953,59 @@ void set_scan_public_open_case(unsigned value)
     scan_tune_records = {};
     scan_shared_order = {};
     scan_shared_order_endpoints = {};
+}
+
+unsigned scan_stream_transform_call_count()
+{
+    return scan_stream_transform_calls.load(std::memory_order_acquire);
+}
+
+void set_scan_stream_transform_mode(unsigned mode)
+{
+    scan_stream_transform_mode.store(mode, std::memory_order_release);
+}
+
+void set_scan_stream_transform_test_active(bool active)
+{
+    scan_stream_transform_test_active.store(active, std::memory_order_release);
+}
+
+void set_scan_stream_transform_source_phase(unsigned phase)
+{
+    auto set_unit = [](std::size_t offset, unsigned char marker) {
+        std::fill(scan_stream_transform_source.begin() + offset,
+                  scan_stream_transform_source.begin() + offset + 188, marker);
+        scan_stream_transform_source[offset] = 0x47;
+    };
+    std::fill(scan_stream_transform_source.begin(), scan_stream_transform_source.end(), 0);
+    std::size_t size = 0;
+    if (phase == 1) {
+        set_unit(0, 0x21);
+        set_unit(378, 0x22);
+        set_unit(566, 0x23);
+        size = 754;
+    } else if (phase == 2) {
+        set_unit(0, 0x31);
+        size = 378;
+    } else if (phase == 3) {
+        set_unit(0, 0x41);
+        set_unit(188, 0x42);
+        size = 376;
+    } else if (phase == 4) {
+        set_unit(0, 0x51);
+        size = 378;
+    } else {
+        set_unit(0, phase == 5 ? 0x61 : 0x11);
+        set_unit(188, phase == 5 ? 0x62 : 0x12);
+        size = 376;
+    }
+    if (phase == 1) std::fill(scan_stream_transform_source.begin() + 188,
+                               scan_stream_transform_source.begin() + 378, 0);
+    if (phase == 2) std::fill(scan_stream_transform_source.begin() + 188,
+                               scan_stream_transform_source.begin() + 378, 0);
+    if (phase == 4) std::fill(scan_stream_transform_source.begin() + 188,
+                               scan_stream_transform_source.begin() + 378, 0);
+    scan_stream_transform_source_size.store(size, std::memory_order_release);
 }
 
 void set_scan_card_reply_mode(unsigned mode)
