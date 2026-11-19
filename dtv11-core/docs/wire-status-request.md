@@ -159,6 +159,7 @@ STATUS 要求のペイロード長は、常に正確に 25 バイト固定であ
 
 ## 関連ドキュメント
 
+- [wire-status-response.md](wire-status-response.md) - STATUS 応答ペイロードコーデック仕様
 - [wire-codec-subset.md](wire-codec-subset.md) - HELLO 要求および ACQUIRE 要求/応答ペイロードコーデック仕様
 - [wire-hello-list.md](wire-hello-list.md) - HELLO 応答および LIST 要求ペイロードコーデック仕様
 - [wire-error-response.md](wire-error-response.md) - ErrorResponse ペイロードコーデック仕様

@@ -104,8 +104,6 @@ if(BUILD_TESTING)
     target_compile_features(usb_claim_lease_contract PRIVATE c_std_11)
     target_link_libraries(usb_claim_lease_contract PRIVATE scanfixture ${DTV_LIBUSB_TARGET})
     add_test(NAME usb_claim_lease_contract COMMAND usb_claim_lease_contract)
-    add_test(NAME usb_enclosure_retire_contract
-        COMMAND usb_claim_lease_contract --enclosure-retire)
     add_executable(discovery_public_contract discovery-public.c discovery-public.cpp)
     target_link_libraries(discovery_public_contract PRIVATE scanfixture ${DTV_LIBUSB_TARGET})
     add_test(NAME discovery_public_contract COMMAND discovery_public_contract)

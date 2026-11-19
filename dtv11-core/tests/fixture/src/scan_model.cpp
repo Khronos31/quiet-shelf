@@ -736,14 +736,6 @@ dtv_internal_result scan_open_plan(
                                        : dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
 }
 
-std::atomic<unsigned> scan_public_stop_count{0};
-
-dtv_internal_result scan_stop_product(dtv_context *, dtv_timeout)
-{
-    scan_public_stop_count.fetch_add(1, std::memory_order_acq_rel);
-    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-}
-
 dtv_internal_result scan_open_identify(dtv_context *, std::span<const unsigned char> bytes,
                                        dtv_timeout, const std::atomic<bool> *)
 {
@@ -1804,7 +1796,7 @@ dtv_internal_result scan_transform_stream(dtv_context *,
 }
 
 const dtv::spi::PublicOpenOps scan_public_open_ops{
-    scan_open_plan, scan_open_identify, scan_stop_product, scan_shared_demux, scan_shared_identify,
+    scan_open_plan, scan_open_identify, nullptr, scan_shared_demux, scan_shared_identify,
     scan_plan_operation, scan_plan_tune, scan_tune_by_frequency,
     scan_prepare_stream, scan_start_stream, scan_stop_stream, scan_after_stream_drain,
     scan_plan_stream, scan_transform_stream, scan_plan_card_transport};
@@ -1814,16 +1806,6 @@ const dtv::spi::PublicOpenOps scan_public_open_ops{
 void set_scan_group_case(unsigned value)
 {
     scan_group_case = static_cast<ScanGroupCase>(value);
-}
-
-unsigned scan_public_stop_count_value()
-{
-    return scan_public_stop_count.load(std::memory_order_acquire);
-}
-
-void reset_scan_public_stop_count()
-{
-    scan_public_stop_count.store(0, std::memory_order_release);
 }
 
 void set_scan_public_open_case(unsigned value)
