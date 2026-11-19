@@ -59,6 +59,7 @@ add_library(dtv-userland STATIC
     src/wire-envelope.cpp
     src/wire-error-response.cpp
     src/wire-hello-list.cpp
+    src/wire-list-response.cpp
     src/wire-status-request.cpp
     src/wire-subset.cpp
     src/wire-lnb-power.cpp
@@ -68,6 +69,9 @@ target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
 target_link_libraries(dtv-userland PRIVATE ${DTV_LIBUSB_TARGET} Threads::Threads)
 set_target_properties(dtv-userland PROPERTIES CXX_EXTENSIONS OFF)
+if(MSVC)
+    target_compile_options(dtv-userland PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+endif()
 
 include(cmake/DtvProduct.cmake)
 
@@ -80,6 +84,10 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_include_directories(usb_async_io_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(usb_async_io_contract PRIVATE dtv::userland ${DTV_LIBUSB_TARGET})
     add_test(NAME usb_async_io_contract COMMAND usb_async_io_contract)
+    add_executable(usb_serial_contract tests/usb-serial.cpp)
+    target_include_directories(usb_serial_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(usb_serial_contract PRIVATE dtv::userland ${DTV_LIBUSB_TARGET})
+    add_test(NAME usb_serial_contract COMMAND usb_serial_contract)
     add_executable(firmware_preflight_contract tests/firmware-preflight.cpp)
     target_link_libraries(firmware_preflight_contract PRIVATE dtv::userland)
     add_test(NAME firmware_preflight_contract COMMAND firmware_preflight_contract)
@@ -111,6 +119,9 @@ if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(wire_hello_list_contract tests/wire-hello-list.cpp)
     target_link_libraries(wire_hello_list_contract PRIVATE dtv::userland)
     add_test(NAME wire_hello_list_contract COMMAND wire_hello_list_contract)
+    add_executable(wire_list_response_contract tests/wire-list-response.cpp)
+    target_link_libraries(wire_list_response_contract PRIVATE dtv::userland)
+    add_test(NAME wire_list_response_contract COMMAND wire_list_response_contract)
     add_executable(wire_status_request_contract tests/wire-status-request.cpp)
     target_link_libraries(wire_status_request_contract PRIVATE dtv::userland)
     add_test(NAME wire_status_request_contract COMMAND wire_status_request_contract)

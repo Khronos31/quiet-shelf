@@ -123,6 +123,16 @@ typedef struct dtv_usb_interface_info {
     uint32_t endpoint_count;
 } dtv_usb_interface_info;
 
+/* USB の文字列記述子を Core が復号した結果の状態。raw は UTF-8 で可逆に保つ。 */
+typedef enum dtv_usb_serial_state {
+    DTV_USB_SERIAL_ABSENT = 0,    /* iSerialNumber が 0 */
+    DTV_USB_SERIAL_PRESENT = 1,   /* UTF-16LE を復号できた。serial_utf8 が有効 */
+    DTV_USB_SERIAL_UNREADABLE = 2, /* open・権限・BUSY・timeout などで読めなかった */
+    DTV_USB_SERIAL_MALFORMED = 3  /* 記述子の長さ・種別・代理対が不正 */
+} dtv_usb_serial_state;
+
+#define DTV_SPI_SERIAL_MAX_BYTES 512u
+
 typedef struct dtv_usb_candidate_info {
     uint64_t candidate_id;
     uint16_t vendor_id;
@@ -134,6 +144,11 @@ typedef struct dtv_usb_candidate_info {
     uint32_t port_path_length;
     const dtv_usb_interface_info *interfaces;
     uint32_t interface_count;
+    /* 借用値。serial_utf8 は std::string の復号結果で、NUL・制御文字も含みうる。
+     * PRESENT のときだけ serial_utf8 が有効で、長さは 0..378 byte。 */
+    uint32_t serial_state;
+    const uint8_t *serial_utf8;
+    uint32_t serial_utf8_bytes;
 } dtv_usb_candidate_info;
 
 typedef struct dtv_usb_function_selection {
@@ -159,6 +174,32 @@ typedef struct dtv_usb_identity {
 typedef dtv_internal_result (*dtv_select_usb_group_fn)(
     const dtv_usb_candidate_info *, uint32_t, uint32_t,
     dtv_usb_function_selection *, uint32_t, uint32_t *, dtv_usb_group_match *);
+
+/* 機種が筐体の serial を導出するときの入力。すべて同じ走査の借用値で、callback の間だけ有効。 */
+typedef struct dtv_serial_derive_input {
+    const dtv_usb_candidate_info *candidates;
+    uint32_t candidate_count;
+    uint32_t anchor_candidate_index;
+    const dtv_usb_function_selection *functions;
+    uint32_t function_count;
+} dtv_serial_derive_input;
+
+typedef enum dtv_serial_derive_outcome {
+    DTV_SERIAL_DERIVE_UNKNOWN = 0,
+    DTV_SERIAL_DERIVE_VALUE = 1
+} dtv_serial_derive_outcome;
+
+typedef struct dtv_serial_derive_output {
+    uint32_t struct_size;
+    uint32_t outcome; /* dtv_serial_derive_outcome */
+    uint32_t length;  /* VALUE のとき必要/書き込んだ UTF-8 byte 数。UNKNOWN のとき 0 */
+} dtv_serial_derive_output;
+
+/* 値の問い合わせは buffer=NULL・capacity=0 で行い、VALUE なら length に必要量を返す。
+ * 2回目は Core 所有の 513 byte buffer を渡す。長さは 1..512、strict UTF-8、NUL/制御文字なし。 */
+typedef dtv_internal_result (*dtv_derive_enclosure_serial_fn)(
+    const dtv_serial_derive_input *, dtv_serial_derive_output *,
+    char *, uint32_t);
 
 enum dtv_internal_result_code {
     DTV_INTERNAL_RESULT_OK = 0, /* 操作成功。 */

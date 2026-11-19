@@ -96,7 +96,7 @@
 | 8 | `enclosures` | オブジェクト配列 | `dtv_list_enclosures()` | 全 capacity 枠走査。NULL 枠スキップ。0 件は `[]` |
 | 9 | `enclosures[].id` | 数値 (`uint32`) | `dtv_get_enclosure_id()` | 筐体識別子 |
 | 10 | `enclosures[].model` | 文字列 / `null` | `dtv_get_model()` | 公開モデル名。内部 ID は出力しない |
-| 11 | `enclosures[].serial` | 文字列 / `null` | `dtv_get_enclosure_serial()` | 現候補は NULL（serial backend は別作業・未実装） |
+| 11 | `enclosures[].serial` | 文字列 / `null` | `dtv_get_enclosure_serial()` | 筐体シリアル番号（未観測時は `null`） |
 | 12 | `enclosures[].serial_unique` | 真偽値 / `null` | `dtv_get_serial_unique()` | tri-state（YES: `true`, NO: `false`, UNKNOWN: `null`） |
 | 13 | `enclosures[].status` | 文字列 | `dtv_get_status()` | 語彙: `ready`, `duplicate`, `invalid_observation`, `unknown` |
 | 14 | `enclosures[].lnb_15v_supported` | 真偽値 / `null` | `dtv_get_enclosure_support(DTV_OP_LNB_POWER)` | tri-state。静的能力（動的給電状態とは別） |
@@ -106,7 +106,7 @@
 | 18 | `enclosures[].candidates` | オブジェクト配列 | `dtv_get_candidates()` | 重複代替観測。平坦 5 鍵（L3 決定 64）。0 件は `[]` |
 | 19 | `devices[].id` | 数値 (`uint32`) | `dtv_get_device_id()` | 親 USB ファンクション ID |
 | 20 | `devices[].usb` | 文字列 | `dtv_get_vid()`, `dtv_get_pid()` | 小文字 4 桁:4 桁 `VID:PID`（例: `"0511:084a"`） |
-| 21 | `devices[].serial` | 文字列 / `null` | `dtv_get_device_serial()` | 現候補は NULL（serial backend は別作業・未実装） |
+| 21 | `devices[].serial` | 文字列 / `null` | `dtv_get_device_serial()` | デバイスシリアル番号（未観測時は `null`） |
 | 22 | `devices[].bus` | 数値 / `null` | `dtv_get_bus()` | 非 NULL 時数値、未観測時 `null`（数値 0 置換禁止） |
 | 23 | `devices[].address` | 数値 / `null` | `dtv_get_address()` | 非 NULL 時数値、未観測時 `null`（数値 0 置換禁止） |
 | 24 | `devices[].port` | 文字列 / `null` | `dtv_get_port()` | 物理トポロジ文字列（例: `"1-2.3"`） |
@@ -122,7 +122,7 @@
 | 34 | `candidates[].address` | 数値 / `null` | `candidate->address` | 候補デバイスアドレス（平坦鍵、L3 決定 64） |
 | 35 | `candidates[].port` | 文字列 / `null` | `candidate->port` | 候補物理ポート（平坦鍵、L3 決定 64） |
 | 36 | `ungrouped_usb_devices` | オブジェクト配列 | `dtv_list_ungrouped_devices()` | 筐体を成さなかった孤立デバイス。0 件は `[]` |
-| 37 | `ungrouped_usb_devices[].serial` | 文字列 / `null` | `ungrouped->serial` | 現候補は NULL（serial backend は別作業・未実装） |
+| 37 | `ungrouped_usb_devices[].serial` | 文字列 / `null` | `ungrouped->serial` | 孤立デバイスのシリアル番号（未観測時は `null`） |
 | 38 | `ungrouped_usb_devices[].model` | 文字列 / `null` | `ungrouped->model` | モデル名（未確定時 `null`） |
 | 39 | `ungrouped_usb_devices[].usb` | 文字列 | `ungrouped->vid`, `pid` | 小文字 4 桁:4 桁 `VID:PID` |
 | 40 | `ungrouped_usb_devices[].status` | 文字列 | `ungrouped->status` | 語彙: `usable`, `unsupported`, `invalid_serial` 等 |
@@ -131,6 +131,15 @@
 | 43 | `ungrouped_usb_devices[].port` | 文字列 / `null` | `ungrouped->port` | 孤立物理ポート（平坦鍵、L3 決定 64） |
 
 ※ 上記の 43 行は、共通親オブジェクトおよび位置情報の詳細展開を含む。L3 getter から直接射影・収集される論理入力単位としては全 29 項目で構成される。
+
+### シリアル番号の一意性契約（`serial_unique`）（L3 決定 66）
+
+`serial_unique` は、同一走査内で観測された完全な筐体間におけるシリアル番号の一意性指標である（正本 L3 §4.4 / 決定 66）:
+- `true` (`DTV_YES`): 自筐体のシリアル番号（1..512 バイトの strict UTF-8、NUL・制御文字なし）が確定しており、走査が完了しており、かつ同一走査内の他の完全な筐体（容量超過で省かれた筐体を含む）とシリアルの重複がないことを意味する。**他の筐体のシリアルが NULL または UNKNOWN であっても、自筐体の一意性（`true`）を妨げない**（シリアル不明な筐体はシリアル指定による特定対象外のため。旧仕様の「他が未知なら YES 保留」は撤回・旧版仕様へ合致）。
+- `false` (`DTV_NO`): 同一走査内の別の完全な筐体と同一のシリアル番号を持つことが確認された場合。走査が未完了であっても、重複が検出された段階で直ちに `false` となる。
+- `null` (`DTV_UNKNOWN`): 自筐体のシリアル番号自体が NULL であるか、あるいは走査が未完了・失敗で終了した場合（既知の重複がある場合を除く）。
+
+孤立 USB デバイス（`ungrouped_usb_devices`）は一意性比較の対象外である。なお、CLI や常駐デーモンによるシリアル番号指定選択機能は現時点では未接続・未実装であり、Core 合成テストの成功をもってシリアル機能の完成や SPI 安定とは呼ばない。
 
 ### 位置情報と平坦化規則（L3 決定 64）
 
@@ -170,9 +179,10 @@
 
 ## 接点および未接続・未実装境界
 
-- **Serial Backend:**
-  - 筐体・デバイス・孤立デバイスのシリアル番号（`serial`）は現行実装ではすべて NULL、`serial_unique` は UNKNOWN（`null`）のまま L3 getter から写像される。
-  - 本 PR は全 29 欄のスキーマ定義および CLI 接続の完了であり、serial backend 自体の完成ではない（別作業として後続実装される）。架空の空文字列や `false` を捏造しない。
+- **Serial Backend および実機境界（L3 決定 66）:**
+  - Core において USB STRING 記述子の共通観測・lossless UTF-8 復号、機種導出 SPI（`dtv_derive_enclosure_serial_fn`）、および公開 getter（`dtv_get_enclosure_serial`, `dtv_get_serial_unique`, `dtv_get_device_serial`）の実装と合成契約テストは完了している。
+  - 一方で、実機 PX-Q3U4 における 2 function raw 観測、14 桁 base 導出、製品（px4-userland）側コールバック宣言、および CLI / daemon でのシリアル指定機器選択動作は未確認・未接続である。Core 単体合成成功をもって「シリアル機能完成」や「SPI 安定」とは呼ばない。
+  - JSON 出力例における `serial: null` や `serial_unique: null` は、シリアル未観測・未宣言環境における合法な出力例として維持される。
 - **容量超過と scan.issues（L3 決定 65）:**
   - 一覧の最大容量（既定 128 筐体）を超過して筐体が除外された場合、Core 内部の警告ログ出力および `scan.complete = true` の維持にとどまり、`scan.issues` には載せない（常に `[]`）。
   - 未決の `scan.issues` コード（`capacity_omitted` 等）や公開 getter（`dtv_get_scan_omitted_count` 等）は採用しない。
