@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: quiet-shelf torne product build
+
+on:
+  push:
+    paths:
+      - 'dtv11-torne/**'
+      - '.github/workflows/torne-ci.yml'
+  pull_request:
+    paths:
+      - 'dtv11-torne/**'
+      - '.github/workflows/torne-ci.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libusb (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
+      - name: Install libusb (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vcpkg install libusb:x64-windows
+      - name: Configure product (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S dtv11-torne -B build-product -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Configure product (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CL: /utf-8
+        run: >-
+          cmake -S dtv11-torne -B build-product -DBUILD_TESTING=OFF
+          "-DLIBUSB_INCLUDE_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\include\libusb-1.0"
+          "-DLIBUSB_LIBRARY=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib\libusb-1.0.lib"
+      - name: Build product library and CLI (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --build build-product --parallel 2 --target torne tornectl
+      - name: Build product library and CLI (Windows)
+        if: runner.os == 'Windows'
+        env:
+          CL: /utf-8
+        run: cmake --build build-product --config Release --parallel 2 --target torne tornectl
+      - name: Check metadata CLI (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./build-product/tornectl --help
+          ./build-product/tornectl --version
+          ./build-product/tornectl --models
+      - name: Check metadata CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ".\build-product\Release\tornectl.exe" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".\build-product\Release\tornectl.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".\build-product\Release\tornectl.exe" --models

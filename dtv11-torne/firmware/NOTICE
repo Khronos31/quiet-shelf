@@ -1,0 +1,5 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+coax - https://github.com/Till0196/coax
+Copyright 2026 Till0196
+The protocol of the CECH-ZD1 J (the MB86H47A USB bridge, its codec cores, the I2C master, the stream path, the card slot UART) was worked out by coax. The FR30 assembly refers to the protocol and hardware values documented by coax's internal/coaxd/usb/bridge/mb86h47 package, available under Apache-2.0 OR GPL-2.0-or-later; this project selects GPL-2.0-or-later.
