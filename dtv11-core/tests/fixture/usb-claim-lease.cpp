@@ -64,6 +64,11 @@ void set_scan_card_t1_receive_capacity(bool, std::size_t, std::uint64_t, std::ui
 void set_scan_card_interleave_phase(unsigned);
 unsigned scan_card_interleave_phase_value();
 void set_scan_stream_192_source();
+unsigned scan_stream_transform_call_count();
+void set_scan_stream_transform_mode(unsigned);
+void set_scan_stream_transform_test_active(bool);
+void set_scan_stream_transform_test_receiver(unsigned);
+void set_scan_stream_transform_source_phase(unsigned);
 void set_scan_stream_failure_modes(unsigned, unsigned, unsigned, unsigned);
 void set_scan_stream_generation_override(std::uint64_t);
 std::uint64_t scan_stream_previous_generation();
@@ -178,8 +183,6 @@ public:
     }
     void free_transfer(libusb_transfer *transfer) override
     {
-        if (transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL)
-            control_free_count.fetch_add(1, std::memory_order_acq_rel);
         std::free(transfer);
         ++free_count;
     }
@@ -192,9 +195,6 @@ public:
         if ((transfer->endpoint & LIBUSB_ENDPOINT_IN) == 0 && transfer->length > 0) {
             outputs.emplace_back(transfer->buffer, transfer->buffer + transfer->length);
         }
-        if (transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL && !defer_next_control_completion)
-            ++ready_counts[0];
-        if (transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL) defer_next_control_completion = false;
         ++endpoint_submit_counts[transfer->endpoint];
         submitted.push_back(transfer);
         async_condition.notify_all();
@@ -203,7 +203,6 @@ public:
     int cancel_transfer(libusb_transfer *transfer) override
     {
         std::lock_guard lock(async_mutex);
-        if (transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL) ++control_cancel_count;
         for (auto *candidate : submitted) {
             if (candidate == transfer || candidate->endpoint == transfer->endpoint) {
                 cancelled.insert(candidate);
@@ -220,9 +219,7 @@ public:
         const auto duration = std::chrono::microseconds(timeout->tv_sec * 1000000 + timeout->tv_usec);
         async_condition.wait_for(lock, duration, [&] {
             for (auto *transfer : submitted) {
-                if ((cancelled.contains(transfer) && !defer_cancel_completion &&
-                     (transfer->type != LIBUSB_TRANSFER_TYPE_CONTROL ||
-                      !defer_control_cancel_completion)) || complete_all ||
+                if ((cancelled.contains(transfer) && !defer_cancel_completion) || complete_all ||
                     ready_counts[transfer->endpoint] != 0) return true;
             }
             return false;
@@ -240,9 +237,7 @@ public:
             }
         }
         if (found == submitted.end()) found = std::find_if(submitted.begin(), submitted.end(), [&](auto *transfer) {
-            return (cancelled.contains(transfer) && !defer_cancel_completion &&
-                    (transfer->type != LIBUSB_TRANSFER_TYPE_CONTROL ||
-                     !defer_control_cancel_completion)) || complete_all ||
+            return (cancelled.contains(transfer) && !defer_cancel_completion) || complete_all ||
                    ready_counts[transfer->endpoint] != 0;
         });
         if (found == submitted.end()) return LIBUSB_SUCCESS;
@@ -252,20 +247,11 @@ public:
         if (!complete_all && ready_counts[transfer->endpoint] != 0) --ready_counts[transfer->endpoint];
         lock.unlock();
         transfer->status = was_cancelled ? LIBUSB_TRANSFER_CANCELLED : LIBUSB_TRANSFER_COMPLETED;
-        const bool control = transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL;
-        const auto requested_length = control
-            ? (transfer->length > static_cast<int>(LIBUSB_CONTROL_SETUP_SIZE)
-                ? static_cast<std::size_t>(transfer->length - LIBUSB_CONTROL_SETUP_SIZE) : 0)
-            : static_cast<std::size_t>((std::max)(transfer->length, 0));
         transfer->actual_length = was_cancelled ? 0
-            : static_cast<int>((std::min)(requested_length, actual_length_limit));
-        const bool input = control
-            ? (libusb_control_transfer_get_setup(transfer)->bmRequestType & LIBUSB_ENDPOINT_IN) != 0
-            : (transfer->endpoint & LIBUSB_ENDPOINT_IN) != 0;
-        if (input) {
-            auto *target = control ? libusb_control_transfer_get_data(transfer) : transfer->buffer;
+            : static_cast<int>((std::min)(static_cast<std::size_t>(transfer->length), actual_length_limit));
+        if (transfer->endpoint & LIBUSB_ENDPOINT_IN) {
             for (int index = 0; index < transfer->actual_length; ++index) {
-                target[index] = static_cast<unsigned char>(transfer->endpoint + index);
+                transfer->buffer[index] = static_cast<unsigned char>(transfer->endpoint + index);
             }
         }
         transfer->callback(transfer);
@@ -286,31 +272,6 @@ public:
     {
         std::lock_guard lock(async_mutex);
         ready_counts[endpoint] += count;
-        async_condition.notify_all();
-    }
-    void defer_next_control()
-    {
-        std::lock_guard lock(async_mutex);
-        defer_next_control_completion = true;
-    }
-    void defer_control_cancel(bool defer)
-    {
-        std::lock_guard lock(async_mutex);
-        defer_control_cancel_completion = defer;
-        async_condition.notify_all();
-    }
-    bool wait_for_control_cancel()
-    {
-        std::unique_lock lock(async_mutex);
-        return async_condition.wait_for(lock, std::chrono::seconds(2), [&] {
-            return control_cancel_count != 0;
-        });
-    }
-    void release_control_cancel()
-    {
-        std::lock_guard lock(async_mutex);
-        defer_control_cancel_completion = false;
-        ++ready_counts[0];
         async_condition.notify_all();
     }
     void set_defer_cancel_completion(bool defer)
@@ -523,11 +484,7 @@ public:
     std::size_t actual_length_limit = (std::numeric_limits<std::size_t>::max)();
     unsigned free_count = 0;
     unsigned cancel_count = 0;
-    unsigned control_cancel_count = 0;
     unsigned callback_count = 0;
-    std::atomic<unsigned> control_free_count{0};
-    bool defer_next_control_completion = false;
-    bool defer_control_cancel_completion = false;
     std::mutex async_mutex;
     std::condition_variable async_condition;
     std::vector<libusb_transfer *> submitted;
@@ -537,8 +494,6 @@ public:
     std::map<std::uint8_t, unsigned> endpoint_submit_counts;
     std::set<std::thread::id> worker_ids;
 };
-
-FakeBackend *active_public_backend = nullptr;
 
 dtv::internal::UsbInterfaceSnapshot interface(std::uint8_t number, std::uint8_t alternate)
 {
@@ -842,17 +797,10 @@ int enclosure_runtime_pending_stop()
     auto runtime = dtv::internal::EnclosureRuntime::start(std::move(claims), &result);
     if (!runtime || result.code != DTV_INTERNAL_RESULT_OK) return 2;
     std::uint64_t request_id = 0;
-    unsigned char control_output[]{4, 5, 6};
-    auto owner = std::make_shared<unsigned>(1);
-    std::weak_ptr<unsigned> weak_owner = owner;
-    backend->defer_next_control();
-    const auto control_submit = runtime->submit_control(0, 0x40, 0x01, 0, 0, 3,
-            std::span<const unsigned char>(control_output, sizeof(control_output)), false, 1,
-            nullptr, nullptr, UINT64_MAX, nullptr, nullptr, owner, &request_id);
-    if (control_submit.code != DTV_INTERNAL_RESULT_OK) return 31;
-    if (!backend->wait_for_submissions(1)) return 32;
-    if (runtime->cancel(request_id).code != DTV_INTERNAL_RESULT_OK) return 33;
-    owner.reset();
+    if (runtime->submit_bulk_in(0, 0x81, 16, 1, nullptr, nullptr, UINT64_MAX,
+                                &request_id).code != DTV_INTERNAL_RESULT_OK ||
+        !backend->wait_for_submissions(1) ||
+        runtime->cancel(request_id).code != DTV_INTERNAL_RESULT_OK) return 3;
     dtv::internal::UsbRuntimeTerminal terminal{};
     if (runtime->wait_request(request_id, nullptr, UINT64_MAX, &terminal).code !=
         DTV_INTERNAL_RESULT_TIMEOUT || terminal != dtv::internal::UsbRuntimeTerminal::cancelled) return 4;
@@ -872,8 +820,7 @@ int enclosure_runtime_pending_stop()
     const auto stopped = runtime->stop(nullptr, UINT64_MAX);
     if (stopped.pending || stopped.result.code != DTV_INTERNAL_RESULT_OK ||
         backend->free_count != 1 || backend->close_count != 1 ||
-        weak_owner.expired() || registry.live_slots()[0] != root ||
-        registry.status(root) != DTV_ENCLOSURE_READY) return 6;
+        registry.live_slots()[0] != root || registry.status(root) != DTV_ENCLOSURE_READY) return 6;
 #if defined(__linux__)
     if (fcntl(descriptors[0], F_GETFD) < 0) return 6;
     close(descriptors[0]);
@@ -884,9 +831,7 @@ int enclosure_runtime_pending_stop()
     if (runtime->next_completion(&completion, &available).code != DTV_INTERNAL_RESULT_OK ||
         !available || completion.request_id != request_id ||
         completion.terminal != dtv::internal::UsbRuntimeTerminal::cancelled ||
-        completion.bytes.size() != 0 ||
         runtime->next_completion(&completion, &available).code != DTV_INTERNAL_RESULT_OK || available) return 7;
-    if (!weak_owner.expired()) return 7;
     dtv_event event{};
     if (registry.next_event(&event, &available).code != DTV_INTERNAL_RESULT_OK || !available ||
         event.kind != DTV_EVENT_USB_CONNECTED || event.enclosure != root ||
@@ -1002,7 +947,7 @@ int public_open_lifecycle()
             DTV_ERROR_BUFFER_TOO_SMALL || output_size != 0) return 42;
     if (dtv_read_stream(stream, packets.data(), packets.size(), nullptr, &output_size, &error) !=
             DTV_ERROR_OK || output_size != packets.size() || packets[0] != 0x47 ||
-        packets[188] != 0x47) return 44;
+        packets[188] != 0x47 || scan_stream_transform_call_count() == 0) return 44;
     if (dtv_read_stream(stream, packets.data(), packets.size(), nullptr, &output_size, &error) !=
             DTV_ERROR_OK || output_size != 0) return 45;
     if (dtv_open_stream(receivers[0], nullptr, &next_stream, &error) != DTV_ERROR_BUSY ||
@@ -1070,7 +1015,7 @@ int public_open_192_stream()
     if (dtv_open_stream(receivers[1], nullptr, &stream, &error) != DTV_ERROR_OK || stream == nullptr)
         return 6;
 
-    constexpr std::size_t source_size = 3 + 5 * 192;
+    constexpr std::size_t source_size = 3 + 7 * 192;
     constexpr std::size_t first_source_size = 3 + 2 * 192;
     constexpr std::size_t chunk_size = 17;
     constexpr std::size_t first_completion_count =
@@ -1087,27 +1032,20 @@ int public_open_192_stream()
         return 7;
     }
 
-    std::array<unsigned char, 2 * 188> output{};
-    std::array<unsigned char, 2 * 188> expected{};
-    std::size_t expected_offset = 0;
-    for (std::size_t unit : {0u, 1u}) {
-        expected[expected_offset] = 0x47;
-        std::fill(expected.begin() + expected_offset + 1,
-                  expected.begin() + expected_offset + 188,
-                  static_cast<unsigned char>(0x20 + unit));
-        expected_offset += 188;
-    }
+    std::array<unsigned char, 4 * 188> output{};
+    std::array<unsigned char, 4 * 188> expected{};
     std::uint64_t output_size = 0;
     const dtv_call_options read_wait{sizeof(dtv_call_options), 2000};
-    if (dtv_read_stream(stream, output.data(), output.size(), &read_wait, &output_size, &error) !=
-            DTV_ERROR_OK || output_size != output.size() || output != expected ||
+    const dtv_call_options gate_wait{sizeof(dtv_call_options), 10};
+    if (dtv_read_stream(stream, output.data(), output.size(), &gate_wait, &output_size, &error) !=
+            DTV_ERROR_TIMEOUT || output_size != 0 ||
         dtv_get_dropped_bytes(stream) != 3 || dtv_get_desyncs(stream) != 0) return 8;
 
     callbacks = backend->callback_count_snapshot();
     backend->complete_endpoint(0x81, remaining_completion_count);
     if (!backend->wait_for_callbacks(callbacks + remaining_completion_count)) return 9;
-    expected_offset = 0;
-    for (std::size_t unit : {3u, 4u}) {
+    std::size_t expected_offset = 0;
+    for (std::size_t unit : {3u, 4u, 5u, 6u}) {
         expected[expected_offset] = 0x47;
         std::fill(expected.begin() + expected_offset + 1,
                   expected.begin() + expected_offset + 188,
@@ -1116,7 +1054,7 @@ int public_open_192_stream()
     }
     if (dtv_read_stream(stream, output.data(), output.size(), &read_wait, &output_size, &error) !=
             DTV_ERROR_OK || output_size != output.size() || output != expected ||
-        dtv_get_dropped_bytes(stream) != 195 || dtv_get_desyncs(stream) != 1) return 10;
+        dtv_get_dropped_bytes(stream) != 579 || dtv_get_desyncs(stream) != 1) return 10;
     for (std::size_t offset = 0; offset < output_size; offset += 188) {
         if (output[offset] != 0x47) return 11;
     }
@@ -1124,6 +1062,115 @@ int public_open_192_stream()
             DTV_ERROR_OK || output_size != 0) return 12;
     if (dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 13;
     dtv_release_stream(stream);
+
+    set_scan_stream_transform_test_active(true);
+    set_scan_stream_transform_mode(0);
+    set_scan_stream_transform_source_phase(0);
+    auto complete_source = [&](unsigned phase) {
+        set_scan_stream_transform_source_phase(phase);
+        const auto before = backend->callback_count_snapshot();
+        backend->complete_endpoint(0x81);
+        return backend->wait_for_callbacks(before + 1);
+    };
+    auto read_markers = [&](dtv_stream *target,
+                            std::initializer_list<unsigned char> markers) {
+        std::array<unsigned char, 3 * 188> actual{};
+        const auto expected_size = markers.size() * 188;
+        std::uint64_t actual_size = 0;
+        if (dtv_read_stream(target, actual.data(), expected_size, &read_wait,
+                &actual_size, &error) != DTV_ERROR_OK || actual_size != expected_size)
+            return false;
+        std::size_t unit = 0;
+        for (const auto marker : markers) {
+            if (actual[unit * 188] != 0x47 || actual[unit * 188 + 1] != marker) return false;
+            ++unit;
+        }
+        return true;
+    };
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(0) ||
+        !read_markers(stream, {0x11, 0x12})) return 15;
+    const auto transform_calls = scan_stream_transform_call_count();
+    if (!complete_source(1) || !read_markers(stream, {0x21, 0xfa, 0xfa}) ||
+        scan_stream_transform_call_count() != transform_calls + 1 ||
+        dtv_get_dropped_bytes(stream) != 190 || dtv_get_desyncs(stream) != 1) return 16;
+    const auto phase2_completed = complete_source(2);
+    const auto phase2_read = phase2_completed && read_markers(stream, {0x31});
+    const auto phase2_dropped = dtv_get_dropped_bytes(stream);
+    const auto phase2_desyncs = dtv_get_desyncs(stream);
+    if (!phase2_completed || !phase2_read || phase2_dropped != 192 || phase2_desyncs != 2) {
+        std::fprintf(stderr, "runtime transform deferred skip: completed=%d read=%d dropped=%llu desyncs=%llu\n",
+            phase2_completed, phase2_read, static_cast<unsigned long long>(phase2_dropped),
+            static_cast<unsigned long long>(phase2_desyncs));
+        return 17;
+    }
+    if (!complete_source(3) || !read_markers(stream, {0xfa, 0xfa}) ||
+        dtv_get_dropped_bytes(stream) != 380 || dtv_get_desyncs(stream) != 2) return 18;
+    if (!complete_source(4) || !read_markers(stream, {0x51}) ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 19;
+    dtv_release_stream(stream);
+    set_scan_stream_transform_source_phase(5);
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(5) ||
+        !read_markers(stream, {0x61, 0x62}) ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 20;
+    dtv_release_stream(stream);
+
+    set_scan_stream_transform_mode(1);
+    set_scan_stream_transform_source_phase(0);
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(0)) return 21;
+    std::array<unsigned char, 188> shortened{};
+    if (dtv_read_stream(stream, shortened.data(), shortened.size(), &read_wait,
+            &output_size, &error) != DTV_ERROR_OK || output_size != shortened.size() ||
+        shortened[0] != 0x47 || shortened[1] != 0x11) return 22;
+    const dtv_call_options short_wait{sizeof(dtv_call_options), 10};
+    if (dtv_read_stream(stream, shortened.data(), shortened.size(), &short_wait,
+            &output_size, &error) != DTV_ERROR_TIMEOUT || output_size != 0 ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 23;
+    dtv_release_stream(stream);
+
+    set_scan_stream_transform_mode(2);
+    set_scan_stream_transform_source_phase(0);
+    const auto calls_before_zero = scan_stream_transform_call_count();
+    if (dtv_open_stream(receivers[0], nullptr, &stream, &error) != DTV_ERROR_OK ||
+        stream == nullptr || !backend->wait_for_submissions(2) || !complete_source(0)) return 24;
+    const auto zero_read = dtv_read_stream(stream, shortened.data(), shortened.size(), &short_wait,
+        &output_size, &error);
+    const auto calls_after_zero = scan_stream_transform_call_count();
+    const auto zero_close = dtv_close_stream(stream, nullptr, &error);
+    if (zero_read != DTV_ERROR_TIMEOUT || output_size != 0 ||
+        calls_after_zero != calls_before_zero + 1 || zero_close != DTV_CLOSE_CLOSED) {
+        std::fprintf(stderr, "runtime transform zero output: read=%d size=%llu calls=%u/%u close=%d\n",
+            zero_read, static_cast<unsigned long long>(output_size), calls_before_zero,
+            calls_after_zero, zero_close);
+        return 25;
+    }
+    dtv_release_stream(stream);
+    set_scan_stream_transform_mode(0);
+    set_scan_stream_transform_test_receiver(2);
+    set_scan_stream_transform_source_phase(6);
+    const auto third_open = dtv_open_stream(receivers[2], nullptr, &stream, &error);
+    if (third_open != DTV_ERROR_OK || stream == nullptr) {
+        std::fprintf(stderr, "three-unit stream open: result=%d error=%d stream=%p receivers=%p/%p/%p\n",
+            third_open, error.code, static_cast<void *>(stream), static_cast<void *>(receivers[0]),
+            static_cast<void *>(receivers[1]), static_cast<void *>(receivers[2]));
+        return 26;
+    }
+    if (!backend->wait_for_submissions(2)) return 29;
+    if (!complete_source(6)) return 30;
+    std::array<unsigned char, 3 * 188> gated_output{};
+    if (dtv_read_stream(stream, gated_output.data(), 2 * 188, &gate_wait,
+            &output_size, &error) != DTV_ERROR_TIMEOUT || output_size != 0 ||
+        dtv_get_dropped_bytes(stream) != 0 || dtv_get_desyncs(stream) != 0) return 27;
+    if (!complete_source(7)) return 30;
+    if (!read_markers(stream, {0x71, 0x72, 0x73})) return 31;
+    if (dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 32;
+    dtv_release_stream(stream);
+    set_scan_stream_transform_test_receiver(0);
+    set_scan_stream_transform_test_active(false);
+    set_scan_stream_transform_mode(0);
+
     if (dtv_close_enclosure(root, nullptr, &error) != DTV_CLOSE_CLOSED) return 14;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
@@ -2161,8 +2208,6 @@ int public_open_card_events()
 {
     auto backend = std::make_shared<FakeBackend>();
     backend->async_enabled = true;
-    backend->defer_control_cancel(true);
-    active_public_backend = backend.get();
     auto context = dtv::internal::UsbContext::scan_only(backend);
     set_scan_group_case(0);
     set_scan_public_open_case(12);
@@ -2176,46 +2221,33 @@ int public_open_card_events()
         if (backend->wait_for_endpoint_submissions(0x81, 1)) backend->complete_endpoint(0x81);
         if (backend->wait_for_endpoint_submissions(0x82, 1)) backend->complete_endpoint(0x82);
     });
-    std::thread tune_io_completer([&] {
-        if (backend->wait_for_endpoint_submissions(0x01, 1)) backend->complete_endpoint(0x01);
-    });
-    std::thread control_releaser([&] {
-        const bool cancelled = backend->wait_for_control_cancel();
-        if (cancelled) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            backend->release_control_cancel();
-        }
-    });
     const auto consumer_result = card_events_public_consumer(drive_card_event, &backend);
     open_completer.join();
-    tune_io_completer.join();
-    control_releaser.join();
-    active_public_backend = nullptr;
     dtv::internal::set_public_discovery_journal_hook_for_test({});
     dtv::internal::set_public_discovery_batch_for_test({});
-    const auto tune_verified = scan_tune_call_count() == 16 && scan_tune_effect_count() == 15 &&
+    const auto tune_verified = scan_tune_call_count() == 15 && scan_tune_effect_count() == 14 &&
         scan_tune_peer_was_checked() && scan_tune_card_was_checked() &&
         scan_tune_record_matches(0, 0, DTV_SYSTEM_ISDB_T, UINT64_C(5931428571), true,
             DTV_TUNE_SELECTOR_TSID, 0x1234, DTV_LNA_ON) &&
         scan_tune_record_matches(1, 1, DTV_SYSTEM_ISDB_S, UINT64_C(11700000000), true,
             DTV_TUNE_SELECTOR_SLOT, 1, DTV_LNA_OFF) &&
-        scan_tune_record_matches(7, 0, DTV_SYSTEM_ISDB_T, UINT64_C(473142857), true,
+        scan_tune_record_matches(6, 0, DTV_SYSTEM_ISDB_T, UINT64_C(473142857), true,
             DTV_TUNE_SELECTOR_NONE, 0, DTV_LNA_ON) &&
-        scan_tune_record_matches(8, 0, DTV_SYSTEM_ISDB_T, UINT64_C(473142857), false,
+        scan_tune_record_matches(7, 0, DTV_SYSTEM_ISDB_T, UINT64_C(473142857), false,
             DTV_TUNE_SELECTOR_NONE, 0, DTV_LNA_DEFAULT) &&
-        scan_tune_record_matches(9, 0, DTV_SYSTEM_ISDB_T, UINT64_C(767142857), true,
+        scan_tune_record_matches(8, 0, DTV_SYSTEM_ISDB_T, UINT64_C(767142857), true,
             DTV_TUNE_SELECTOR_NONE, 0, DTV_LNA_OFF) &&
+        scan_tune_record_matches(9, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1049480000), true,
+            DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT) &&
         scan_tune_record_matches(10, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1049480000), true,
-            DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT) &&
-        scan_tune_record_matches(11, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1049480000), true,
             DTV_TUNE_SELECTOR_TSID, 0x1234, DTV_LNA_ON) &&
-        scan_tune_record_matches(12, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1471440000), true,
+        scan_tune_record_matches(11, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1471440000), true,
             DTV_TUNE_SELECTOR_TSID, 0x1234, DTV_LNA_ON) &&
-        scan_tune_record_matches(13, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1613000000), true,
+        scan_tune_record_matches(12, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1613000000), true,
             DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT) &&
-        scan_tune_record_matches(14, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1733000000), true,
+        scan_tune_record_matches(13, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1733000000), true,
             DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_OFF) &&
-        scan_tune_record_matches(15, 1, DTV_SYSTEM_ISDB_S, UINT64_C(2053000000), true,
+        scan_tune_record_matches(14, 1, DTV_SYSTEM_ISDB_S, UINT64_C(2053000000), true,
             DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT);
     set_scan_public_open_case(0);
     return consumer_result != 0 ? consumer_result : tune_verified ? 0 : 2;
@@ -6774,17 +6806,6 @@ int public_error_message_boundary()
 
 }
 
-extern "C" void dtv_public_test_defer_next_control()
-{
-    if (active_public_backend != nullptr) active_public_backend->defer_next_control();
-}
-
-extern "C" unsigned dtv_public_test_control_free_count()
-{
-    return active_public_backend == nullptr ? 0
-        : active_public_backend->control_free_count.load(std::memory_order_acquire);
-}
-
 int main(int argc, char **argv)
 {
     dtv_load_scanfixture();
@@ -6809,8 +6830,6 @@ int main(int argc, char **argv)
         return public_firmware_unknown_no_io();
     if (argc == 2 && std::strcmp(argv[1], "--card-events") == 0)
         return public_open_card_events();
-    if (argc == 2 && std::strcmp(argv[1], "--runtime-retire") == 0)
-        return enclosure_runtime_pending_stop();
     if (const int result = public_lnb_roundtrip(); result != 0) {
         std::fprintf(stderr, "public_lnb_roundtrip failed: %d\n", result);
         return 139 + result;

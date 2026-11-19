@@ -80,6 +80,7 @@ struct model_information {
         std::uint32_t known_operations;
         std::uint32_t supported_operations;
         std::uint32_t ts_scrambling = DTV_TS_UNKNOWN;
+        std::uint8_t source_sync_confirmation_units = 0;
     };
     struct device_receiver_information {
         std::uint32_t function;

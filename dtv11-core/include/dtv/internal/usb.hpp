@@ -149,8 +149,6 @@ struct UsbRuntimeStopResult {
 class EnclosureRuntime {
 public:
     struct State;
-    using DispatchAction = int (*)(void *);
-    using DispatchCallback = dtv_internal_result (*)(void *, DispatchAction, void *);
     static std::unique_ptr<EnclosureRuntime> start(
         UsbClaimLeaseGroup &&, dtv_internal_result *result);
     ~EnclosureRuntime();
@@ -166,20 +164,6 @@ public:
         std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
         std::uint64_t generation, const dtv_runtime_clock *, const dtv_cancel *,
         std::uint64_t deadline_ns, std::uint64_t *request_id);
-    dtv_internal_result submit_tune_bulk_out(
-        std::size_t handle_index, std::uint8_t endpoint, std::span<const unsigned char>,
-        std::uint64_t generation, const dtv_runtime_clock *, std::uint64_t deadline_ns,
-        DispatchCallback, void *, std::shared_ptr<void>, std::uint64_t *request_id);
-    dtv_internal_result submit_tune_bulk_in(
-        std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
-        std::uint64_t generation, const dtv_runtime_clock *, std::uint64_t deadline_ns,
-        DispatchCallback, void *, std::shared_ptr<void>, std::uint64_t *request_id);
-    dtv_internal_result submit_control(
-        std::size_t handle_index, std::uint8_t request_type, std::uint8_t request,
-        std::uint16_t value, std::uint16_t index, std::uint16_t length,
-        std::span<const unsigned char> output, bool input, std::uint64_t generation,
-        const dtv_runtime_clock *, const dtv_cancel *, std::uint64_t deadline_ns,
-        DispatchCallback, void *, std::shared_ptr<void>, std::uint64_t *request_id);
     dtv_internal_result submit_shared_bulk_in(
         std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
         std::uint64_t generation,

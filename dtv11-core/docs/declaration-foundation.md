@@ -1536,19 +1536,79 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
 
 
 
-## 公開tuneコールバックの借用I/O接続と安全性境界（PR87、内部基盤）
+## runtime TS transform の3欠口補完（PR86、内部基盤）
 
-PR87 では、公開選局（`dtv_tune_by_frequency` / `dtv_tune_by_channel`）の機種コールバックにおいて、同一筐体の Core claim / `EnclosureRuntime` に属する USB 借用 I/O 境界を接続している。
+PR86 では、Core の整列後 TS ストリーミングと機種 SPI `transform_stream` の接続において、実機・暗号ストリーム適用に向けた 3 つの欠落条件（188/0 登録到達、可変長・zero produced 契約、framer discard 境界伝達）を補完している。
 
-- **借用 I/O 境界と対象種別:**
-  - `PublicTunePlan::handle_index` で特定された claimed handle に対し、`PublicTuneSession::io`（`const dtv_usb_io *`）を通じて control および bulk 転送のみを提供する（control/bulk 以外の転送種別は非対応）。
-  - `PublicTuneSession::io` view はコールバック実行中のみ借用され、コールバック外で保持してはならない。
-- **バッファ所有権とフェンス順序:**
-  - control setup / data および bulk 要求バッファは Core ランタイムが所有・管理する（request-owned buffer / context）。
-  - 要求ディスパッチ直前にキャンセル状態、呼び出し deadline、接続エポック、および操作エポックをフェンス検査し、最初の効果（first-effect）順序を直列化してバックエンドへ投入する。
-- **物理 retire 待機とライフサイクル境界:**
-  - タイムアウトやキャンセルが発生した場合でも、物理的な完了コールバック処理・transfer 解放・完了抽出（retire）が完了するまで操作チケットを保持し、競合する次の tune 作用を待機させる。
-  - 筐体 close 処理においても同一の retire 待機バリアに含まれ、期限内に retire が完了しなければ `DTV_CLOSE_PENDING` を返す。
-- **検証状況と位置づけ:**
-  - 内部 fixture（`usb_claim_lease_contract` の `--runtime-retire` および `--card-events`）の成功を確認済み（first-green 実行時刻は未保存）。
-  - 長い修正後の全 target 再走、Windows、NDK、実機 USB は未実施であり、製品 open 初期化・信号・実機完成を主張しない。PR81（筐体 close 改善）は別未マージであり、統合時に final-close 経路の調整を要する。公開 L3 および正本仕様の変更はない。
+### 1. 3欠口の補完と契約仕様
+
+- **1. 188/0 登録 transform への到達:**
+  - `source_stride_bytes == 188 && source_sync_offset_bytes == 0` の標準ストライドであっても、登録済み機種が `PublicOpenOps::transform_stream` コールバックを宣言・保持している場合は runtime caller から確実に呼び出されるよう接続。
+  - **不変条件:** 未登録時の 188/0 透過（pass-through、ダイレクトコピー）、および 192/4 等の非 188/0 ストライドにおける `transform_stream` 登録必須条件（未登録なら `DTV_ERROR_NOT_READY`）は変更なく維持される。
+- **2. 出力容量範囲と 188 倍数契約（zero produced の許容）:**
+  - transform コールバックは渡された全入力（`framed.produced` バイト）を完全に消費する（全 input consume）。
+  - 出力 `produced` は `0 .. output.size()`（`source_units * 188`）の範囲内で、かつ 188 の整数倍（`produced % 188 == 0`）を出力する契約。容量超過、非 188 倍数、または入力未消費時は `DTV_INTERNAL_RESULT_INTERNAL`。
+  - **zero output の成功:** `produced == 0`（暗号 marker 待ちやヘッダ解析中など）は正常な成功であり、終端（EOF）やエラーとは扱われない。実際に `produced` された有効範囲のみが sync 検証（先頭 `0x47`）を経て公開キューへ配送される。
+- **3. Framer discard (skip) 境界の unit index 順伝達:**
+  - `TsFramer` における同期喪失やノイズによるパケット破棄（discard）境界を、整列済み unit index 順の配列として `PublicStreamRequest::source_sync_skips_before_units`（`std::span<const std::size_t>`）経由で transform コールバックへ通知。
+  - **同 feed 内の順序保持:** skip 前の unit → skip 発生 → skip 後の unit という時間的前後関係を index 列で正確に伝達。
+  - **次 feed への繰越し (carry):** feed 末尾（`unit_index == source_units`）で発生した保留 skip は次回 feed の先頭（unit 0 の前）へ持ち越して伝達。
+  - **世代分離 (generation isolation):** 保留 skip がある状態でストリームが閉じられ、新しい世代（generation）で再オープンされた場合、保留 skip は持ち越されず確実に破棄・分離される。
+
+### 2. 統計カウンタと暗号非混入契約
+
+- **公開 dropped_bytes / desyncs の帰属:**
+  - 公開される `dtv_get_dropped_bytes()` および `dtv_get_desyncs()` は、`TsFramer` のアライメント discard 統計のみを保持する。
+  - 暗号 marker や IV パケット等の未出力パケット、未配送パケットは混入しない。新しい公開統計や API は追加していない。
+
+### 3. 検証状況と未完成・未実施境界
+
+- **作者検証（単体 fixture / caller 検証）:**
+  - 既存内部 fixture（`tests/fixture/src/scan_model.cpp`, `tests/fixture/usb-claim-lease.cpp`, `tests/ts-framer.cpp`）を拡張して検証。
+  - 初期 checkpoint で fulltarget 成功（188/0 到達確認）。
+  - 全条件追加後の初回 CTest では別々の 2 回の同期喪失（desyncs 期待値 1 -> 2）による return 17 を検出し、テスト期待値を訂正。
+  - 短い caller 確認で zero-output 時の呼出し回数（入力あたり 1 回呼出し）による return 25 を検出し、テスト期待値を訂正。
+  - 最終的に短い caller で return 0、`ts_framer_contract` で 1/1 PASS を確認済み。
+- **未完成・未実施境界:**
+  - DT181（3同期）や ASICEN（4同期）の追加接合、機種固有の crypto / TS 算法、および標準 TS ヘッダの scrambling control パケット計数 API・統計は本 PR では追加しておらず、未完成である。
+  - 長い修正後の全 target 再走、全 CTest suite、Windows / NDK、GitHub Actions、実機 / USB、および製品実体 QA は作者環境では未実施である。
+  - 本 PR86 は未マージのまま親/ユーザー判断へ提出する。
+
+
+
+## 機種宣言からのTS同期確認数接合（PR88、内部基盤）
+
+PR88 では、機種ごとのTS同期確認要件をCore共通の有界フレーマ（`TsFramer`）へ届けるため、受信部宣言から公開ストリームフレーマへの内部接合を追加している。
+
+### 1. 宣言仕様と正規化規則
+
+- **`receiver_information` 内部拡張:**
+  - `model_information::receiver_information` 末尾に内部フィールド `source_sync_confirmation_units`（`std::uint8_t`、既定値 0）を追加。
+  - 受信部宣言時の指定イニシャライザ省略（既定 0）および明示的な 0 指定は、従来互換の実効値 2 へ正規化して解決される。
+  - 受理される有効値は 0（実効 2）、2、3、4 のみであり、それ以外の不正値は `DTV_ERROR_INVALID_ARGUMENT` として拒否される。
+  - 宣言の再検証（`update_receiver_declarations`）においても、0 と 2 は同一実効値として扱われ、不要な不一致判定を起こさない。
+- **Core 内部伝達経路:**
+  - 初期 registry 作成、ファームウェアロード後の runtime receiver 確定、および receiver declaration update の各経路で `source_sync_confirmation_units` を取り込み、`ReceiverSignalSnapshot` および `PublicStreamState` を経由して `dtv_open_stream` 構築時の `TsFramer` へ渡す。
+- **共通 `TsFramer` の gate 拡張:**
+  - `TsFramer` の有効な `ready_units` として従来の 2 および 4 に加え、新たに 3 を受理（`ready_units == 2 || ready_units == 3 || ready_units == 4`）。
+  - 既存の初回同期候補保持、同期喪失時の再 arm、ユニット順序、ストリーム世代分離、および PR86 で補完された ordered skip/transform/queue/drop-desync 経路は変更なく維持される。
+
+### 2. 機種宣言要件と製品分離
+
+- **合意済み機種要件:**
+  - **PIX-DT181:** spec（`Khronos31/dtv11-pix` commit `dfd1213ef33fe873dd97882962789bd676efb147`, `spec/pix-dt181-pu0.md` §6.2）において、188-byte 間隔の sync byte `0x47` を 3 個連続確認（564-byte 揃うまで gate 判定を保留）することを要求。
+  - **ASICEN W3U3 / W3U2:** spec（`Khronos31/dtv11-asicen` commit `c018ccdc9e9b2e9cee34541c8d3d876b50b59e64`, `spec/px-w3u3.md` §4.3 / `spec/px-w3u2.md` §4.3）において、188-byte packet の 4 連続 sync を要求し、同期喪失後は 1-byte 再探索を行うことを要求。
+- **製品側更新との明確な分離:**
+  - 各製品リポジトリ（dtv11-pix, dtv11-asicen 等）における実際の宣言更新、暗号・marker 処理、seed 寿命管理、raw 予算の調整は別工程の責務であり、本 PR 単独では全 TS 経路の製品完成を意味しない。Core は受信部ごとに指定された同期数を正しく共通フレーマへ引き渡す能力を提供する。
+- **公開 ABI / CLI / JSON の不変性:**
+  - 公開 L3 C API、CLI オプション、JSON 出力、公開統計、および製品別の独自 framer や queue は一切追加・変更していない。
+
+### 3. 検証状況と未実施境界
+
+- **作者検証（単体 fixture / caller 検証）:**
+  - 既存 internal fixture（`tests/fixture/src/scan_model.cpp`, `tests/fixture/usb-claim-lease.cpp`, `tests/ts-framer.cpp`）を拡張して検証。
+  - `ts_framer_contract` 単体テストにおいて 1/1 PASS を確認済み。
+  - GDB からの `public_open_192_stream` 直接呼出しにより return 0 を確認。3-unit receiver における 2 packet 到着時の非配送および 3 packet 到着時の先頭 unit からの順序配送、4-unit receiver における閾値前非配送と初回候補失敗後の 4 valid packet 再 arm 配送、既定 2 receiver の従来動作維持を確認済み。
+- **未実施境界:**
+  - 長い `usb_claim_lease_contract` 全体、全 CTest suite、Windows / NDK（※作者環境の WSL PATH による観測）、JPlag、公開 CI、実機 / USB / 製品実体 QA は作者環境では未実施である。
+  - 本 PR88 は未マージのまま親/ユーザー判断へ提出する。

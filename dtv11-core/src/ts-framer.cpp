@@ -22,14 +22,20 @@ TsFramer::TsFramer(std::uint16_t stride_bytes, std::uint8_t sync_offset_bytes,
              (stride_bytes == 192 && sync_offset_bytes == 4))
 {
     const auto required = static_cast<std::size_t>(stride_bytes_) * ready_units_;
-    valid_ = valid_ && (ready_units_ == 2 || ready_units_ == 4) &&
+    valid_ = valid_ && (ready_units_ == 2 || ready_units_ == 3 || ready_units_ == 4) &&
              max_pending_bytes_ >= required && required / ready_units_ == stride_bytes_;
     if (valid_) pending_.reserve(max_pending_bytes_);
 }
 
-void TsFramer::discard_one()
+void TsFramer::discard_one(std::size_t produced,
+                           std::vector<std::size_t> *skip_before_units)
 {
     if (head_ == pending_.size()) return;
+    if (skip_before_units != nullptr) {
+        const auto unit_index = produced / stride_bytes_;
+        if (skip_before_units->empty() || skip_before_units->back() != unit_index)
+            skip_before_units->push_back(unit_index);
+    }
     ++head_;
     increment(stats_.dropped_bytes);
 }
@@ -42,7 +48,8 @@ void TsFramer::lose_sync()
 }
 
 bool TsFramer::process(std::span<std::uint8_t> output, std::size_t &produced,
-                       bool &output_full)
+                       bool &output_full,
+                       std::vector<std::size_t> *skip_before_units)
 {
     bool changed = false;
     while (valid_) {
@@ -52,7 +59,7 @@ bool TsFramer::process(std::span<std::uint8_t> output, std::size_t &produced,
             if (pending_size <= second_sync) break;
             if (pending_[head_ + sync_offset_bytes_] != 0x47 ||
                 pending_[head_ + second_sync] != 0x47) {
-                discard_one();
+                discard_one(produced, skip_before_units);
                 changed = true;
                 continue;
             }
@@ -73,7 +80,7 @@ bool TsFramer::process(std::span<std::uint8_t> output, std::size_t &produced,
             }
             if (gate_failed) {
                 lose_sync();
-                discard_one();
+                discard_one(produced, skip_before_units);
                 changed = true;
                 continue;
             }
@@ -85,7 +92,7 @@ bool TsFramer::process(std::span<std::uint8_t> output, std::size_t &produced,
         if (pending_size < stride_bytes_) break;
         if (pending_[head_ + sync_offset_bytes_] != 0x47) {
             lose_sync();
-            discard_one();
+            discard_one(produced, skip_before_units);
             changed = true;
             continue;
         }
@@ -102,14 +109,16 @@ bool TsFramer::process(std::span<std::uint8_t> output, std::size_t &produced,
 }
 
 TsFramerResult TsFramer::feed(std::span<const std::uint8_t> input,
-                              std::span<std::uint8_t> output)
+                              std::span<std::uint8_t> output,
+                              std::vector<std::size_t> *skip_before_units)
 {
     if (!valid_) return {TsFramerCode::invalid_configuration, 0, 0};
+    if (skip_before_units != nullptr) skip_before_units->clear();
     std::size_t consumed = 0;
     std::size_t produced = 0;
     for (;;) {
         bool output_full = false;
-        process(output, produced, output_full);
+        process(output, produced, output_full, skip_before_units);
         if (output_full) return {TsFramerCode::output_full, consumed, produced};
         if (consumed == input.size()) return {TsFramerCode::ok, consumed, produced};
 

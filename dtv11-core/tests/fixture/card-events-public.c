@@ -1,13 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <dtv/dtv.h>
 #include <stddef.h>
-#include <stdio.h>
 
 int dtv_public_test_receiver_transition(dtv_enclosure *);
 void dtv_public_test_set_tune_context(dtv_enclosure *, dtv_receiver *, dtv_receiver *);
 void dtv_public_test_set_tune_mode(uint32_t);
-void dtv_public_test_defer_next_control(void);
-unsigned dtv_public_test_control_free_count(void);
 
 typedef int (*card_event_driver)(void *, uint32_t);
 
@@ -183,18 +180,12 @@ int card_events_public_consumer(card_event_driver driver, void *user)
         dtv_tune_options tune = {sizeof(dtv_tune_options), DTV_TUNE_SELECTOR_TSID,
                                  0x1234, DTV_LNA_ON};
         dtv_call_options call = {sizeof(dtv_call_options), 1000};
-        dtv_public_test_set_tune_mode(5);
-        const int32_t tune_result = dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T,
-            UINT64_C(5931428571), &tune, &call, &error);
-        if (tune_result != DTV_ERROR_OK || error.code != DTV_ERROR_OK) {
-            fprintf(stderr, "public tune control result=%d error=%u\n", tune_result, error.code);
-            return 23;
-        }
-        if (!expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
+        if (dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T, UINT64_C(5931428571),
+                &tune, &call, &error) != DTV_ERROR_OK || error.code != DTV_ERROR_OK ||
+            !expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
                            DTV_MEASUREMENT_REASON_TUNE_CHANGED, 0) ||
             !expect_signal(receivers[1], DTV_MEASUREMENT_VALID,
                            DTV_MEASUREMENT_REASON_NONE, 1) || !expect_timeout()) return 23;
-        dtv_public_test_set_tune_mode(0);
         if (!drive(driver, user, 19) || !expect_timeout() ||
             !expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
                            DTV_MEASUREMENT_REASON_TUNE_CHANGED, 0)) return 24;
@@ -246,21 +237,12 @@ int card_events_public_consumer(card_event_driver driver, void *user)
             !expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
                            DTV_MEASUREMENT_REASON_TUNE_CHANGED, 0)) return 30;
         dtv_public_test_set_tune_mode(4);
-        call.timeout_ms = 1000;
-        const unsigned control_frees_before_timeout = dtv_public_test_control_free_count();
-        dtv_public_test_defer_next_control();
-        const int32_t mode4_result = dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T,
-            UINT64_C(5931428571), &tune, &call, &error);
-        if (mode4_result != DTV_ERROR_TIMEOUT || error.code != DTV_ERROR_TIMEOUT) return 31;
-        if (dtv_public_test_control_free_count() != control_frees_before_timeout) return 40;
-        dtv_public_test_set_tune_mode(0);
-        call.timeout_ms = 1000;
-        const int32_t next_result = dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T,
-            UINT64_C(5931428571), &tune, &call, &error);
-        if (next_result != DTV_ERROR_OK || error.code != DTV_ERROR_OK ||
-            dtv_public_test_control_free_count() <= control_frees_before_timeout) return 41;
-        if (!expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
+        call.timeout_ms = 1;
+        if (dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T, UINT64_C(5931428571),
+                &tune, &call, &error) != DTV_ERROR_TIMEOUT || error.code != DTV_ERROR_TIMEOUT ||
+            !expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
                            DTV_MEASUREMENT_REASON_TUNE_CHANGED, 0)) return 31;
+        dtv_public_test_set_tune_mode(0);
         if (!drive(driver, user, 23) ||
             !wait_receiver_event(&event, root, receivers[0], DTV_EVENT_LOCK_ACQUIRED) ||
             !expect_signal(receivers[0], DTV_MEASUREMENT_VALID,
