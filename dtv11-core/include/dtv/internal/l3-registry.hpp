@@ -41,7 +41,6 @@ public:
         std::uint32_t receiver_index = 0;
         std::uint16_t source_stride_bytes = 0;
         std::uint8_t source_sync_offset_bytes = 0;
-        std::uint8_t source_sync_confirmation_units = 2;
         std::uint32_t receiver_systems = 0;
         std::uint32_t known_operations = 0;
         std::uint32_t supported_operations = 0;

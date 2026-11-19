@@ -106,6 +106,9 @@ std::size_t scan_open_identify_bytes = 0;
 std::atomic<unsigned> scan_open_identify_calls{0};
 std::atomic<bool> scan_open_identify_blocked{false};
 std::atomic<bool> scan_open_identify_release{true};
+std::atomic<unsigned> scan_open_initialize_calls{0};
+std::atomic<std::size_t> scan_open_initialize_io_count{0};
+std::atomic<unsigned> scan_open_stop_calls{0};
 dtv::spi::PublicOpenSession scan_shared_session{};
 std::array<std::uint64_t, 2> scan_shared_tokens{};
 std::array<std::uint64_t, 2> scan_shared_generations{};
@@ -137,12 +140,6 @@ std::atomic<unsigned> scan_stream_drain_mode{0};
 std::atomic<std::size_t> scan_stream_192_offset{0};
 std::atomic<bool> scan_stream_192_end_sent{false};
 std::atomic<unsigned> scan_stream_receiver{0};
-std::atomic<unsigned> scan_stream_transform_calls{0};
-std::atomic<unsigned> scan_stream_transform_mode{0};
-std::atomic<bool> scan_stream_transform_test_active{false};
-std::atomic<unsigned> scan_stream_transform_test_receiver{0};
-std::atomic<std::size_t> scan_stream_transform_source_size{0};
-std::array<unsigned char, 754> scan_stream_transform_source{};
 std::array<unsigned char, 963> scan_stream_192_source{};
 std::array<std::atomic<std::uint64_t>, 3> scan_tune_epochs{};
 std::atomic<std::uint64_t> scan_shared_lock_epoch_override{UINT64_MAX};
@@ -742,6 +739,34 @@ dtv_internal_result scan_open_plan(
                                        : dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
 }
 
+dtv_internal_result scan_open_initialize(dtv_context *,
+    std::span<const dtv::spi::PublicOpenIo> ios, dtv_timeout, const std::atomic<bool> *)
+{
+    scan_open_initialize_calls.fetch_add(1, std::memory_order_release);
+    scan_open_initialize_io_count.store(ios.size(), std::memory_order_release);
+    if (std::any_of(ios.begin(), ios.end(), [](const auto &entry) {
+            return entry.io == nullptr;
+        })) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    if (scan_public_open_case == 19 || scan_public_open_case == 20) {
+        if (ios.empty() || ios.front().io->bulk_out == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+        static const unsigned char init_byte = 0xa5;
+        const dtv_bytes output{&init_byte, 1};
+        const auto result = ios.front().io->bulk_out(ios.front().io->user, 0x02, output, {});
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        return scan_public_open_case == 19
+            ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0)
+            : dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result scan_open_stop(dtv_context *, dtv_timeout)
+{
+    scan_open_stop_calls.fetch_add(1, std::memory_order_release);
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
 dtv_internal_result scan_open_identify(dtv_context *, std::span<const unsigned char> bytes,
                                        dtv_timeout, const std::atomic<bool> *)
 {
@@ -1135,16 +1160,6 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
     const auto stream_generation = scan_stream_generation.load(std::memory_order_acquire);
-    if (scan_stream_transform_test_active.load(std::memory_order_acquire) &&
-        stream_generation != 0 && packet->endpoint == 0x81) {
-        message->kind = dtv::spi::PublicOpenMessageKind::source_chunk;
-        message->receiver_index = scan_stream_transform_test_receiver.load(std::memory_order_acquire);
-        message->stream_generation = stream_generation;
-        message->generation = packet->generation;
-        const auto size = scan_stream_transform_source_size.load(std::memory_order_acquire);
-        message->payload = std::span<const unsigned char>(scan_stream_transform_source).first(size);
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    }
     if (scan_public_open_case == 16 && packet->endpoint == 0x81) {
         bool pending = false;
         {
@@ -1680,7 +1695,41 @@ dtv_internal_result scan_tune_by_frequency(dtv_context *, const dtv::spi::Public
     const auto mode = scan_tune_mode.load(std::memory_order_acquire);
     if (mode == 1) return dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
     std::uint64_t operation_epoch = 0;
-    auto result = session->begin_effect(session->user, &operation_epoch);
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    if (mode == 5) {
+        if (session->io == nullptr || session->io->control == nullptr ||
+            session->io->bulk_out == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        unsigned char command[]{0x41, 0x42};
+        dtv_buffer buffer{command, sizeof(command), sizeof(command)};
+        result = session->io->control(session->io->user, 0x40, 0x01, 0, 0, &buffer,
+                                      request->timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        const unsigned char packet[]{0x51, 0x52};
+        result = session->io->bulk_out(session->io->user, 0x01,
+            dtv_bytes{packet, sizeof(packet)}, request->timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        result = session->begin_effect(session->user, &operation_epoch);
+    } else if (mode == 4) {
+        if (session->io == nullptr || session->io->control == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+        unsigned char command[]{0x43};
+        dtv_buffer buffer{command, sizeof(command), sizeof(command)};
+        const dtv_timeout io_timeout{25, 0};
+        result = session->io->control(session->io->user, 0x40, 0x02, 0, 0, &buffer,
+                                      io_timeout);
+        if (result.code != DTV_INTERNAL_RESULT_OK) {
+            auto effect_result = session->begin_effect(session->user, &operation_epoch);
+            if (effect_result.code == DTV_INTERNAL_RESULT_OK) {
+                scan_tune_epochs[receiver_index].store(operation_epoch, std::memory_order_release);
+                scan_tune_effects.fetch_add(1, std::memory_order_release);
+            }
+            return result;
+        }
+        result = session->begin_effect(session->user, &operation_epoch);
+    } else {
+        result = session->begin_effect(session->user, &operation_epoch);
+    }
     if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     scan_tune_epochs[receiver_index].store(operation_epoch, std::memory_order_release);
     scan_tune_effects.fetch_add(1, std::memory_order_release);
@@ -1705,7 +1754,7 @@ dtv_internal_result scan_plan_stream(dtv_context *, const dtv::spi::PublicStream
         ? 900 + request->receiver_index : 900;
     plan->supported = true;
     plan->ready = true;
-    plan->arguments_valid = request->receiver_index < 4;
+    plan->arguments_valid = request->receiver_index < 3;
     plan->resource_keys = resource_keys;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
@@ -1714,10 +1763,6 @@ dtv_internal_result scan_prepare_stream(dtv_context *, const dtv::spi::PublicStr
 {
     if (request == nullptr ||
         !((request->receiver_index == 0 && request->source_stride_bytes == 188 &&
-           request->source_sync_offset_bytes == 0) ||
-          (request->receiver_index == 2 && request->source_stride_bytes == 188 &&
-           request->source_sync_offset_bytes == 0) ||
-          (request->receiver_index == 3 && request->source_stride_bytes == 188 &&
            request->source_sync_offset_bytes == 0) ||
           (request->receiver_index == 1 && request->source_stride_bytes == 192 &&
            request->source_sync_offset_bytes == 4)))
@@ -1799,31 +1844,8 @@ dtv_internal_result scan_transform_stream(dtv_context *,
     const dtv::spi::PublicStreamRequest *request, std::span<const unsigned char> input,
     std::span<unsigned char> output, std::size_t *consumed, std::size_t *produced)
 {
-    if (request == nullptr || consumed == nullptr || produced == nullptr)
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-    scan_stream_transform_calls.fetch_add(1, std::memory_order_acq_rel);
-    if (request->source_stride_bytes == 188 && request->source_sync_offset_bytes == 0) {
-        if (input.size() % 188 != 0 || output.size() != input.size())
-            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-        std::size_t skip_index = 0;
-        bool skipped = false;
-        for (std::size_t offset = 0; offset < input.size(); offset += 188) {
-            while (skip_index < request->source_sync_skips_before_units.size() &&
-                   request->source_sync_skips_before_units[skip_index] == offset / 188) {
-                skipped = true;
-                ++skip_index;
-            }
-            std::copy_n(input.begin() + offset, 188, output.begin() + offset);
-            if (skipped) output[offset + 1] = 0xfa;
-        }
-        if (skip_index != request->source_sync_skips_before_units.size())
-            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-        *consumed = input.size();
-        const auto mode = scan_stream_transform_mode.load(std::memory_order_acquire);
-        *produced = mode == 1 ? 188 : mode == 2 ? 0 : output.size();
-        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
-    }
-    if (request->source_stride_bytes != 192 || request->source_sync_offset_bytes != 4 ||
+    if (request == nullptr || consumed == nullptr || produced == nullptr ||
+        request->source_stride_bytes != 192 || request->source_sync_offset_bytes != 4 ||
         input.size() % 192 != 0 || output.size() != input.size() / 192 * 188)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
     for (std::size_t source_offset = 0, output_offset = 0;
@@ -1839,10 +1861,10 @@ dtv_internal_result scan_transform_stream(dtv_context *,
 }
 
 const dtv::spi::PublicOpenOps scan_public_open_ops{
-    scan_open_plan, scan_open_identify, nullptr, scan_shared_demux, scan_shared_identify,
+    scan_open_plan, scan_open_identify, scan_open_stop, scan_shared_demux, scan_shared_identify,
     scan_plan_operation, scan_plan_tune, scan_tune_by_frequency,
     scan_prepare_stream, scan_start_stream, scan_stop_stream, scan_after_stream_drain,
-    scan_plan_stream, scan_transform_stream, scan_plan_card_transport};
+    scan_plan_stream, scan_transform_stream, scan_plan_card_transport, scan_open_initialize};
 
 }
 
@@ -1854,6 +1876,9 @@ void set_scan_group_case(unsigned value)
 void set_scan_public_open_case(unsigned value)
 {
     scan_public_open_case = value;
+    scan_open_initialize_calls.store(0, std::memory_order_release);
+    scan_open_initialize_io_count.store(0, std::memory_order_release);
+    scan_open_stop_calls.store(0, std::memory_order_release);
     scan_stream_generation.store(0, std::memory_order_release);
     previous_stream_generation.store(0, std::memory_order_release);
     scan_stream_generation_override.store(0, std::memory_order_release);
@@ -1870,11 +1895,6 @@ void set_scan_public_open_case(unsigned value)
     scan_stream_192_offset.store(0, std::memory_order_release);
     scan_stream_192_end_sent.store(false, std::memory_order_release);
     scan_stream_receiver.store(0, std::memory_order_release);
-    scan_stream_transform_calls.store(0, std::memory_order_release);
-    scan_stream_transform_mode.store(0, std::memory_order_release);
-    scan_stream_transform_test_active.store(false, std::memory_order_release);
-    scan_stream_transform_test_receiver.store(0, std::memory_order_release);
-    scan_stream_transform_source_size.store(0, std::memory_order_release);
     scan_open_identify_calls.store(0, std::memory_order_release);
     scan_open_identify_blocked.store(false, std::memory_order_release);
     scan_open_identify_release.store(value != 8, std::memory_order_release);
@@ -1961,77 +1981,19 @@ void set_scan_public_open_case(unsigned value)
     scan_shared_order_endpoints = {};
 }
 
-unsigned scan_stream_transform_call_count()
+unsigned scan_open_initialize_call_count()
 {
-    return scan_stream_transform_calls.load(std::memory_order_acquire);
+    return scan_open_initialize_calls.load(std::memory_order_acquire);
 }
 
-void set_scan_stream_transform_mode(unsigned mode)
+std::size_t scan_open_initialize_io_count_value()
 {
-    scan_stream_transform_mode.store(mode, std::memory_order_release);
+    return scan_open_initialize_io_count.load(std::memory_order_acquire);
 }
 
-void set_scan_stream_transform_test_active(bool active)
+unsigned scan_open_stop_call_count()
 {
-    scan_stream_transform_test_active.store(active, std::memory_order_release);
-}
-
-void set_scan_stream_transform_test_receiver(unsigned receiver_index)
-{
-    scan_stream_transform_test_receiver.store(receiver_index, std::memory_order_release);
-}
-
-void set_scan_stream_transform_source_phase(unsigned phase)
-{
-    auto set_unit = [](std::size_t offset, unsigned char marker) {
-        std::fill(scan_stream_transform_source.begin() + offset,
-                  scan_stream_transform_source.begin() + offset + 188, marker);
-        scan_stream_transform_source[offset] = 0x47;
-    };
-    std::fill(scan_stream_transform_source.begin(), scan_stream_transform_source.end(), 0);
-    std::size_t size = 0;
-    if (phase == 1) {
-        set_unit(0, 0x21);
-        set_unit(378, 0x22);
-        set_unit(566, 0x23);
-        size = 754;
-    } else if (phase == 2) {
-        set_unit(0, 0x31);
-        size = 378;
-    } else if (phase == 3) {
-        set_unit(0, 0x41);
-        set_unit(188, 0x42);
-        size = 376;
-    } else if (phase == 4) {
-        set_unit(0, 0x51);
-        size = 378;
-    } else if (phase == 6) {
-        set_unit(0, 0x71);
-        set_unit(188, 0x72);
-        size = 376;
-    } else if (phase == 7) {
-        set_unit(0, 0x73);
-        size = 188;
-    } else if (phase == 8) {
-        set_unit(0, 0x81);
-        set_unit(188, 0x82);
-        set_unit(376, 0x83);
-        size = 564;
-    } else if (phase == 9) {
-        set_unit(0, 0x84);
-        size = 188;
-    } else {
-        set_unit(0, phase == 5 ? 0x61 : 0x11);
-        set_unit(188, phase == 5 ? 0x62 : 0x12);
-        size = 376;
-    }
-    if (phase == 1) std::fill(scan_stream_transform_source.begin() + 188,
-                               scan_stream_transform_source.begin() + 378, 0);
-    if (phase == 2) std::fill(scan_stream_transform_source.begin() + 188,
-                               scan_stream_transform_source.begin() + 378, 0);
-    if (phase == 4) std::fill(scan_stream_transform_source.begin() + 188,
-                               scan_stream_transform_source.begin() + 378, 0);
-    scan_stream_transform_source_size.store(size, std::memory_order_release);
+    return scan_open_stop_calls.load(std::memory_order_acquire);
 }
 
 void set_scan_card_reply_mode(unsigned mode)
@@ -2239,7 +2201,8 @@ bool scan_operation_mode_enabled()
 {
     return scan_public_open_case == 11 || scan_public_open_case == 13 ||
         scan_public_open_case == 15 || scan_public_open_case == 16 ||
-        scan_public_open_case == 17 || scan_public_open_case == 18;
+        scan_public_open_case == 17 || scan_public_open_case == 18 ||
+        scan_public_open_case == 19 || scan_public_open_case == 20;
 }
 
 std::size_t scan_stream_queue_capacity_value()
@@ -2477,9 +2440,9 @@ inline constexpr dtv::spi::model_information::receiver_information scan_receiver
      (1u << (DTV_OP_TUNE_ISDB_S - 1)) | (1u << (DTV_OP_SIGNAL - 1)) |
          (1u << (DTV_OP_SELECT_SLOT - 1)) | (1u << (DTV_OP_SELECT_TSID - 1)) |
          (1u << (DTV_OP_LNA - 1)), DTV_TS_SCRAMBLED},
-    {2, 2, 1u << DTV_SYSTEM_ISDB_T, 188, 0,
+    {2, 2, 1u << DTV_SYSTEM_ISDB_T, 0, 0,
      (1u << (DTV_OP_TUNE_ISDB_T - 1)) | (1u << (DTV_OP_SIGNAL - 1)),
-     0, DTV_TS_UNKNOWN, 3},
+     0, DTV_TS_UNKNOWN},
 };
 inline constexpr dtv::spi::model_information::receiver_information scan_receivers_second[]{
     {3, 0, 1u << DTV_SYSTEM_ISDB_T, 188, 0,
