@@ -536,7 +536,15 @@ struct EnclosureRuntime::State {
         std::uint64_t generation = 0;
         std::size_t handle_index = 0;
         std::uint8_t endpoint = 0;
+        bool control = false;
         bool input = false;
+        std::uint8_t control_request_type = 0;
+        std::uint8_t control_request = 0;
+        std::uint16_t control_value = 0;
+        std::uint16_t control_index = 0;
+        EnclosureRuntime::DispatchCallback dispatch = nullptr;
+        void *dispatch_user = nullptr;
+        std::shared_ptr<void> dispatch_owner;
         bool continuous = false;
         bool initial_published = false;
         dtv_internal_result (*sink)(void *, const UsbRuntimePacket *) = nullptr;
@@ -612,13 +620,21 @@ struct EnclosureRuntime::State {
         request->completion.result = result;
         request->completion.actual_length = actual_length;
         request->completion.reached_backend = request->reached_backend;
+        const auto data_offset = request->control ? LIBUSB_CONTROL_SETUP_SIZE : 0;
         if (include_bytes && request->continuous) {
-            const auto size = (std::min)(actual_length, request->buffer.size());
-            request->completion.bytes.assign(request->buffer.begin(), request->buffer.begin() + size);
+            const auto size = (std::min)(actual_length, request->buffer.size() - data_offset);
+            request->completion.bytes.assign(request->buffer.begin() + data_offset,
+                                             request->buffer.begin() + data_offset + size);
         } else if (include_bytes) {
-            const auto size = (std::min)(actual_length, request->buffer.size());
-            request->buffer.resize(size);
-            request->completion.bytes = std::move(request->buffer);
+            const auto size = (std::min)(actual_length, request->buffer.size() - data_offset);
+            if (request->control) {
+                request->completion.bytes.assign(request->buffer.begin() + data_offset,
+                                                 request->buffer.begin() + data_offset + size);
+                request->buffer.clear();
+            } else {
+                request->buffer.resize(size);
+                request->completion.bytes = std::move(request->buffer);
+            }
         } else {
             request->buffer.clear();
         }
@@ -674,7 +690,9 @@ struct EnclosureRuntime::State {
         std::size_t handle_index, std::uint8_t endpoint, bool input,
         std::span<const unsigned char> output, std::size_t input_capacity,
         std::uint64_t generation, const dtv_runtime_clock *clock,
-        const dtv_cancel *cancel, std::uint64_t deadline, std::uint64_t *request_id)
+        const dtv_cancel *cancel, std::uint64_t deadline, std::uint64_t *request_id,
+        EnclosureRuntime::DispatchCallback dispatch = nullptr, void *dispatch_user = nullptr,
+        std::shared_ptr<void> dispatch_owner = {})
     {
         if (request_id == nullptr || handle_index >= handles.size() ||
             (input ? input_capacity > INT_MAX : output.size() > INT_MAX)) return invalid();
@@ -687,6 +705,9 @@ struct EnclosureRuntime::State {
             request->generation = generation;
             request->deadline = deadline;
             request->cancel = cancel;
+            request->dispatch = dispatch;
+            request->dispatch_user = dispatch_user;
+            request->dispatch_owner = std::move(dispatch_owner);
             if (clock != nullptr) {
                 request->clock = *clock;
                 request->has_clock = true;
@@ -736,6 +757,64 @@ struct EnclosureRuntime::State {
             request->generation = generation;
             request->buffer.resize(input_capacity);
             request->completion.bytes.resize(input_capacity);
+            std::lock_guard lock(mutex);
+            if (stopping || !started || requests.size() >= kRequestCapacity ||
+                next_request_id == 0 || next_submit_sequence == 0) {
+                return stopping ? make_result(DTV_INTERNAL_RESULT_NOT_READY)
+                                : make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+            }
+            request->id = next_request_id++;
+            request->submit_sequence = next_submit_sequence++;
+            requests.emplace(request->id, request);
+            try { pending.push_back(request->id); }
+            catch (...) { requests.erase(request->id); throw; }
+            *request_id = request->id;
+            condition.notify_all();
+            return make_result(DTV_INTERNAL_RESULT_OK);
+        } catch (...) {
+            return exception_result();
+        }
+    }
+
+    dtv_internal_result queue_control_request(
+        std::size_t handle_index, std::uint8_t request_type, std::uint8_t control_request,
+        std::uint16_t value, std::uint16_t index, std::uint16_t length,
+        std::span<const unsigned char> output, bool input, std::uint64_t generation,
+        const dtv_runtime_clock *clock, const dtv_cancel *cancel, std::uint64_t deadline,
+        EnclosureRuntime::DispatchCallback dispatch, void *dispatch_user,
+        std::shared_ptr<void> dispatch_owner, std::uint64_t *request_id)
+    {
+        if (request_id == nullptr || handle_index >= handles.size() ||
+            (input ? (request_type & LIBUSB_ENDPOINT_IN) == 0
+                   : (request_type & LIBUSB_ENDPOINT_IN) != 0) ||
+            (input ? !output.empty() : output.size() != length)) return invalid();
+        try {
+            auto request = std::make_shared<Request>();
+            request->owner = this;
+            request->handle_index = handle_index;
+            request->control = true;
+            request->input = input;
+            request->control_request_type = request_type;
+            request->control_request = control_request;
+            request->control_value = value;
+            request->control_index = index;
+            request->dispatch = dispatch;
+            request->dispatch_user = dispatch_user;
+            request->dispatch_owner = std::move(dispatch_owner);
+            request->generation = generation;
+            request->deadline = deadline;
+            request->cancel = cancel;
+            if (clock != nullptr) {
+                request->clock = *clock;
+                request->has_clock = true;
+            }
+            request->buffer.resize(LIBUSB_CONTROL_SETUP_SIZE + length);
+            libusb_fill_control_setup(request->buffer.data(), request_type, control_request,
+                                      value, index, length);
+            if (!input && length != 0) {
+                std::copy(output.begin(), output.end(),
+                          request->buffer.begin() + LIBUSB_CONTROL_SETUP_SIZE);
+            }
             std::lock_guard lock(mutex);
             if (stopping || !started || requests.size() >= kRequestCapacity ||
                 next_request_id == 0 || next_submit_sequence == 0) {
@@ -867,9 +946,14 @@ struct EnclosureRuntime::State {
                 continue;
             }
             request->transfer = transfer;
-            libusb_fill_bulk_transfer(transfer, lease->handle, request->endpoint,
-                request->buffer.data(), static_cast<int>(request->buffer.size()),
-                transfer_completed, request.get(), 0);
+            if (request->control) {
+                libusb_fill_control_transfer(transfer, lease->handle, request->buffer.data(),
+                    transfer_completed, request.get(), 0);
+            } else {
+                libusb_fill_bulk_transfer(transfer, lease->handle, request->endpoint,
+                    request->buffer.data(), static_cast<int>(request->buffer.size()),
+                    transfer_completed, request.get(), 0);
+            }
             {
                 std::lock_guard lock(mutex);
                 const auto slot = std::find_if(active.begin(), active.end(),
@@ -884,13 +968,25 @@ struct EnclosureRuntime::State {
                 *slot = request;
                 ++active_size;
             }
-            int status = LIBUSB_ERROR_OTHER;
-            try {
-                status = context->backend->submit_transfer(transfer);
-            } catch (...) {
-                status = LIBUSB_ERROR_OTHER;
+            struct SubmitState {
+                UsbTransferBackend *backend;
+                libusb_transfer *transfer;
+                int status = LIBUSB_ERROR_OTHER;
+            } submit{context->backend.get(), transfer};
+            const auto submit_action = [](void *user) -> int {
+                auto *state = static_cast<SubmitState *>(user);
+                try { state->status = state->backend->submit_transfer(state->transfer); }
+                catch (...) { state->status = LIBUSB_ERROR_OTHER; }
+                return state->status;
+            };
+            dtv_internal_result dispatch_result = make_result(DTV_INTERNAL_RESULT_OK);
+            if (request->dispatch != nullptr) {
+                dispatch_result = request->dispatch(request->dispatch_user, submit_action, &submit);
+            } else {
+                (void)submit_action(&submit);
             }
-            if (status != LIBUSB_SUCCESS) {
+            if (dispatch_result.code != DTV_INTERNAL_RESULT_OK ||
+                submit.status != LIBUSB_SUCCESS) {
                 {
                     std::lock_guard lock(mutex);
                     const auto slot = std::find_if(active.begin(), active.end(),
@@ -901,7 +997,8 @@ struct EnclosureRuntime::State {
                     }
                     request->transfer = nullptr;
                 }
-                dtv_internal_result result = usb_result(status);
+                dtv_internal_result result = dispatch_result.code != DTV_INTERNAL_RESULT_OK
+                    ? dispatch_result : usb_result(submit.status);
                 try { context->backend->free_transfer(transfer); }
                 catch (...) { result = exception_result(); }
                 finish_without_transfer(request, UsbRuntimeTerminal::failed, result);
@@ -1218,6 +1315,39 @@ dtv_internal_result EnclosureRuntime::submit_bulk_in(
 {
     return state_->queue_request(handle_index, endpoint, true, {}, capacity, generation,
                                  clock, cancel, deadline_ns, request_id);
+}
+
+dtv_internal_result EnclosureRuntime::submit_tune_bulk_out(
+    std::size_t handle_index, std::uint8_t endpoint, std::span<const unsigned char> bytes,
+    std::uint64_t generation, const dtv_runtime_clock *clock, std::uint64_t deadline_ns,
+    DispatchCallback dispatch, void *dispatch_user, std::shared_ptr<void> dispatch_owner,
+    std::uint64_t *request_id)
+{
+    return state_->queue_request(handle_index, endpoint, false, bytes, 0, generation, clock,
+        nullptr, deadline_ns, request_id, dispatch, dispatch_user, std::move(dispatch_owner));
+}
+
+dtv_internal_result EnclosureRuntime::submit_tune_bulk_in(
+    std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
+    std::uint64_t generation, const dtv_runtime_clock *clock, std::uint64_t deadline_ns,
+    DispatchCallback dispatch, void *dispatch_user, std::shared_ptr<void> dispatch_owner,
+    std::uint64_t *request_id)
+{
+    return state_->queue_request(handle_index, endpoint, true, {}, capacity, generation, clock,
+        nullptr, deadline_ns, request_id, dispatch, dispatch_user, std::move(dispatch_owner));
+}
+
+dtv_internal_result EnclosureRuntime::submit_control(
+    std::size_t handle_index, std::uint8_t request_type, std::uint8_t request,
+    std::uint16_t value, std::uint16_t index, std::uint16_t length,
+    std::span<const unsigned char> output, bool input, std::uint64_t generation,
+    const dtv_runtime_clock *clock, const dtv_cancel *cancel, std::uint64_t deadline_ns,
+    DispatchCallback dispatch, void *dispatch_user, std::shared_ptr<void> dispatch_owner,
+    std::uint64_t *request_id)
+{
+    return state_->queue_control_request(handle_index, request_type, request, value, index,
+        length, output, input, generation, clock, cancel, deadline_ns, dispatch, dispatch_user,
+        std::move(dispatch_owner), request_id);
 }
 
 dtv_internal_result EnclosureRuntime::submit_shared_bulk_in(

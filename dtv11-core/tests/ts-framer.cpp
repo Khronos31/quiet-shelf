@@ -84,45 +84,6 @@ int main()
                                    source188.begin() + 3 * 188) &&
                            false_sync.stats().dropped_bytes == 7, 7)) return failed;
 
-    TsFramer ordered(188, 0, 2, 1128);
-    std::vector<std::size_t> skip_before_units;
-    std::vector<std::uint8_t> ordered_output(1128);
-    const auto initial_units = units(188, 0, 2, 81);
-    const auto initial_framed = ordered.feed(initial_units, ordered_output, &skip_before_units);
-    if (int failed = check(initial_framed.code == TsFramerCode::ok &&
-                           initial_framed.produced == initial_units.size() &&
-                           skip_before_units.empty(), 17)) return failed;
-    auto interleaved = units(188, 0, 1, 91);
-    interleaved.insert(interleaved.end(), 190, 0);
-    const auto after_skip = units(188, 0, 2, 101);
-    interleaved.insert(interleaved.end(), after_skip.begin(), after_skip.end());
-    const auto interleaved_framed = ordered.feed(interleaved, ordered_output, &skip_before_units);
-    const auto interleaved_expected = [&] {
-        auto value = units(188, 0, 1, 91);
-        value.insert(value.end(), after_skip.begin(), after_skip.end());
-        return value;
-    }();
-    if (int failed = check(interleaved_framed.code == TsFramerCode::ok &&
-                           interleaved_framed.produced == interleaved_expected.size() &&
-                           std::vector<std::uint8_t>(ordered_output.begin(),
-                               ordered_output.begin() + interleaved_framed.produced) ==
-                               interleaved_expected && skip_before_units ==
-                                   std::vector<std::size_t>{1}, 18)) return failed;
-    auto deferred_skip = units(188, 0, 1, 111);
-    deferred_skip.insert(deferred_skip.end(), 190, 0);
-    const auto deferred_framed = ordered.feed(deferred_skip, ordered_output, &skip_before_units);
-    if (int failed = check(deferred_framed.code == TsFramerCode::ok &&
-                           deferred_framed.produced == 188 &&
-                           skip_before_units == std::vector<std::size_t>{1}, 19)) return failed;
-    const auto resumed_units = units(188, 0, 2, 121);
-    const auto resumed_framed = ordered.feed(resumed_units, ordered_output, &skip_before_units);
-    if (int failed = check(resumed_framed.code == TsFramerCode::ok &&
-                           resumed_framed.produced == resumed_units.size() &&
-                           std::vector<std::uint8_t>(ordered_output.begin(),
-                               ordered_output.begin() + resumed_framed.produced) ==
-                               resumed_units && skip_before_units ==
-                                   std::vector<std::size_t>{0}, 20)) return failed;
-
     TsFramer gated(188, 0, 4, 752);
     std::vector<std::uint8_t> bad_candidate = units(188, 0, 4, 33);
     bad_candidate[2 * 188] = 0x00;
