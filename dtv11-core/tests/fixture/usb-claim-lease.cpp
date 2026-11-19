@@ -44,6 +44,8 @@ extern const dtv::spi::l3_model_record dtv_l3_model_scanfixture_scan_model_alias
 extern "C" int dtv_public_test_receiver_transition(dtv_enclosure *);
 void set_scan_group_case(unsigned);
 void set_scan_public_open_case(unsigned);
+unsigned scan_public_stop_count_value();
+void reset_scan_public_stop_count();
 void set_scan_card_reply_mode(unsigned);
 void set_scan_card_transport_drop_reply(bool);
 void set_scan_card_t1_exchange_mode(unsigned);
@@ -887,6 +889,122 @@ int enclosure_runtime_endpoint_cancel()
         completion.terminal != dtv::internal::UsbRuntimeTerminal::deadline) return 9;
     const auto stopped = runtime->stop(nullptr, UINT64_MAX);
     return !stopped.pending && stopped.result.code == DTV_INTERNAL_RESULT_OK ? 0 : 6;
+}
+
+int enclosure_runtime_retire_barrier()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    std::vector<dtv::internal::UsbClaimDeviceInput> inputs{{901, snapshot(context, 3, 901), {{1, 0}}}};
+    dtv::internal::UsbClaimLeaseGroup claims;
+    if (context.acquire_claims(inputs, nullptr, nullptr, UINT64_MAX, &claims).code !=
+        DTV_INTERNAL_RESULT_OK) return 1;
+    dtv_internal_result result{};
+    auto runtime = dtv::internal::EnclosureRuntime::start(std::move(claims), &result);
+    if (!runtime || result.code != DTV_INTERNAL_RESULT_OK) return 2;
+    std::uint64_t request_id = 0;
+    if (runtime->submit_bulk_in(0, 0x81, 8, 1, nullptr, nullptr, UINT64_MAX,
+                                &request_id).code != DTV_INTERNAL_RESULT_OK ||
+        !backend->wait_for_submissions(1)) return 3;
+    backend->set_defer_cancel_completion(true);
+    if (runtime->cancel(request_id).code != DTV_INTERNAL_RESULT_OK) return 4;
+    dtv::internal::UsbRuntimeTerminal terminal{};
+    if (runtime->wait_request(request_id, nullptr, UINT64_MAX, &terminal).code !=
+            DTV_INTERNAL_RESULT_TIMEOUT ||
+        terminal != dtv::internal::UsbRuntimeTerminal::cancelled) return 5;
+
+    std::uint64_t now = 10;
+    const dtv_runtime_clock clock{&now, monotonic_now, nullptr, nullptr};
+    const std::array<std::uint64_t, 1> target{{request_id}};
+    if (runtime->wait_retired(target, &clock, now).code != DTV_INTERNAL_RESULT_TIMEOUT) return 6;
+
+    backend->set_defer_cancel_completion(false);
+    backend->complete_transfers();
+    if (runtime->wait_retired(target, nullptr, UINT64_MAX).code != DTV_INTERNAL_RESULT_OK) return 7;
+    const std::array<std::uint64_t, 1> unknown{{request_id + 1000}};
+    if (runtime->wait_retired(unknown, nullptr, UINT64_MAX).code !=
+        DTV_INTERNAL_RESULT_INVALID_ARGUMENT) return 8;
+
+    dtv::internal::UsbRuntimeCompletion completion{};
+    bool available = false;
+    if (runtime->take_completion(request_id, &completion, &available).code !=
+            DTV_INTERNAL_RESULT_OK ||
+        !available || completion.request_id != request_id ||
+        runtime->wait_retired(target, nullptr, UINT64_MAX).code != DTV_INTERNAL_RESULT_OK) return 9;
+    const auto stopped = runtime->stop(nullptr, UINT64_MAX);
+    return !stopped.pending && stopped.result.code == DTV_INTERNAL_RESULT_OK ? 0 : 10;
+}
+
+int enclosure_retire_public_close()
+{
+    reset_scan_public_stop_count();
+    set_scan_public_open_case(9);
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 801), snapshot(context, 4, 802)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1 ||
+        batch.groups[0].functions.size() != 2) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error error{};
+    error.struct_size = sizeof(error);
+    auto *const *enclosures = dtv_list_enclosures(&error);
+    if (enclosures == nullptr || enclosures[0] == nullptr || error.code != DTV_ERROR_OK) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    std::int32_t open_result = DTV_ERROR_INTERNAL;
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    std::thread opening([&] { open_result = dtv_open_enclosure(root, nullptr, &open_error); });
+    if (!backend->wait_for_submissions(2)) {
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+        opening.join();
+        dtv_drop_enclosure(root);
+        return 3;
+    }
+    backend->complete_endpoint(0x81);
+    backend->complete_endpoint(0x82);
+    opening.join();
+    if (open_result != DTV_ERROR_OK || open_error.code != DTV_ERROR_OK ||
+        !backend->wait_for_endpoint_submissions(0x81, 2) ||
+        !backend->wait_for_endpoint_submissions(0x82, 2)) {
+        dtv_drop_enclosure(root);
+        return 4;
+    }
+
+    backend->set_defer_cancel_completion(true);
+    const dtv_call_options short_close{sizeof(dtv_call_options), 50};
+    const auto pending = dtv_close_enclosure(root, &short_close, &error);
+    if (pending != DTV_CLOSE_PENDING || scan_public_stop_count_value() != 0 ||
+        backend->close_count != 0 || dtv_get_enclosure_close_state(root, &error) != DTV_CLOSE_PENDING) {
+        backend->set_defer_cancel_completion(false);
+        backend->complete_transfers();
+        dtv_drop_enclosure(root);
+        return 5;
+    }
+    backend->set_defer_cancel_completion(false);
+    backend->complete_transfers();
+    const dtv_call_options close_options{sizeof(dtv_call_options), 2000};
+    while (dtv_close_enclosure(root, &close_options, &error) != DTV_CLOSE_CLOSED) {
+        if (error.code != DTV_ERROR_OK || scan_public_stop_count_value() > 1) {
+            dtv_drop_enclosure(root);
+            return 6;
+        }
+    }
+    if (scan_public_stop_count_value() != 1 || dtv_get_enclosure_close_state(root, &error) !=
+            DTV_CLOSE_CLOSED || error.code != DTV_ERROR_OK) {
+        dtv_drop_enclosure(root);
+        return 7;
+    }
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return 0;
 }
 
 int public_open_lifecycle()
@@ -6702,6 +6820,19 @@ int public_error_message_boundary()
 int main(int argc, char **argv)
 {
     dtv_load_scanfixture();
+    if (argc == 2 && std::strcmp(argv[1], "--enclosure-retire") == 0) {
+        const int barrier = enclosure_runtime_retire_barrier();
+        if (barrier != 0) {
+            std::fprintf(stderr, "enclosure_runtime_retire_barrier failed: %d\n", barrier);
+            return barrier;
+        }
+        const int close_result = enclosure_retire_public_close();
+        if (close_result != 0) {
+            std::fprintf(stderr, "enclosure_retire_public_close failed: %d\n", close_result);
+            return close_result;
+        }
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--lnb") == 0) {
         const int result = public_lnb_roundtrip();
         if (result != 0) {

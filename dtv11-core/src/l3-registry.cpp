@@ -8856,6 +8856,20 @@ extern "C" uint32_t dtv_close_enclosure(dtv_enclosure *object,
         set_public_error(error, DTV_ERROR_OK);
         return DTV_CLOSE_PENDING;
     }
+    if (runtime) {
+        std::vector<std::uint64_t> retire_requests;
+        {
+            std::lock_guard lock(slot->mutex);
+            retire_requests = slot->requests;
+        }
+        const auto retired = runtime->wait_retired(retire_requests, clock, deadline);
+        if (retired.code != DTV_INTERNAL_RESULT_OK) {
+            std::lock_guard lock(slot->mutex);
+            slot->phase = PublicDiscoveryState::OpenSlot::Phase::pending;
+            set_public_error(error, DTV_ERROR_OK);
+            return DTV_CLOSE_PENDING;
+        }
+    }
     const auto product_stop = stop_open_product(slot, *clock, deadline);
     if (runtime) {
         const auto stopped = runtime->stop(clock, deadline);

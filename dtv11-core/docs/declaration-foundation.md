@@ -1534,3 +1534,66 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - USB 記述子読取の実測遅延、実機 USB での権限・BUSY 挙動、およびアクティブな TS ストリームへの影響は未測定である。走査予算（250ms / 2s）は未測定の試値であり、実測に基づく見直しが後続課題として残されている。
   - 既存 CLI および daemon との接続は本 PR の対象外であり、未接続・未実装である。
 
+
+## 筐体最終closeの物理retire接続と製品stop前保証（PR81、L3基盤）
+
+PR81 では、採用 C03/L3 の遅延完了回収を現筐体の最終クローズに接続し、Core runtime における transfer request の cancel 要求・早期 terminal と物理 retire（回収完了）を明確に区別して、製品 stop コールバック（`PublicOpenOps::stop`）の実行前に対象 transfer の物理回収が完了することを保証する限定修正を導入している。
+
+### 1. 概要と順序保証（`dtv_close_enclosure`）
+
+筐体最終クローズ（`dtv_close_enclosure`）において、以下の処理順序が厳密に保証される:
+
+1. **`request cancel`:** 実行中・待機中のリクエストに対してキャンセルを要求し、worker を起床させる。
+2. **`operation callers` 待ち (`wait_for_operation_callers`):** 外部スレッドからの操作呼び出し完了を待機する。
+3. **物理 retire バリア (`EnclosureRuntime::wait_retired`):** 対象 transfer の物理 retire（コールバック回収・free・terminal sink 終了・再投入なし）が完了するまで待機する。
+4. **製品 stop (`stop_open_product` / `PublicOpenOps::stop`):** 物理 retire 完了後に初めて、製品固有の stop フックを一度だけ呼び出す。
+5. **`runtime.stop`:** 1-worker ランタイムを停止・join する。
+6. **`CLOSED` (`DTV_CLOSE_CLOSED`):** クローズ完了状態へ遷移する。
+
+### 2. 物理 retire の定義と完了証拠
+
+- **物理 retire の成立条件:**
+  - 対象 request の transfer コールバック回収、libusb transfer の解放（free）と以降の transfer バッファ不使用、terminal sink コールバックの終了、および再投入（re-submit）なしがすべて揃った状態（`physically_retired_locked`）を物理 retire と定義する。
+  - なお、Request インスタンスおよび転送バッファ自体のメモリ所有権は runtime の `requests` マップに残され、`PublicOpenOps::stop` より後の `runtime.stop` 時まで安全に保持される。
+- **早期完了・cancel との明確な区別:**
+  - Core runtime に対する単なる `cancel` 要求送信や、初回完了（`completion_ready`）、`wait_request` の早期 terminal 到達は、物理完了（retire）の証拠にはならない。
+  - continuous 転送（共有 IN 等）において初回のパケット受信完了があっても、コールバック回収と sink 処理が完了する前は retire 済みとはみなさない。
+- **ID 判定規則:**
+  - 既に回収済みの ID（`id < next_request_id` かつ `requests` マップに存在しない）は retire 済みとして扱う。
+  - 未提出の ID（`id == 0` または `id >= next_request_id`）は `INVALID_ARGUMENT`（`DTV_INTERNAL_RESULT_INVALID_ARGUMENT`）として拒否する。
+- **スレッドとロックの責務:**
+  - retire 待機中（`wait_retired`）も runtime mutex を一時解放し、worker スレッドのイベント処理（`handle_events`）と sink コールバック実行を継続させることで、自己デッドロックを防止する。
+
+### 3. 期限切れ PENDING 中の資源所有と再開プロトコル
+
+- **PENDING 状態への遷移:**
+  - 指定された期限（deadline）内に対象 transfer が retire しなかった場合、`dtv_close_enclosure` は直ちに `DTV_CLOSE_PENDING` を返す。
+- **資源所有の完全保持:**
+  - `DTV_CLOSE_PENDING` の返却中、owner、context、claims（live claim 排他予約）、buffers、slot、および暗黙 hold はすべて破棄されず安全に保持される。
+  - PENDING 中に `dtv_release_enclosure` が呼ばれても no-op として資源解放を拒否する。
+- **製品 stop の 1 回のみ実行保証:**
+  - 製品 stop（`stop_open_product`）は物理 retire の完了後に一度だけ実行される。PENDING 中に製品 stop が前倒しで早期実行されたり、二重に実行されることはない。
+- **再開と CLOSED 到達:**
+  - 呼び出し側は `dtv_get_enclosure_close_state` による状態確認、または再度の `dtv_close_enclosure` 呼び出しによりクローズを続行できる。遅延コールバック回収後に `DTV_CLOSE_CLOSED` へ遷移する。
+
+### 4. 適用範囲と除外境界（制限事項）
+
+- **保証の限定適用:**
+  - 本保証は **筐体最終 close（`dtv_close_enclosure`）のみ** に適用される。
+- **明示的除外事項:**
+  - stream 単独 close（`after_stream_drain`）
+  - torne の Core0 stop 順序
+  - raw counter / snapshot
+  - open 失敗時の `finish_failure` の順序
+  - 専用/共有 IN の stream scope
+- **製品 stop と同一 IN 応答の未確認境界:**
+  - 製品 stop コールバック自身が、最終 stop 処理のために同一 IN エンドポイントの新しい応答（パケット）の受信を必要とする機種が存在する場合、その機種との整合性は本 PR では未確認・未検証である。
+
+### 5. 検証状況と境界
+
+- **合成テスト検証:**
+  - Core 内部の合成テスト `usb_claim_lease_contract --enclosure-retire`（CTest: `usb_enclosure_retire_contract`）により、内部 barrier（cancel 後・callback 前の TIMEOUT、callback 回収後の OK、未知 ID の拒否）および公開 close（遅延中の PENDING / 製品 stop 0 回 / USB device handle close 0 回 [`close_count == 0`]、callback 回収後の製品 stop 1 回 / CLOSED）の契約を確認済みである（※ fixture の `close_count` は USB device handle の close 回数を示しており、request handle 存続、free_count、claim release そのものを直接検査したものではない）。
+- **作者最初 green 時刻:**
+  - 作者の最初 green 実時刻は保存されておらず（未保存）、推測を行わない。
+- **独立 QA および実機境界:**
+  - 独立 QA（`usb_claim_lease_contract` full suite、Windows/MSVC、NDK、JPlag）、実機環境、および quiet-shelf public CI の成功は先取りしない。

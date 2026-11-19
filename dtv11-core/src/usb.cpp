@@ -554,6 +554,7 @@ struct EnclosureRuntime::State {
         bool terminal_requested = false;
         bool cancel_sent = false;
         bool completion_ready = false;
+        bool retire_in_progress = false;
         UsbRuntimeTerminal terminal = UsbRuntimeTerminal::failed;
         dtv_internal_result terminal_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         UsbRuntimeCompletion completion;
@@ -584,6 +585,19 @@ struct EnclosureRuntime::State {
     std::mutex join_mutex;
 
     bool has_active_locked() const { return active_size != 0; }
+
+    bool physically_retired_locked(const std::shared_ptr<Request> &request) const
+    {
+        if (request->retire_in_progress) return false;
+        for (const auto &entry : active) {
+            if (entry == request) return false;
+        }
+        for (const auto id : pending) {
+            if (id == request->id) return false;
+        }
+        if (!request->continuous) return request->completion_ready;
+        return request->terminal_requested || request->completion_ready;
+    }
 
     static void transfer_completed(libusb_transfer *transfer)
     {
@@ -645,6 +659,8 @@ struct EnclosureRuntime::State {
                 condition.notify_all();
             } else {
                 push_completed_locked(request, terminal, result, 0, false);
+                request->retire_in_progress = false;
+                condition.notify_all();
             }
         }
         if (notify_sink) {
@@ -657,6 +673,9 @@ struct EnclosureRuntime::State {
             packet.terminal = terminal;
             packet.result = result;
             (void)call_callback([&] { return request->sink(request->sink_user, &packet); });
+            std::lock_guard lock(mutex);
+            request->retire_in_progress = false;
+            condition.notify_all();
         }
     }
 
@@ -820,6 +839,7 @@ struct EnclosureRuntime::State {
                 const auto found = requests.find(id);
                 if (found == requests.end()) continue;
                 request = found->second;
+                request->retire_in_progress = true;
                 if (stopping && !request->terminal_requested) {
                     mark_terminal_locked(request, UsbRuntimeTerminal::stopped,
                                          make_result(DTV_INTERNAL_RESULT_NOT_READY));
@@ -827,6 +847,8 @@ struct EnclosureRuntime::State {
                 if (request->terminal_requested) {
                     push_completed_locked(request, request->terminal, request->terminal_result,
                                           0, false);
+                    request->retire_in_progress = false;
+                    condition.notify_all();
                     continue;
                 }
             }
@@ -879,10 +901,13 @@ struct EnclosureRuntime::State {
                     try { context->backend->free_transfer(transfer); } catch (...) {}
                     push_completed_locked(request, UsbRuntimeTerminal::failed,
                         make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED), 0, false);
+                    request->retire_in_progress = false;
+                    condition.notify_all();
                     continue;
                 }
                 *slot = request;
                 ++active_size;
+                request->retire_in_progress = false;
             }
             int status = LIBUSB_ERROR_OTHER;
             try {
@@ -908,6 +933,7 @@ struct EnclosureRuntime::State {
             } else {
                 std::lock_guard lock(mutex);
                 request->reached_backend = true;
+                request->retire_in_progress = false;
             }
         }
     }
@@ -960,6 +986,7 @@ struct EnclosureRuntime::State {
                 }
                 retired[retired_count++] = {request->transfer, request};
                 request->transfer = nullptr;
+                request->retire_in_progress = true;
                 request.reset();
                 --active_size;
             }
@@ -1045,7 +1072,10 @@ struct EnclosureRuntime::State {
                     packet.result = result;
                     lock.unlock();
                     (void)call_callback([&] { return request->sink(request->sink_user, &packet); });
+                    lock.lock();
                 }
+                request->retire_in_progress = false;
+                condition.notify_all();
                 continue;
             }
             }
@@ -1065,6 +1095,7 @@ struct EnclosureRuntime::State {
                 request->terminal = stopping ? UsbRuntimeTerminal::stopped : UsbRuntimeTerminal::failed;
                 request->terminal_result = stopping
                     ? make_result(DTV_INTERNAL_RESULT_NOT_READY) : sink_result;
+                request->retire_in_progress = false;
                 condition.notify_all();
                 continue;
             }
@@ -1072,6 +1103,7 @@ struct EnclosureRuntime::State {
                 request->terminal_requested = true;
                 request->terminal = UsbRuntimeTerminal::failed;
                 request->terminal_result = make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+                request->retire_in_progress = false;
                 condition.notify_all();
                 continue;
             }
@@ -1087,6 +1119,7 @@ struct EnclosureRuntime::State {
                 request->terminal_result = exception_result();
                 condition.notify_all();
             }
+            request->retire_in_progress = false;
             condition.notify_all();
         }
     }
@@ -1258,6 +1291,33 @@ dtv_internal_result EnclosureRuntime::wait_request(
             *terminal = request->terminal;
             return request->terminal_result;
         }
+        lock.unlock();
+        const auto checkpoint = claim_checkpoint(clock, nullptr, deadline_ns);
+        lock.lock();
+        if (checkpoint.code != DTV_INTERNAL_RESULT_OK) return checkpoint;
+        state_->condition.wait_for(lock, std::chrono::milliseconds(5));
+    }
+}
+
+dtv_internal_result EnclosureRuntime::wait_retired(
+    std::span<const std::uint64_t> request_ids, const dtv_runtime_clock *clock,
+    std::uint64_t deadline_ns)
+{
+    std::unique_lock lock(state_->mutex);
+    for (const auto id : request_ids) {
+        if (id == 0 || id >= state_->next_request_id) return invalid();
+    }
+    for (;;) {
+        bool all_retired = true;
+        for (const auto id : request_ids) {
+            const auto found = state_->requests.find(id);
+            if (found == state_->requests.end()) continue;
+            if (!state_->physically_retired_locked(found->second)) {
+                all_retired = false;
+                break;
+            }
+        }
+        if (all_retired) return make_result(DTV_INTERNAL_RESULT_OK, 0);
         lock.unlock();
         const auto checkpoint = claim_checkpoint(clock, nullptr, deadline_ns);
         lock.lock();

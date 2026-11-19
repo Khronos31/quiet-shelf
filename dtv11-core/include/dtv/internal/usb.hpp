@@ -173,6 +173,11 @@ public:
     dtv_internal_result wait_request(std::uint64_t request_id,
                                      const dtv_runtime_clock *, std::uint64_t deadline_ns,
                                      UsbRuntimeTerminal *terminal);
+    /* 対象 request の transfer callback 回収・free・terminal sink 終了・再投入なしが
+     * 揃うまで待つ。cancel 送信や wait_request の早期 terminal は完了証拠にしない。
+     * 既に回収済みの ID は retire 済み、未提出の ID は INVALID_ARGUMENT とする。 */
+    dtv_internal_result wait_retired(std::span<const std::uint64_t> request_ids,
+                                     const dtv_runtime_clock *, std::uint64_t deadline_ns);
     dtv_internal_result next_completion(UsbRuntimeCompletion *, bool *available);
     dtv_internal_result take_completion(std::uint64_t request_id,
                                         UsbRuntimeCompletion *, bool *available);
