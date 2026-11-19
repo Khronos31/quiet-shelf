@@ -1015,7 +1015,7 @@ int public_open_192_stream()
     if (dtv_open_stream(receivers[1], nullptr, &stream, &error) != DTV_ERROR_OK || stream == nullptr)
         return 6;
 
-    constexpr std::size_t source_size = 3 + 7 * 192;
+    constexpr std::size_t source_size = 3 + 5 * 192;
     constexpr std::size_t first_source_size = 3 + 2 * 192;
     constexpr std::size_t chunk_size = 17;
     constexpr std::size_t first_completion_count =
@@ -1032,20 +1032,28 @@ int public_open_192_stream()
         return 7;
     }
 
-    std::array<unsigned char, 4 * 188> output{};
-    std::array<unsigned char, 4 * 188> expected{};
+    std::array<unsigned char, 2 * 188> output{};
+    std::array<unsigned char, 2 * 188> expected{};
+    std::size_t expected_offset = 0;
+    for (std::size_t unit : {0u, 1u}) {
+        expected[expected_offset] = 0x47;
+        std::fill(expected.begin() + expected_offset + 1,
+                  expected.begin() + expected_offset + 188,
+                  static_cast<unsigned char>(0x20 + unit));
+        expected_offset += 188;
+    }
     std::uint64_t output_size = 0;
     const dtv_call_options read_wait{sizeof(dtv_call_options), 2000};
     const dtv_call_options gate_wait{sizeof(dtv_call_options), 10};
-    if (dtv_read_stream(stream, output.data(), output.size(), &gate_wait, &output_size, &error) !=
-            DTV_ERROR_TIMEOUT || output_size != 0 ||
+    if (dtv_read_stream(stream, output.data(), output.size(), &read_wait, &output_size, &error) !=
+            DTV_ERROR_OK || output_size != output.size() || output != expected ||
         dtv_get_dropped_bytes(stream) != 3 || dtv_get_desyncs(stream) != 0) return 8;
 
     callbacks = backend->callback_count_snapshot();
     backend->complete_endpoint(0x81, remaining_completion_count);
     if (!backend->wait_for_callbacks(callbacks + remaining_completion_count)) return 9;
-    std::size_t expected_offset = 0;
-    for (std::size_t unit : {3u, 4u, 5u, 6u}) {
+    expected_offset = 0;
+    for (std::size_t unit : {3u, 4u}) {
         expected[expected_offset] = 0x47;
         std::fill(expected.begin() + expected_offset + 1,
                   expected.begin() + expected_offset + 188,
@@ -1054,7 +1062,7 @@ int public_open_192_stream()
     }
     if (dtv_read_stream(stream, output.data(), output.size(), &read_wait, &output_size, &error) !=
             DTV_ERROR_OK || output_size != output.size() || output != expected ||
-        dtv_get_dropped_bytes(stream) != 579 || dtv_get_desyncs(stream) != 1) return 10;
+        dtv_get_dropped_bytes(stream) != 195 || dtv_get_desyncs(stream) != 1) return 10;
     for (std::size_t offset = 0; offset < output_size; offset += 188) {
         if (output[offset] != 0x47) return 11;
     }
@@ -1074,7 +1082,7 @@ int public_open_192_stream()
     };
     auto read_markers = [&](dtv_stream *target,
                             std::initializer_list<unsigned char> markers) {
-        std::array<unsigned char, 3 * 188> actual{};
+        std::array<unsigned char, 4 * 188> actual{};
         const auto expected_size = markers.size() * 188;
         std::uint64_t actual_size = 0;
         if (dtv_read_stream(target, actual.data(), expected_size, &read_wait,
@@ -1166,6 +1174,37 @@ int public_open_192_stream()
     if (!complete_source(7)) return 30;
     if (!read_markers(stream, {0x71, 0x72, 0x73})) return 31;
     if (dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 32;
+    dtv_release_stream(stream);
+    const dtv::spi::model_information::receiver_information four_unit_declaration[]{
+        {3, 0, 1u << DTV_SYSTEM_ISDB_T, 188, 0, 0, 0, DTV_TS_UNKNOWN, 4},
+    };
+    const dtv::spi::model_information::device_receiver_information four_unit_device_declaration[]{
+        {2, true, four_unit_declaration, std::size(four_unit_declaration)},
+    };
+    if (dtv::internal::update_public_discovery_receiver_declarations_for_test(
+            root, four_unit_device_declaration).code != DTV_INTERNAL_RESULT_OK) return 33;
+    devices = dtv_get_devices(root);
+    auto *const *four_unit_receivers = devices == nullptr || devices[1] == nullptr
+        ? nullptr : dtv_get_receivers(devices[1]);
+    set_scan_stream_transform_test_receiver(3);
+    set_scan_stream_transform_source_phase(8);
+    const auto four_open = four_unit_receivers == nullptr || four_unit_receivers[0] == nullptr
+        ? DTV_ERROR_INVALID_ARGUMENT
+        : dtv_open_stream(four_unit_receivers[0], nullptr, &stream, &error);
+    const bool four_submitted = four_open == DTV_ERROR_OK && backend->wait_for_submissions(2);
+    const bool four_completed = four_submitted && complete_source(8);
+    if (!four_completed || stream == nullptr) {
+        std::fprintf(stderr, "four-unit stream setup: receivers=%p/%p open=%d error=%d stream=%p submitted=%d completed=%d\n",
+            static_cast<void *>(four_unit_receivers == nullptr ? nullptr : four_unit_receivers[0]),
+            static_cast<void *>(devices == nullptr ? nullptr : devices[1]), four_open, error.code,
+            static_cast<void *>(stream), four_submitted, four_completed);
+        return 36;
+    }
+    if (dtv_read_stream(stream, gated_output.data(), 3 * 188, &gate_wait,
+            &output_size, &error) != DTV_ERROR_TIMEOUT || output_size != 0 ||
+        dtv_get_dropped_bytes(stream) != 0 || dtv_get_desyncs(stream) != 0) return 34;
+    if (!complete_source(9) || !read_markers(stream, {0x81, 0x82, 0x83, 0x84}) ||
+        dtv_close_stream(stream, nullptr, &error) != DTV_CLOSE_CLOSED) return 35;
     dtv_release_stream(stream);
     set_scan_stream_transform_test_receiver(0);
     set_scan_stream_transform_test_active(false);

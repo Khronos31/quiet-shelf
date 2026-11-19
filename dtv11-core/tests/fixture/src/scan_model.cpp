@@ -143,7 +143,7 @@ std::atomic<bool> scan_stream_transform_test_active{false};
 std::atomic<unsigned> scan_stream_transform_test_receiver{0};
 std::atomic<std::size_t> scan_stream_transform_source_size{0};
 std::array<unsigned char, 754> scan_stream_transform_source{};
-std::array<unsigned char, 1347> scan_stream_192_source{};
+std::array<unsigned char, 963> scan_stream_192_source{};
 std::array<std::atomic<std::uint64_t>, 3> scan_tune_epochs{};
 std::atomic<std::uint64_t> scan_shared_lock_epoch_override{UINT64_MAX};
 std::atomic<unsigned> scan_tune_mode{0};
@@ -1705,7 +1705,7 @@ dtv_internal_result scan_plan_stream(dtv_context *, const dtv::spi::PublicStream
         ? 900 + request->receiver_index : 900;
     plan->supported = true;
     plan->ready = true;
-    plan->arguments_valid = request->receiver_index < 3;
+    plan->arguments_valid = request->receiver_index < 4;
     plan->resource_keys = resource_keys;
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
@@ -1716,6 +1716,8 @@ dtv_internal_result scan_prepare_stream(dtv_context *, const dtv::spi::PublicStr
         !((request->receiver_index == 0 && request->source_stride_bytes == 188 &&
            request->source_sync_offset_bytes == 0) ||
           (request->receiver_index == 2 && request->source_stride_bytes == 188 &&
+           request->source_sync_offset_bytes == 0) ||
+          (request->receiver_index == 3 && request->source_stride_bytes == 188 &&
            request->source_sync_offset_bytes == 0) ||
           (request->receiver_index == 1 && request->source_stride_bytes == 192 &&
            request->source_sync_offset_bytes == 4)))
@@ -2010,6 +2012,14 @@ void set_scan_stream_transform_source_phase(unsigned phase)
     } else if (phase == 7) {
         set_unit(0, 0x73);
         size = 188;
+    } else if (phase == 8) {
+        set_unit(0, 0x81);
+        set_unit(188, 0x82);
+        set_unit(376, 0x83);
+        size = 564;
+    } else if (phase == 9) {
+        set_unit(0, 0x84);
+        size = 188;
     } else {
         set_unit(0, phase == 5 ? 0x61 : 0x11);
         set_unit(188, phase == 5 ? 0x62 : 0x12);
@@ -2154,7 +2164,7 @@ unsigned scan_card_interleave_phase_value()
 void set_scan_stream_192_source()
 {
     std::fill(scan_stream_192_source.begin(), scan_stream_192_source.begin() + 3, 0x13);
-    for (std::size_t unit = 0; unit < 7; ++unit) {
+    for (std::size_t unit = 0; unit < 5; ++unit) {
         const auto offset = 3 + unit * 192;
         std::fill(scan_stream_192_source.begin() + offset,
                   scan_stream_192_source.begin() + offset + 4,
@@ -2466,7 +2476,7 @@ inline constexpr dtv::spi::model_information::receiver_information scan_receiver
          (1u << (DTV_OP_LNA - 1)),
      (1u << (DTV_OP_TUNE_ISDB_S - 1)) | (1u << (DTV_OP_SIGNAL - 1)) |
          (1u << (DTV_OP_SELECT_SLOT - 1)) | (1u << (DTV_OP_SELECT_TSID - 1)) |
-         (1u << (DTV_OP_LNA - 1)), DTV_TS_SCRAMBLED, 4},
+         (1u << (DTV_OP_LNA - 1)), DTV_TS_SCRAMBLED},
     {2, 2, 1u << DTV_SYSTEM_ISDB_T, 188, 0,
      (1u << (DTV_OP_TUNE_ISDB_T - 1)) | (1u << (DTV_OP_SIGNAL - 1)),
      0, DTV_TS_UNKNOWN, 3},
