@@ -106,6 +106,9 @@ std::size_t scan_open_identify_bytes = 0;
 std::atomic<unsigned> scan_open_identify_calls{0};
 std::atomic<bool> scan_open_identify_blocked{false};
 std::atomic<bool> scan_open_identify_release{true};
+std::atomic<unsigned> scan_open_initialize_calls{0};
+std::atomic<std::size_t> scan_open_initialize_io_count{0};
+std::atomic<unsigned> scan_open_stop_calls{0};
 dtv::spi::PublicOpenSession scan_shared_session{};
 std::array<std::uint64_t, 2> scan_shared_tokens{};
 std::array<std::uint64_t, 2> scan_shared_generations{};
@@ -734,6 +737,34 @@ dtv_internal_result scan_open_plan(
     }
     return *count == candidates.size() ? dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0)
                                        : dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0);
+}
+
+dtv_internal_result scan_open_initialize(dtv_context *,
+    std::span<const dtv::spi::PublicOpenIo> ios, dtv_timeout, const std::atomic<bool> *)
+{
+    scan_open_initialize_calls.fetch_add(1, std::memory_order_release);
+    scan_open_initialize_io_count.store(ios.size(), std::memory_order_release);
+    if (std::any_of(ios.begin(), ios.end(), [](const auto &entry) {
+            return entry.io == nullptr;
+        })) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    if (scan_public_open_case == 19 || scan_public_open_case == 20) {
+        if (ios.empty() || ios.front().io->bulk_out == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+        static const unsigned char init_byte = 0xa5;
+        const dtv_bytes output{&init_byte, 1};
+        const auto result = ios.front().io->bulk_out(ios.front().io->user, 0x02, output, {});
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+        return scan_public_open_case == 19
+            ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0)
+            : dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result scan_open_stop(dtv_context *, dtv_timeout)
+{
+    scan_open_stop_calls.fetch_add(1, std::memory_order_release);
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
 dtv_internal_result scan_open_identify(dtv_context *, std::span<const unsigned char> bytes,
@@ -1830,10 +1861,10 @@ dtv_internal_result scan_transform_stream(dtv_context *,
 }
 
 const dtv::spi::PublicOpenOps scan_public_open_ops{
-    scan_open_plan, scan_open_identify, nullptr, scan_shared_demux, scan_shared_identify,
+    scan_open_plan, scan_open_identify, scan_open_stop, scan_shared_demux, scan_shared_identify,
     scan_plan_operation, scan_plan_tune, scan_tune_by_frequency,
     scan_prepare_stream, scan_start_stream, scan_stop_stream, scan_after_stream_drain,
-    scan_plan_stream, scan_transform_stream, scan_plan_card_transport};
+    scan_plan_stream, scan_transform_stream, scan_plan_card_transport, scan_open_initialize};
 
 }
 
@@ -1845,6 +1876,9 @@ void set_scan_group_case(unsigned value)
 void set_scan_public_open_case(unsigned value)
 {
     scan_public_open_case = value;
+    scan_open_initialize_calls.store(0, std::memory_order_release);
+    scan_open_initialize_io_count.store(0, std::memory_order_release);
+    scan_open_stop_calls.store(0, std::memory_order_release);
     scan_stream_generation.store(0, std::memory_order_release);
     previous_stream_generation.store(0, std::memory_order_release);
     scan_stream_generation_override.store(0, std::memory_order_release);
@@ -1945,6 +1979,21 @@ void set_scan_public_open_case(unsigned value)
     scan_tune_records = {};
     scan_shared_order = {};
     scan_shared_order_endpoints = {};
+}
+
+unsigned scan_open_initialize_call_count()
+{
+    return scan_open_initialize_calls.load(std::memory_order_acquire);
+}
+
+std::size_t scan_open_initialize_io_count_value()
+{
+    return scan_open_initialize_io_count.load(std::memory_order_acquire);
+}
+
+unsigned scan_open_stop_call_count()
+{
+    return scan_open_stop_calls.load(std::memory_order_acquire);
 }
 
 void set_scan_card_reply_mode(unsigned mode)
@@ -2152,7 +2201,8 @@ bool scan_operation_mode_enabled()
 {
     return scan_public_open_case == 11 || scan_public_open_case == 13 ||
         scan_public_open_case == 15 || scan_public_open_case == 16 ||
-        scan_public_open_case == 17 || scan_public_open_case == 18;
+        scan_public_open_case == 17 || scan_public_open_case == 18 ||
+        scan_public_open_case == 19 || scan_public_open_case == 20;
 }
 
 std::size_t scan_stream_queue_capacity_value()

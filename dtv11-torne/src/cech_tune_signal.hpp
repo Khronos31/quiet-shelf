@@ -386,6 +386,34 @@ struct LockObservation {
     bool layer_viterbi[3];
 };
 
+enum class CnrObservationState {
+    not_observed,
+    invalid_unlocked,
+    invalid_noise_zero,
+    numeric_unresolved,
+    valid
+};
+
+struct CnrObservation {
+    CnrObservationState state = CnrObservationState::not_observed;
+    bool lock_observed = false;
+    bool noise_observed = false;
+    bool signal_observed = false;
+    std::uint16_t lock_register = 0;
+    std::uint16_t noise_register = 0;
+    std::uint16_t signal_register = 0;
+    std::uint64_t noise_q16_16 = 0;
+    std::uint64_t signal_q16_16 = 0;
+    std::int32_t hundredth_db = 0;
+};
+
+bool demod_fec_mpeg_locked(std::uint16_t register_568);
+bool calculate_demod_cnr(std::uint16_t noise_register,
+                         std::uint16_t signal_register,
+                         std::uint64_t *noise_q16_16,
+                         std::uint64_t *signal_q16_16,
+                         std::int32_t *hundredth_db);
+
 enum class LockReadResult { read_error, unlocked, locked };
 
 LockReadResult observe_lock(bool read_succeeded, std::uint16_t register_568,

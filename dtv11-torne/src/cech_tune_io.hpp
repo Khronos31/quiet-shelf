@@ -9,7 +9,27 @@
 
 #include <dtv/spi/types.h>
 
+#include "cech_tune_signal.hpp"
+
 namespace torne::cech_zd1j {
+
+struct TunePlan;
+struct CnrObservation;
+
+struct DemodSyncIoState {
+    DemodSyncState machine{};
+    bool started = false;
+};
+
+struct DemodSyncIoResult {
+    DemodSyncStatus status = DemodSyncStatus::failed;
+    dtv_internal_result io_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    std::uint32_t poll_interval_ms = 0;
+    std::size_t plan_steps_completed = 0;
+    bool immediate_plan_applied = false;
+    bool recovery_attempted = false;
+    bool recovery_succeeded = false;
+};
 
 /* One device session's I2C ticket state; never stores the callback-scoped io view. */
 struct I2cCursor {
@@ -32,6 +52,13 @@ public:
     dtv_internal_result write_demodulator(std::uint16_t reg, std::uint16_t value);
     dtv_internal_result read_tuner(std::uint8_t reg, std::uint16_t *value);
     dtv_internal_result write_tuner(std::uint8_t reg, std::uint16_t value);
+    dtv_internal_result apply_tune_plan(const TunePlan &plan);
+    dtv_internal_result observe_cnr(CnrObservation *observation);
+    DemodSyncIoResult begin_sync(DemodTransmissionMode mode, bool differential,
+                                 bool wait_mpeg,
+                                 const DemodLayerConfig (&layers)[3],
+                                 DemodSyncIoState *state);
+    DemodSyncIoResult poll_sync(DemodSyncIoState *state);
 
 private:
     dtv_internal_result transact(std::uint8_t address, std::uint16_t operation,

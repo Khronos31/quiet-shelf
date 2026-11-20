@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <span>
 #include <vector>
@@ -12,6 +14,7 @@
 #include <dtv/spi/firmware_session.hpp>
 
 #include "torne_firmware.hpp"
+#include "cech_tune_signal.hpp"
 
 namespace {
 
@@ -51,6 +54,28 @@ constexpr std::uint32_t kCandidatePatchWords[]{
 struct CeChState {
     const dtv_usb_io *io = nullptr;
     std::vector<std::uint8_t> candidate_widen;
+    bool frontend_power_attempted = false;
+    bool frontend_power_complete = false;
+    dtv_internal_result frontend_power_result =
+        dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+};
+
+struct RuntimeObservation {
+    bool attempted = false;
+    bool widen_patches_observed = false;
+    bool widen_pristine = false;
+    bool widen_candidate_patches = false;
+    std::uint32_t widen_patch_words[5]{};
+    bool widen_image_observed = false;
+    std::uint8_t widen_image[kWidenSize]{};
+    bool core1_info_observed = false;
+    bool core1_info_valid = false;
+    std::uint8_t core1_info[64]{};
+    dtv_internal_result result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+};
+
+struct CeChModelState {
+    RuntimeObservation runtime_observation;
 };
 
 dtv_internal_result result(int code, std::uint32_t detail = 0)
@@ -72,6 +97,20 @@ void destroy_state(dtv_context *context)
     delete reinterpret_cast<CeChState *>(context);
 }
 
+dtv_internal_result create_model_state(dtv_device_id, dtv_context **out)
+{
+    if (out == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    auto *state = new (std::nothrow) CeChModelState;
+    if (state == nullptr) return result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+    *out = reinterpret_cast<dtv_context *>(state);
+    return result(DTV_INTERNAL_RESULT_OK);
+}
+
+void destroy_model_state(dtv_context *context)
+{
+    delete reinterpret_cast<CeChModelState *>(context);
+}
+
 dtv_internal_result open_device(dtv_context *context, const dtv_usb_io *io,
                                 const dtv_open_args *args)
 {
@@ -81,6 +120,9 @@ dtv_internal_result open_device(dtv_context *context, const dtv_usb_io *io,
         return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
     state->io = io;
     state->candidate_widen.clear();
+    state->frontend_power_attempted = false;
+    state->frontend_power_complete = false;
+    state->frontend_power_result = result(DTV_INTERNAL_RESULT_NOT_READY);
     return result(DTV_INTERNAL_RESULT_OK);
 }
 
@@ -108,6 +150,13 @@ std::uint16_t packed_value(std::uint32_t address)
                                       ((address >> 24) & 0xFF));
 }
 
+dtv_internal_result open_control_write(const dtv_usb_io *io, dtv_timeout timeout,
+                                       std::uint32_t address,
+                                       std::span<const std::uint8_t> bytes);
+dtv_internal_result open_wide_control_write(const dtv_usb_io *io, dtv_timeout timeout,
+                                            std::uint32_t address,
+                                            std::span<const std::uint8_t> bytes);
+
 dtv_internal_result control_read(CeChState *state, std::uint32_t address,
                                  std::span<std::uint8_t> bytes, bool wide)
 {
@@ -127,14 +176,11 @@ dtv_internal_result control_read(CeChState *state, std::uint32_t address,
 dtv_internal_result control_write(CeChState *state, std::uint32_t address,
                                   std::span<const std::uint8_t> bytes, bool wide)
 {
-    if (state == nullptr || state->io == nullptr || state->io->control == nullptr ||
-        bytes.empty() || address > 0x01FFFFFF || bytes.size() > 0x02000000 - address)
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    dtv_buffer buffer{const_cast<std::uint8_t *>(bytes.data()), bytes.size(), bytes.size()};
-    return state->io->control(state->io->user,
-        wide ? kWideWriteType : kNarrowWriteType,
-        wide ? kWideRequest : kNarrowRequest, packed_value(address),
-        static_cast<std::uint16_t>(address & 0xFFFF), &buffer, io_timeout(state->io));
+    if (state == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    const auto timeout = io_timeout(state->io);
+    if (wide)
+        return open_wide_control_write(state->io, timeout, address, bytes);
+    return open_control_write(state->io, timeout, address, bytes);
 }
 
 std::uint32_t read_be32(const std::uint8_t *bytes)
@@ -165,6 +211,272 @@ dtv_internal_result write_word(CeChState *state, std::uint32_t address, std::uin
     std::uint8_t bytes[4]{};
     write_be32(bytes, value);
     return control_write(state, address, bytes, address >= 0x01000000);
+}
+
+dtv_internal_result open_control_read(const dtv_usb_io *io, dtv_timeout timeout,
+                                      std::uint32_t address, std::span<std::uint8_t> bytes)
+{
+    if (io == nullptr || io->control == nullptr || bytes.empty() ||
+        address > 0x00FFFFFF || bytes.size() > 0x01000000 - address)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    dtv_buffer buffer{bytes.data(), bytes.size(), 0};
+    const auto transferred = io->control(io->user, kNarrowReadType, kNarrowRequest,
+        packed_value(address), static_cast<std::uint16_t>(address), &buffer, timeout);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    if (buffer.size != bytes.size())
+        return result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(buffer.size));
+    return transferred;
+}
+
+dtv_internal_result open_control_write(const dtv_usb_io *io, dtv_timeout timeout,
+                                       std::uint32_t address,
+                                       std::span<const std::uint8_t> bytes)
+{
+    if (io == nullptr || io->control == nullptr || bytes.empty() ||
+        address > 0x00FFFFFF || bytes.size() > 0x01000000 - address)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    dtv_buffer buffer{const_cast<std::uint8_t *>(bytes.data()), bytes.size(), bytes.size()};
+    return io->control(io->user, kNarrowWriteType, kNarrowRequest,
+        packed_value(address), static_cast<std::uint16_t>(address), &buffer, timeout);
+}
+
+dtv_internal_result open_wide_control_write(const dtv_usb_io *io, dtv_timeout timeout,
+                                            std::uint32_t address,
+                                            std::span<const std::uint8_t> bytes)
+{
+    if (io == nullptr || io->control == nullptr || bytes.empty() || (address & 3) != 0 ||
+        address < 0x01000000 || address > 0x01FFFFFF ||
+        bytes.size() > 0x02000000 - address)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    dtv_buffer buffer{const_cast<std::uint8_t *>(bytes.data()), bytes.size(), bytes.size()};
+    return io->control(io->user, kWideWriteType, kWideRequest,
+        packed_value(address), static_cast<std::uint16_t>(address), &buffer, timeout);
+}
+
+dtv_internal_result open_wide_control_read(const dtv_usb_io *io, dtv_timeout timeout,
+                                           std::uint32_t address,
+                                           std::span<std::uint8_t> bytes)
+{
+    if (io == nullptr || io->control == nullptr || bytes.empty() || (address & 3) != 0 ||
+        address < 0x01000000 || address > 0x01FFFFFF ||
+        bytes.size() > 0x02000000 - address)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    dtv_buffer buffer{bytes.data(), bytes.size(), 0};
+    const auto transferred = io->control(io->user, kWideReadType, kWideRequest,
+        packed_value(address), static_cast<std::uint16_t>(address), &buffer, timeout);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    if (buffer.size != bytes.size())
+        return result(DTV_INTERNAL_RESULT_USB_IO, static_cast<std::uint32_t>(buffer.size));
+    return transferred;
+}
+
+dtv_internal_result open_read_word(const dtv_usb_io *io, dtv_timeout timeout,
+                                   std::uint32_t address, std::uint32_t *value)
+{
+    if (value == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    std::uint8_t bytes[4]{};
+    const auto transferred = open_control_read(io, timeout, address, bytes);
+    if (transferred.code == DTV_INTERNAL_RESULT_OK) *value = read_be32(bytes);
+    return transferred;
+}
+
+dtv_internal_result open_write_word(const dtv_usb_io *io, dtv_timeout timeout,
+                                    std::uint32_t address, std::uint32_t value)
+{
+    std::uint8_t bytes[4]{};
+    write_be32(bytes, value);
+    return open_control_write(io, timeout, address, bytes);
+}
+
+dtv_internal_result open_wide_write_word(const dtv_usb_io *io, dtv_timeout timeout,
+                                         std::uint32_t address, std::uint32_t value)
+{
+    std::uint8_t bytes[4]{};
+    write_be32(bytes, value);
+    return open_wide_control_write(io, timeout, address, bytes);
+}
+
+dtv_internal_result open_delay_ms(const dtv_usb_io *io, dtv_timeout timeout,
+                                  const std::atomic<bool> *cancelled,
+                                  std::uint32_t milliseconds)
+{
+    if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
+        return result(DTV_INTERNAL_RESULT_CANCELLED);
+    if (io == nullptr || io->clock == nullptr || io->clock->monotonic_now_ns == nullptr ||
+        io->clock->delay_until == nullptr)
+        return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+    const auto now = io->clock->monotonic_now_ns(io->clock->user);
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    const auto delta = static_cast<std::uint64_t>(milliseconds) * 1000000;
+    const auto wake = now > maximum - delta ? maximum : now + delta;
+    std::uint32_t clock_cancelled = 0;
+    const auto delayed = io->clock->delay_until(io->clock->user, wake,
+        timeout.operation_deadline_ns, nullptr, &clock_cancelled);
+    if (clock_cancelled != 0 ||
+        (cancelled != nullptr && cancelled->load(std::memory_order_acquire)))
+        return result(DTV_INTERNAL_RESULT_CANCELLED);
+    return delayed;
+}
+
+dtv_internal_result apply_stream_plan(const dtv_usb_io *io, dtv_timeout timeout,
+                                      const std::atomic<bool> *cancelled,
+                                      const torne::cech_zd1j::StreamPlan &plan)
+{
+    if (io == nullptr || io->control == nullptr)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    for (std::size_t index = 0; index < plan.step_count; ++index) {
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
+            return result(DTV_INTERNAL_RESULT_CANCELLED);
+        const auto &step = plan.steps[index];
+        dtv_internal_result transferred = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        switch (step.kind) {
+        case torne::cech_zd1j::StreamStepKind::write24:
+        case torne::cech_zd1j::StreamStepKind::trigger_write24:
+            transferred = open_write_word(io, timeout, step.reg, step.value);
+            break;
+        case torne::cech_zd1j::StreamStepKind::masked_write24: {
+            std::uint32_t current = 0;
+            transferred = open_read_word(io, timeout, step.reg, &current);
+            if (transferred.code == DTV_INTERNAL_RESULT_OK && cancelled != nullptr &&
+                cancelled->load(std::memory_order_acquire))
+                transferred = result(DTV_INTERNAL_RESULT_CANCELLED);
+            if (transferred.code == DTV_INTERNAL_RESULT_OK)
+                transferred = open_write_word(io, timeout, step.reg,
+                    (current & step.mask) | step.value);
+            break;
+        }
+        case torne::cech_zd1j::StreamStepKind::wide_write32:
+        case torne::cech_zd1j::StreamStepKind::trigger_wide_write32:
+            transferred = open_wide_write_word(io, timeout, step.reg, step.value);
+            break;
+        case torne::cech_zd1j::StreamStepKind::poll_mask_clear24: {
+            if (io->clock == nullptr || io->clock->monotonic_now_ns == nullptr ||
+                io->clock->delay_until == nullptr)
+                return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            const auto now = io->clock->monotonic_now_ns(io->clock->user);
+            const auto maximum = std::numeric_limits<std::uint64_t>::max();
+            const auto duration = static_cast<std::uint64_t>(step.timeout_ms) * 1000000;
+            auto poll_deadline = now > maximum - duration ? maximum : now + duration;
+            if (timeout.operation_deadline_ns != 0)
+                poll_deadline = std::min(poll_deadline, timeout.operation_deadline_ns);
+            bool first_poll = true;
+            for (;;) {
+                if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
+                    return result(DTV_INTERNAL_RESULT_CANCELLED);
+                if (!first_poll && io->clock->monotonic_now_ns(io->clock->user) >= poll_deadline)
+                    return result(DTV_INTERNAL_RESULT_TIMEOUT);
+                first_poll = false;
+                std::uint32_t current = 0;
+                transferred = open_read_word(io, timeout, step.reg, &current);
+                if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+                const auto polled_at = io->clock->monotonic_now_ns(io->clock->user);
+                if (polled_at >= poll_deadline) return result(DTV_INTERNAL_RESULT_TIMEOUT);
+                if ((current & step.mask) == 0) break;
+                const auto poll_now = polled_at;
+                const auto interval = static_cast<std::uint64_t>(step.interval_ms) * 1000000;
+                const auto wake = poll_now > maximum - interval
+                    ? maximum : std::min(poll_now + interval, poll_deadline);
+                std::uint32_t clock_cancelled = 0;
+                transferred = io->clock->delay_until(io->clock->user, wake,
+                    timeout.operation_deadline_ns, nullptr, &clock_cancelled);
+                if (clock_cancelled != 0 ||
+                    (cancelled != nullptr && cancelled->load(std::memory_order_acquire)))
+                    return result(DTV_INTERNAL_RESULT_CANCELLED);
+                if (transferred.code != DTV_INTERNAL_RESULT_OK &&
+                    transferred.code != DTV_INTERNAL_RESULT_TIMEOUT)
+                    return transferred;
+            }
+            break;
+        }
+        }
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
+            return result(DTV_INTERNAL_RESULT_CANCELLED);
+    }
+    return result(DTV_INTERNAL_RESULT_OK);
+}
+
+[[maybe_unused]] dtv_internal_result apply_stream_start_plans(
+    const dtv_usb_io *io, dtv_timeout timeout,
+    const std::atomic<bool> *cancelled)
+{
+    if (io == nullptr || io->control == nullptr)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    torne::cech_zd1j::StreamPlan plan{};
+    if (!torne::cech_zd1j::build_stream_engine_plan(&plan))
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    auto transferred = apply_stream_plan(io, timeout, cancelled, plan);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    if (!torne::cech_zd1j::build_stream_core0_run_plan(&plan))
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    transferred = apply_stream_plan(io, timeout, cancelled, plan);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    if (!torne::cech_zd1j::build_stream_input_start_plan(&plan))
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    return apply_stream_plan(io, timeout, cancelled, plan);
+}
+
+[[maybe_unused]] dtv_internal_result apply_stream_input_close_plan(
+    const dtv_usb_io *io, dtv_timeout timeout,
+    const std::atomic<bool> *cancelled)
+{
+    if (io == nullptr || io->control == nullptr)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    torne::cech_zd1j::StreamPlan plan{};
+    if (!torne::cech_zd1j::build_stream_input_close_plan(&plan))
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    return apply_stream_plan(io, timeout, cancelled, plan);
+}
+
+[[maybe_unused]] dtv_internal_result initialize_frontend_power(
+    dtv_context *context, std::span<const dtv::spi::PublicOpenIo> ios,
+    dtv_timeout timeout, const std::atomic<bool> *cancelled)
+{
+    // PublicOpenOpsへの登録は、実identify接合後の単位に残す。
+    auto *state = reinterpret_cast<CeChState *>(context);
+    if (state == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    if (state->frontend_power_attempted) return state->frontend_power_result;
+    state->frontend_power_attempted = true;
+    state->frontend_power_result = result(DTV_INTERNAL_RESULT_NOT_READY);
+
+    if (ios.size() != 1 || ios[0].io == nullptr) {
+        state->frontend_power_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return state->frontend_power_result;
+    }
+    torne::cech_zd1j::FrontendPowerPlan plan{};
+    if (!torne::cech_zd1j::build_frontend_power_plan(&plan)) {
+        state->frontend_power_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return state->frontend_power_result;
+    }
+
+    const auto *io = ios[0].io;
+    for (std::size_t index = 0; index < plan.step_count; ++index) {
+        const auto &step = plan.steps[index];
+        dtv_internal_result transferred = result(DTV_INTERNAL_RESULT_OK);
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+            transferred = result(DTV_INTERNAL_RESULT_CANCELLED);
+        } else if (step.kind == torne::cech_zd1j::InitStepKind::masked_write) {
+            std::uint32_t current = 0;
+            transferred = open_read_word(io, timeout, step.reg, &current);
+            if (transferred.code == DTV_INTERNAL_RESULT_OK && cancelled != nullptr &&
+                cancelled->load(std::memory_order_acquire))
+                transferred = result(DTV_INTERNAL_RESULT_CANCELLED);
+            if (transferred.code == DTV_INTERNAL_RESULT_OK)
+                transferred = open_write_word(io, timeout, step.reg,
+                    (current & step.mask) | step.value);
+        } else if (step.kind == torne::cech_zd1j::InitStepKind::delay_ms) {
+            transferred = open_delay_ms(io, timeout, cancelled, step.value);
+        } else {
+            transferred = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        }
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) {
+            state->frontend_power_result = transferred;
+            return transferred;
+        }
+    }
+    state->frontend_power_complete = true;
+    state->frontend_power_result = result(DTV_INTERNAL_RESULT_OK);
+    return state->frontend_power_result;
 }
 
 dtv_internal_result write_wide_image(CeChState *state, std::uint32_t address,
@@ -253,6 +565,84 @@ bool valid_core1_info(const std::uint8_t info[64])
            read_be32(info + 20) == kCore1ImageSize &&
            read_be32(info + 24) == 0x000A3800 &&
            read_be32(info + 28) == 0x00040000;
+}
+
+[[maybe_unused]] dtv_internal_result observe_open_runtime(
+    dtv_context *context, std::span<const dtv::spi::PublicOpenIo> ios,
+    dtv_timeout timeout, const std::atomic<bool> *cancelled)
+{
+    auto *state = reinterpret_cast<CeChModelState *>(context);
+    if (state == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    state->runtime_observation = {};
+    state->runtime_observation.attempted = true;
+    state->runtime_observation.result = result(DTV_INTERNAL_RESULT_NOT_READY);
+    if (ios.size() != 1 || ios[0].io == nullptr || ios[0].io->control == nullptr) {
+        state->runtime_observation.result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return state->runtime_observation.result;
+    }
+
+    const auto *io = ios[0].io;
+    auto *observation = &state->runtime_observation;
+    for (std::size_t index = 0; index < sizeof(kPatchAddresses) / sizeof(kPatchAddresses[0]); ++index) {
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+            observation->result = result(DTV_INTERNAL_RESULT_CANCELLED);
+            return observation->result;
+        }
+        auto transferred = open_read_word(io, timeout, kPatchAddresses[index],
+                                          &observation->widen_patch_words[index]);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) {
+            observation->result = transferred;
+            return transferred;
+        }
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+            observation->result = result(DTV_INTERNAL_RESULT_CANCELLED);
+            return observation->result;
+        }
+    }
+    observation->widen_patches_observed = true;
+    observation->widen_pristine = std::equal(observation->widen_patch_words,
+        observation->widen_patch_words + 5, kPristinePatchWords);
+    observation->widen_candidate_patches = std::equal(observation->widen_patch_words,
+        observation->widen_patch_words + 5, kCandidatePatchWords);
+
+    if (observation->widen_pristine || !observation->widen_candidate_patches) {
+        observation->result = result(DTV_INTERNAL_RESULT_OK);
+        return observation->result;
+    }
+
+    for (std::size_t offset = 0; offset < kWidenSize; offset += 4) {
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+            observation->result = result(DTV_INTERNAL_RESULT_CANCELLED);
+            return observation->result;
+        }
+        auto transferred = open_control_read(io, timeout,
+            kWidenBase + static_cast<std::uint32_t>(offset),
+            std::span<std::uint8_t>(observation->widen_image + offset, 4));
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) {
+            observation->result = transferred;
+            return transferred;
+        }
+        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+            observation->result = result(DTV_INTERNAL_RESULT_CANCELLED);
+            return observation->result;
+        }
+    }
+    observation->widen_image_observed = true;
+
+    if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+        observation->result = result(DTV_INTERNAL_RESULT_CANCELLED);
+        return observation->result;
+    }
+    auto transferred = open_wide_control_read(io, timeout, kInfoAddress,
+        observation->core1_info);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) {
+        observation->result = transferred;
+        return transferred;
+    }
+    observation->core1_info_observed = true;
+    observation->core1_info_valid = valid_core1_info(observation->core1_info);
+    observation->result = result(DTV_INTERNAL_RESULT_OK);
+    return observation->result;
 }
 
 dtv_internal_result identify_device(dtv_context *context, dtv_identify_info *identity,
@@ -567,13 +957,15 @@ const ModelEntry cech_zd1j_model{
     .model = {"CECH-ZD1J", 0x054C, 0x04B2},
     .firmware = nullptr,
     .firmware_count = 0,
-    .create_state = create_state,
-    .destroy_state = destroy_state,
+    .create_state = create_model_state,
+    .destroy_state = destroy_model_state,
     .bootstrap_ops = &bootstrap_ops,
     .functions = functions,
     .function_count = 1,
     .source_stride_bytes = 192,
     .source_sync_offset_bytes = 4,
+    // 初回IN planとmodel観測結果のidentify接点が揃うまで公開tableへ登録しない。
+    .public_open = nullptr,
     .runtime_device_receivers = device_receivers,
     .runtime_device_receiver_count = 1};
 

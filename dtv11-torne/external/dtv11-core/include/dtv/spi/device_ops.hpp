@@ -334,6 +334,11 @@ struct PublicTuneSession {
     const dtv_usb_io *io = nullptr;
 };
 
+struct PublicOpenIo {
+    std::size_t handle_index = 0;
+    const dtv_usb_io *io = nullptr;
+};
+
 struct PublicOpenOps {
     dtv_internal_result (*plan)(std::span<const dtv_usb_candidate_info>,
                                 std::span<const dtv_function>,
@@ -362,6 +367,8 @@ struct PublicOpenOps {
                                             std::size_t *) = nullptr;
     dtv_internal_result (*plan_card_transport)(dtv_context *, const CardTransportRequest *,
                                                PublicCardTransportPlan *) = nullptr;
+    dtv_internal_result (*initialize)(dtv_context *, std::span<const PublicOpenIo>,
+                                      dtv_timeout, const std::atomic<bool> *) = nullptr;
 };
 
 struct ModelEntry {

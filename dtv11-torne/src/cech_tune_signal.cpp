@@ -1451,6 +1451,67 @@ bool build_tuner_step1_plan(bool boost, TunerCalibrationPlan *plan)
     return true;
 }
 
+namespace {
+
+std::uint64_t decode_cnr_q16_16(std::uint16_t encoded)
+{
+    const auto mantissa = static_cast<std::uint64_t>((encoded >> 6) & 0x00FF);
+    const auto exponent_bits = static_cast<std::int32_t>(encoded & 0x003F);
+    const auto exponent = (exponent_bits & 0x0020) != 0
+        ? exponent_bits - 0x0040 : exponent_bits;
+    const auto shift = exponent + 16;
+    return shift >= 0 ? mantissa << shift : mantissa >> -shift;
+}
+
+std::int64_t log2_q20(std::uint64_t value)
+{
+    std::uint32_t integer = 0;
+    auto normalized = value;
+    while (normalized >= 2) {
+        normalized >>= 1;
+        ++integer;
+    }
+    normalized = integer <= 31
+        ? value << (31 - integer) : value >> (integer - 31);
+
+    std::uint32_t fraction = 0;
+    for (std::uint32_t bit = 0; bit < 20; ++bit) {
+        normalized = (normalized * normalized) >> 31;
+        if (normalized >= 0x100000000ULL) {
+            normalized >>= 1;
+            fraction |= 1U << (19 - bit);
+        }
+    }
+    return (static_cast<std::int64_t>(integer) << 20) + fraction;
+}
+
+}
+
+bool demod_fec_mpeg_locked(std::uint16_t register_568)
+{
+    return (register_568 & 0x1000) != 0 && (register_568 & 0x00E0) != 0;
+}
+
+bool calculate_demod_cnr(std::uint16_t noise_register,
+                         std::uint16_t signal_register,
+                         std::uint64_t *noise_q16_16,
+                         std::uint64_t *signal_q16_16,
+                         std::int32_t *hundredth_db)
+{
+    if (noise_q16_16 == nullptr || signal_q16_16 == nullptr || hundredth_db == nullptr)
+        return false;
+    *noise_q16_16 = decode_cnr_q16_16(noise_register);
+    *signal_q16_16 = decode_cnr_q16_16(signal_register);
+    if (*noise_q16_16 == 0 || *signal_q16_16 == 0) return false;
+
+    // 内部Q20 log2。specに出力丸め・誤差上限の規定はない。
+    constexpr std::int64_t kCentiDbPerLog2Q20 = 315652829;
+    const auto log2_ratio_q20 = log2_q20(*signal_q16_16) - log2_q20(*noise_q16_16);
+    const auto scaled = log2_ratio_q20 * kCentiDbPerLog2Q20;
+    *hundredth_db = static_cast<std::int32_t>(scaled / (1LL << 40));
+    return true;
+}
+
 LockReadResult observe_lock(bool read_succeeded, std::uint16_t register_568,
                             const std::uint16_t (&viterbi_registers)[3],
                             LockObservation *observation)
@@ -1461,7 +1522,7 @@ LockReadResult observe_lock(bool read_succeeded, std::uint16_t register_568,
     observation->tmcc_sync = (register_568 & 0x001E) == 0x001E;
     observation->coff_cpil = (register_568 & 0x1800) != 0;
     observation->lmod4 = (register_568 & 0x0400) != 0;
-    observation->fec_mpeg = (register_568 & 0x1000) != 0 && (register_568 & 0x00E0) != 0;
+    observation->fec_mpeg = demod_fec_mpeg_locked(register_568);
     observation->layer_mpeg[0] = (register_568 & 0x0080) != 0;
     observation->layer_mpeg[1] = (register_568 & 0x0040) != 0;
     observation->layer_mpeg[2] = (register_568 & 0x0020) != 0;

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "cech_tune_io.hpp"
+#include "cech_tune_signal.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -134,6 +135,230 @@ dtv_internal_result CechI2cIo::write_demodulator(std::uint16_t reg, std::uint16_
     return transact(0x24, 1, bytes, {});
 }
 
+dtv_internal_result CechI2cIo::observe_cnr(CnrObservation *observation)
+{
+    if (observation == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    *observation = {};
+
+    auto transferred = read_demodulator(568, &observation->lock_register);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    observation->lock_observed = true;
+    if (!demod_fec_mpeg_locked(observation->lock_register)) {
+        observation->state = CnrObservationState::invalid_unlocked;
+        return result(DTV_INTERNAL_RESULT_OK);
+    }
+
+    transferred = read_demodulator(542, &observation->noise_register);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    observation->noise_observed = true;
+    transferred = read_demodulator(543, &observation->signal_register);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    observation->signal_observed = true;
+
+    if (!calculate_demod_cnr(observation->noise_register, observation->signal_register,
+            &observation->noise_q16_16, &observation->signal_q16_16,
+            &observation->hundredth_db)) {
+        observation->state = ((observation->noise_register >> 6) & 0x00FF) == 0
+            ? CnrObservationState::invalid_noise_zero
+            : CnrObservationState::numeric_unresolved;
+        return result(DTV_INTERNAL_RESULT_OK);
+    }
+    observation->state = CnrObservationState::valid;
+    return result(DTV_INTERNAL_RESULT_OK);
+}
+
+DemodSyncIoResult CechI2cIo::begin_sync(DemodTransmissionMode mode, bool differential,
+                                        bool wait_mpeg,
+                                        const DemodLayerConfig (&layers)[3],
+                                        DemodSyncIoState *state)
+{
+    DemodSyncIoResult sync_result{};
+    sync_result.io_result = result(DTV_INTERNAL_RESULT_OK);
+    if (state == nullptr || state->started) {
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return sync_result;
+    }
+    if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+        state->started = true;
+        state->machine.stage = DemodSyncStage::failed;
+        sync_result.status = DemodSyncStatus::failed;
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_CANCELLED);
+        return sync_result;
+    }
+    if (io_ == nullptr || io_->clock == nullptr || io_->clock->monotonic_now_ns == nullptr) {
+        state->started = true;
+        state->machine.stage = DemodSyncStage::failed;
+        sync_result.status = DemodSyncStatus::failed;
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        return sync_result;
+    }
+
+    const auto now_ms = io_->clock->monotonic_now_ns(io_->clock->user) / 1000000;
+    DemodInitPlan plan{};
+    if (!torne::cech_zd1j::begin_demod_sync(mode, differential, wait_mpeg,
+            layers, now_ms, &state->machine, &plan, &sync_result.poll_interval_ms)) {
+        state->started = true;
+        state->machine.stage = DemodSyncStage::failed;
+        sync_result.status = DemodSyncStatus::failed;
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return sync_result;
+    }
+    state->started = true;
+    sync_result.status = DemodSyncStatus::pending;
+    for (std::size_t index = 0; index < plan.step_count; ++index) {
+        const auto &step = plan.steps[index];
+        if (step.target != InitTarget::demodulator || step.kind != InitStepKind::write ||
+            step.reg > 0xFFFF || step.value > 0xFFFF) {
+            state->machine.stage = DemodSyncStage::failed;
+            sync_result.status = DemodSyncStatus::failed;
+            sync_result.io_result = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            return sync_result;
+        }
+        sync_result.io_result = write_demodulator(static_cast<std::uint16_t>(step.reg),
+            static_cast<std::uint16_t>(step.value));
+        if (sync_result.io_result.code != DTV_INTERNAL_RESULT_OK) {
+            state->machine.stage = DemodSyncStage::failed;
+            sync_result.status = DemodSyncStatus::failed;
+            return sync_result;
+        }
+        ++sync_result.plan_steps_completed;
+    }
+    sync_result.immediate_plan_applied = plan.step_count != 0;
+    return sync_result;
+}
+
+DemodSyncIoResult CechI2cIo::poll_sync(DemodSyncIoState *state)
+{
+    DemodSyncIoResult sync_result{};
+    sync_result.io_result = result(DTV_INTERNAL_RESULT_OK);
+    if (state == nullptr || !state->started) {
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return sync_result;
+    }
+
+    auto &machine = state->machine;
+    if (machine.stage == DemodSyncStage::complete ||
+        machine.stage == DemodSyncStage::failed ||
+        machine.stage == DemodSyncStage::recovery_failed) {
+        DemodInitPlan plan{};
+        sync_result.status = torne::cech_zd1j::advance_demod_sync(
+            &machine, true, true, true, 0, 0, nullptr, &plan,
+            &sync_result.poll_interval_ms);
+        return sync_result;
+    }
+    if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+        machine.stage = DemodSyncStage::failed;
+        sync_result.status = DemodSyncStatus::failed;
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_CANCELLED);
+        return sync_result;
+    }
+    if (io_ == nullptr || io_->clock == nullptr || io_->clock->monotonic_now_ns == nullptr) {
+        machine.stage = DemodSyncStage::failed;
+        sync_result.status = DemodSyncStatus::failed;
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        return sync_result;
+    }
+
+    const auto now_ms = io_->clock->monotonic_now_ns(io_->clock->user) / 1000000;
+    if (machine.stage == DemodSyncStage::await_coff_cpil &&
+        now_ms < machine.coff_started_ms + 10U) {
+        sync_result.status = DemodSyncStatus::pending;
+        sync_result.poll_interval_ms = 10;
+        return sync_result;
+    }
+    if (machine.stage == DemodSyncStage::viterbi_start ||
+        machine.stage == DemodSyncStage::failure_recovery) {
+        DemodInitPlan plan{};
+        sync_result.status = torne::cech_zd1j::advance_demod_sync(
+            &machine, true, true, true, now_ms, 0, nullptr, &plan,
+            &sync_result.poll_interval_ms);
+        return sync_result;
+    }
+
+    std::uint16_t register_568 = 0;
+    sync_result.io_result = read_demodulator(568, &register_568);
+    if (sync_result.io_result.code != DTV_INTERNAL_RESULT_OK) {
+        DemodInitPlan plan{};
+        sync_result.status = torne::cech_zd1j::advance_demod_sync(
+            &machine, false, false, false,
+            io_->clock->monotonic_now_ns(io_->clock->user) / 1000000,
+            0, nullptr, &plan,
+            &sync_result.poll_interval_ms);
+        return sync_result;
+    }
+
+    const std::uint16_t viterbi_registers[3]{};
+    LockObservation observation{};
+    if (observe_lock(true, register_568, viterbi_registers, &observation) ==
+        LockReadResult::read_error) {
+        machine.stage = DemodSyncStage::failed;
+        sync_result.status = DemodSyncStatus::failed;
+        sync_result.io_result = result(DTV_INTERNAL_RESULT_INTERNAL);
+        return sync_result;
+    }
+
+    std::uint16_t register_188 = 0;
+    bool register_188_read_succeeded = true;
+    if (machine.stage == DemodSyncStage::await_coff_cpil && observation.coff_cpil &&
+        !machine.differential && !observation.lmod4) {
+        sync_result.io_result = read_demodulator(188, &register_188);
+        register_188_read_succeeded = sync_result.io_result.code == DTV_INTERNAL_RESULT_OK;
+    }
+
+    const auto observation_now_ms =
+        io_->clock->monotonic_now_ns(io_->clock->user) / 1000000;
+    DemodInitPlan plan{};
+    sync_result.status = torne::cech_zd1j::advance_demod_sync(
+        &machine, true, register_188_read_succeeded, true, observation_now_ms, register_188,
+        &observation, &plan, &sync_result.poll_interval_ms);
+    if (!register_188_read_succeeded) return sync_result;
+    if (plan.step_count == 0) return sync_result;
+
+    sync_result.recovery_attempted = machine.stage == DemodSyncStage::failure_recovery;
+    for (std::size_t index = 0; index < plan.step_count; ++index) {
+        const auto &step = plan.steps[index];
+        if (step.target != InitTarget::demodulator || step.reg > 0xFFFF ||
+            step.value > 0xFFFF || step.mask > 0xFFFF) {
+            sync_result.io_result = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            break;
+        }
+        if (step.kind == InitStepKind::write) {
+            sync_result.io_result = write_demodulator(static_cast<std::uint16_t>(step.reg),
+                static_cast<std::uint16_t>(step.value));
+        } else if (step.kind == InitStepKind::masked_write) {
+            std::uint16_t current = 0;
+            sync_result.io_result = read_demodulator(static_cast<std::uint16_t>(step.reg),
+                &current);
+            if (sync_result.io_result.code == DTV_INTERNAL_RESULT_OK)
+                sync_result.io_result = write_demodulator(static_cast<std::uint16_t>(step.reg),
+                    static_cast<std::uint16_t>((current & step.mask) | step.value));
+        } else {
+            sync_result.io_result = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        }
+        if (sync_result.io_result.code != DTV_INTERNAL_RESULT_OK) break;
+        ++sync_result.plan_steps_completed;
+    }
+    if (sync_result.io_result.code != DTV_INTERNAL_RESULT_OK) {
+        DemodInitPlan recovery_plan{};
+        sync_result.status = torne::cech_zd1j::advance_demod_sync(
+            &machine, true, true, false, observation_now_ms, 0, nullptr, &recovery_plan,
+            &sync_result.poll_interval_ms);
+        return sync_result;
+    }
+    sync_result.immediate_plan_applied = true;
+    if (sync_result.recovery_attempted) sync_result.recovery_succeeded = true;
+    if (machine.stage == DemodSyncStage::viterbi_start ||
+        machine.stage == DemodSyncStage::failure_recovery) {
+        const auto plan_applied_now_ms =
+            io_->clock->monotonic_now_ns(io_->clock->user) / 1000000;
+        DemodInitPlan completed_plan{};
+        sync_result.status = torne::cech_zd1j::advance_demod_sync(
+            &machine, true, true, true, plan_applied_now_ms, 0, &observation, &completed_plan,
+            &sync_result.poll_interval_ms);
+    }
+    return sync_result;
+}
+
 dtv_internal_result CechI2cIo::read_tuner(std::uint8_t reg, std::uint16_t *value)
 {
     if (value == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
@@ -149,6 +374,19 @@ dtv_internal_result CechI2cIo::write_tuner(std::uint8_t reg, std::uint16_t value
     std::uint8_t bytes[3]{reg, 0, 0};
     write_be16(bytes + 1, value);
     return transact(0xC0, 1, bytes, {});
+}
+
+dtv_internal_result CechI2cIo::apply_tune_plan(const TunePlan &plan)
+{
+    // 公開tune caller未接合。呼出し側は最初のI/O前にbegin_effectを呼ぶ。
+    if (plan.write_count > sizeof(plan.writes) / sizeof(plan.writes[0]))
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    for (std::size_t index = 0; index < plan.write_count; ++index) {
+        const auto &write = plan.writes[index];
+        const auto transferred = write_tuner(write.address, write.value);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    }
+    return result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result CechI2cIo::initialize_cursor()

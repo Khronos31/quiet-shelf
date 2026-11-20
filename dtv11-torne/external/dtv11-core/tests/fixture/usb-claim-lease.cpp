@@ -44,6 +44,9 @@ extern const dtv::spi::l3_model_record dtv_l3_model_scanfixture_scan_model_alias
 extern "C" int dtv_public_test_receiver_transition(dtv_enclosure *);
 void set_scan_group_case(unsigned);
 void set_scan_public_open_case(unsigned);
+unsigned scan_open_initialize_call_count();
+std::size_t scan_open_initialize_io_count_value();
+unsigned scan_open_stop_call_count();
 void set_scan_card_reply_mode(unsigned);
 void set_scan_card_transport_drop_reply(bool);
 void set_scan_card_t1_exchange_mode(unsigned);
@@ -6643,6 +6646,103 @@ int public_open_error_boundaries()
     return 0;
 }
 
+int public_open_initialize_failure()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    backend->complete_all = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 150), snapshot(context, 4, 151)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    set_scan_public_open_case(19);
+    const auto input_before = backend->endpoint_submission_count(0x81) +
+        backend->endpoint_submission_count(0x82);
+    const auto output_before = backend->endpoint_submission_count(0x02);
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    const auto opened = dtv_open_enclosure(root, nullptr, &open_error);
+    const auto input_after = backend->endpoint_submission_count(0x81) +
+        backend->endpoint_submission_count(0x82);
+    const auto output_after = backend->endpoint_submission_count(0x02);
+    if (opened != DTV_ERROR_USB_IO || open_error.code != DTV_ERROR_USB_IO ||
+        scan_open_initialize_call_count() != 1 ||
+        scan_open_initialize_io_count_value() == 0 || input_after != input_before ||
+        output_after != output_before + 1 || scan_open_stop_call_count() != 1) return 3;
+    dtv_error close_error{};
+    close_error.struct_size = sizeof(close_error);
+    const auto close_result = dtv_close_enclosure(root, nullptr, &close_error);
+    dtv_error state_error{};
+    state_error.struct_size = sizeof(state_error);
+    const auto close_state = dtv_get_enclosure_close_state(root, &state_error);
+    const auto stop_calls = scan_open_stop_call_count();
+    if (close_result != DTV_CLOSE_CLOSED || close_error.code != DTV_ERROR_OK ||
+        close_state != DTV_CLOSE_CLOSED || state_error.code != DTV_ERROR_USB_IO ||
+        stop_calls != 1) {
+        std::fprintf(stderr,
+            "public_open_initialize_failure close: result=%u error=%d state=%u state_error=%d stop_calls=%u\n",
+            close_result, close_error.code, close_state, state_error.code, stop_calls);
+        return 4;
+    }
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return 0;
+}
+
+int public_open_initialize_success()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    backend->complete_all = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 152), snapshot(context, 4, 153)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    set_scan_public_open_case(20);
+    const auto input_before = backend->endpoint_submission_count(0x81) +
+        backend->endpoint_submission_count(0x82);
+    const auto output_before = backend->endpoint_submission_count(0x02);
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    const auto opened = dtv_open_enclosure(root, nullptr, &open_error);
+    const auto input_after = backend->endpoint_submission_count(0x81) +
+        backend->endpoint_submission_count(0x82);
+    const auto output_after = backend->endpoint_submission_count(0x02);
+    if (opened != DTV_ERROR_OK || open_error.code != DTV_ERROR_OK) return 31;
+    if (scan_open_initialize_call_count() != 1) return 32;
+    if (scan_open_initialize_io_count_value() == 0) return 33;
+    if (input_after <= input_before) return 34;
+    if (output_after != output_before + 1) return 35;
+    if (scan_open_identify_size() != 64) return 36;
+    dtv_error close_error{};
+    close_error.struct_size = sizeof(close_error);
+    if (dtv_close_enclosure(root, nullptr, &close_error) != DTV_CLOSE_CLOSED ||
+        close_error.code != DTV_ERROR_OK || scan_open_stop_call_count() != 1) return 4;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return 0;
+}
+
 int public_open_independent_enclosures()
 {
     auto backend = std::make_shared<FakeBackend>();
@@ -6788,6 +6888,17 @@ extern "C" unsigned dtv_public_test_control_free_count()
 int main(int argc, char **argv)
 {
     dtv_load_scanfixture();
+    if (argc == 2 && std::strcmp(argv[1], "--public-open-init-short") == 0) {
+        if (const int result = public_open_initialize_success(); result != 0) {
+            std::fprintf(stderr, "public_open_initialize_success failed: %d\n", result);
+            return result;
+        }
+        if (const int result = public_open_initialize_failure(); result != 0) {
+            std::fprintf(stderr, "public_open_initialize_failure failed: %d\n", result);
+            return 10 + result;
+        }
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--lnb") == 0) {
         const int result = public_lnb_roundtrip();
         if (result != 0) {
@@ -6912,6 +7023,10 @@ int main(int argc, char **argv)
     if (const int result = public_open_error_boundaries(); result != 0) {
         std::fprintf(stderr, "public_open_error_boundaries failed: %d\n", result);
         return 90 + result;
+    }
+    if (const int result = public_open_initialize_failure(); result != 0) {
+        std::fprintf(stderr, "public_open_initialize_failure failed: %d\n", result);
+        return 91 + result;
     }
     if (const int result = public_open_independent_enclosures(); result != 0) {
         std::fprintf(stderr, "public_open_independent_enclosures failed: %d\n", result);
