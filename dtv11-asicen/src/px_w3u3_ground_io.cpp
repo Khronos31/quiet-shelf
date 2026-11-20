@@ -364,9 +364,11 @@ dtv_internal_result tune_ground_by_frequency(
     if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     (void)operation_epoch;
 
-    result = write_demodulator(timed_request, *session, ground_demodulator, 0x25, 0x00);
-    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    result = write_demodulator(timed_request, *session, ground_demodulator, 0x23, 0x4d);
+    const ::asicen::detail::ground_io::IoContext context{
+        session->io, timed_request.timeout, timed_request.cancelled};
+    result = ::asicen::detail::ground_io::write_ground_tune_prepare(
+        context, ground_demodulator,
+        "PX-W3U3 I2C応答長が不正です", "PX-W3U3 I2C statusが失敗を示しました");
     if (result.code != DTV_INTERNAL_RESULT_OK) return result;
 
     for (std::size_t count = 0; count < 4; ++count) {
@@ -402,11 +404,10 @@ dtv_internal_result tune_ground_by_frequency(
         }
     }
 
-    for (const auto &reg : ground_tune_finish) {
-        result = write_demodulator(timed_request, *session, ground_demodulator,
-                                   reg.address, reg.value);
-        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    }
+    result = ::asicen::detail::ground_io::write_ground_tune_finish(
+        context, ground_demodulator,
+        "PX-W3U3 I2C応答長が不正です", "PX-W3U3 I2C statusが失敗を示しました");
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     while (true) {
         if (timed_request.cancelled != nullptr &&
             timed_request.cancelled->load(std::memory_order_acquire))

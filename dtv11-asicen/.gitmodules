@@ -1,0 +1,3 @@
+[submodule "external/dtv11-core"]
+	path = external/dtv11-core
+	url = https://github.com/Khronos31/dtv11-core.git

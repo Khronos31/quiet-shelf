@@ -355,10 +355,11 @@ dtv_internal_result tune_ground_by_frequency_khz(
     if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     (void)operation_epoch;
 
-    for (const auto &reg : ground_tune_prepare) {
-        result = write_demodulator(timed_request, *session, reg.reg, reg.value);
-        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    }
+    const ::asicen::detail::ground_io::IoContext context{
+        session->io, timed_request.timeout, timed_request.cancelled};
+    result = ::asicen::detail::ground_io::write_ground_tune_prepare(
+        context, ground_demodulator, response_length_diagnostic, response_status_diagnostic);
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     for (std::size_t count = 0; count < ground_tune_max_attempts; ++count) {
         result = write_rf_tuner(timed_request, *session, 0x13, 0x02);
         if (result.code != DTV_INTERNAL_RESULT_OK) return result;
@@ -389,10 +390,9 @@ dtv_internal_result tune_ground_by_frequency_khz(
             if (result.code != DTV_INTERNAL_RESULT_OK) return result;
         }
     }
-    for (const auto &reg : ground_tune_finish) {
-        result = write_demodulator(timed_request, *session, reg.reg, reg.value);
-        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    }
+    result = ::asicen::detail::ground_io::write_ground_tune_finish(
+        context, ground_demodulator, response_length_diagnostic, response_status_diagnostic);
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
     while (true) {
         if (timed_request.cancelled != nullptr &&
             timed_request.cancelled->load(std::memory_order_acquire))

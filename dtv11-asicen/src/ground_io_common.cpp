@@ -153,6 +153,41 @@ dtv_internal_result write_demodulator(const dtv::spi::PublicTuneRequest &request
                              length_diagnostic, status_diagnostic);
 }
 
+namespace {
+
+// 固定のprepare/finish表を順に適用し、最初のwrite errorを返す。
+dtv_internal_result write_demodulator_table(
+    const IoContext &context, std::uint8_t address,
+    std::span<const ::asicen::detail::ground_tune::RegisterValue> writes,
+    const char *length_diagnostic, const char *status_diagnostic)
+{
+    auto result = make_result(DTV_INTERNAL_RESULT_OK);
+    for (const auto &write : writes) {
+        result = write_demodulator(context, address, write.reg, write.value,
+                                   length_diagnostic, status_diagnostic);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+    }
+    return result;
+}
+
+}
+
+dtv_internal_result write_ground_tune_prepare(
+    const IoContext &context, std::uint8_t address,
+    const char *length_diagnostic, const char *status_diagnostic)
+{
+    return write_demodulator_table(context, address,
+        ::asicen::detail::ground_tune::prepare, length_diagnostic, status_diagnostic);
+}
+
+dtv_internal_result write_ground_tune_finish(
+    const IoContext &context, std::uint8_t address,
+    const char *length_diagnostic, const char *status_diagnostic)
+{
+    return write_demodulator_table(context, address,
+        ::asicen::detail::ground_tune::finish, length_diagnostic, status_diagnostic);
+}
+
 dtv_internal_result write_demodulator_bytes(const IoContext &context, std::uint8_t address,
                                             std::uint8_t reg,
                                             std::span<const std::uint8_t> values, bool no_stop,

@@ -9,10 +9,20 @@
 
 namespace asicen::px_s3u2::detail {
 
+dtv_internal_result write_ground_tune_prepare(
+    const ::asicen::detail::ground_io::IoContext &context,
+    std::uint8_t demodulator, const char *length_diagnostic,
+    const char *status_diagnostic);
+
 dtv_internal_result write_ground_tuner_registers(
     const ::asicen::detail::ground_io::IoContext &context,
     std::uint8_t demodulator, std::span<const std::uint8_t, 6> values,
     const char *length_diagnostic, const char *status_diagnostic);
+
+dtv_internal_result write_ground_tune_finish(
+    const ::asicen::detail::ground_io::IoContext &context,
+    std::uint8_t demodulator, const char *length_diagnostic,
+    const char *status_diagnostic);
 
 }
 

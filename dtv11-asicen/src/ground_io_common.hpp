@@ -2,6 +2,8 @@
 #ifndef ASICEN_GROUND_IO_COMMON_HPP
 #define ASICEN_GROUND_IO_COMMON_HPP
 
+#include "ground_tune_common.hpp"
+
 #include <dtv/spi/device_ops.hpp>
 
 #include <atomic>
@@ -25,6 +27,10 @@ dtv_internal_result read_demodulator(const IoContext &, std::uint8_t, std::uint8
                                      std::uint8_t, std::uint8_t *, const char *, const char *);
 dtv_internal_result write_demodulator(const IoContext &, std::uint8_t, std::uint8_t,
                                       std::uint8_t, const char *, const char *);
+dtv_internal_result write_ground_tune_prepare(const IoContext &, std::uint8_t,
+                                              const char *, const char *);
+dtv_internal_result write_ground_tune_finish(const IoContext &, std::uint8_t,
+                                             const char *, const char *);
 dtv_internal_result write_demodulator_bytes(const IoContext &, std::uint8_t, std::uint8_t,
                                             std::span<const std::uint8_t>, bool,
                                             const char *, const char *);
