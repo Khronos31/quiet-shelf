@@ -184,7 +184,11 @@ public:
         std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
         std::uint64_t generation,
         dtv_internal_result (*)(void *, const UsbRuntimePacket *), void *,
+        bool handoff_first_completion,
         std::uint64_t *request_id);
+    dtv_internal_result wait_backend_admission(std::uint64_t request_id,
+                                               const dtv_runtime_clock *,
+                                               std::uint64_t deadline_ns);
     dtv_internal_result cancel(std::uint64_t request_id);
     dtv_internal_result wait_request(std::uint64_t request_id,
                                      const dtv_runtime_clock *, std::uint64_t deadline_ns,

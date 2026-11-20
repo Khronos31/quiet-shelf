@@ -547,6 +547,7 @@ struct EnclosureRuntime::State {
         std::shared_ptr<void> dispatch_owner;
         bool continuous = false;
         bool initial_published = false;
+        bool handoff_first_completion = false;
         dtv_internal_result (*sink)(void *, const UsbRuntimePacket *) = nullptr;
         void *sink_user = nullptr;
         std::vector<unsigned char> buffer;
@@ -653,10 +654,12 @@ struct EnclosureRuntime::State {
         bool notify_sink = false;
         {
             std::lock_guard lock(mutex);
-            if (request->continuous && request->initial_published) {
+            if (request->continuous &&
+                (request->initial_published || request->handoff_first_completion)) {
                 request->terminal_requested = true;
                 request->terminal = terminal;
                 request->terminal_result = result;
+                request->initial_published = true;
                 notify_sink = true;
                 condition.notify_all();
             } else {
@@ -741,6 +744,7 @@ struct EnclosureRuntime::State {
         std::size_t handle_index, std::uint8_t endpoint, std::size_t input_capacity,
         std::uint64_t generation,
         dtv_internal_result (*sink)(void *, const UsbRuntimePacket *), void *sink_user,
+        bool handoff_first_completion,
         std::uint64_t *request_id)
     {
         if (sink == nullptr || input_capacity == 0 || request_id == nullptr ||
@@ -754,6 +758,7 @@ struct EnclosureRuntime::State {
             request->continuous = true;
             request->sink = sink;
             request->sink_user = sink_user;
+            request->handoff_first_completion = handoff_first_completion;
             request->generation = generation;
             request->buffer.resize(input_capacity);
             request->completion.bytes.resize(input_capacity);
@@ -1005,6 +1010,7 @@ struct EnclosureRuntime::State {
             } else {
                 std::lock_guard lock(mutex);
                 request->reached_backend = true;
+                condition.notify_all();
             }
         }
     }
@@ -1090,17 +1096,21 @@ struct EnclosureRuntime::State {
             if (!request->continuous || !request->initial_published ||
                 terminal != UsbRuntimeTerminal::completed || stopping || request->terminal_requested) {
                 if (!request->continuous || !request->initial_published) {
-                    if (request->continuous && terminal == UsbRuntimeTerminal::completed &&
-                        !stopping && !request->terminal_requested) {
+                    if (request->continuous && (request->handoff_first_completion ||
+                        (terminal == UsbRuntimeTerminal::completed && !stopping &&
+                         !request->terminal_requested))) {
                         UsbRuntimePacket packet;
                         packet.request_id = request->id;
                         packet.submit_sequence = request->submit_sequence;
                         packet.generation = request->generation;
                         packet.handle_index = request->handle_index;
                         packet.endpoint = request->endpoint;
+                        packet.terminal = terminal;
+                        packet.result = result;
                         packet.actual_length = static_cast<std::size_t>((std::max)(request->actual_length, 0));
-                        packet.bytes = std::span<const unsigned char>(request->buffer.data(),
-                            (std::min)(packet.actual_length, request->buffer.size()));
+                        if (terminal == UsbRuntimeTerminal::completed)
+                            packet.bytes = std::span<const unsigned char>(request->buffer.data(),
+                                (std::min)(packet.actual_length, request->buffer.size()));
                         lock.unlock();
                         const auto sink_result = call_callback([&] {
                             return request->sink(request->sink_user, &packet);
@@ -1109,6 +1119,34 @@ struct EnclosureRuntime::State {
                         if (sink_result.code != DTV_INTERNAL_RESULT_OK) {
                             terminal = UsbRuntimeTerminal::failed;
                             result = sink_result;
+                        }
+                        if (request->handoff_first_completion) {
+                            request->initial_published = true;
+                            if (terminal != UsbRuntimeTerminal::completed || stopping ||
+                                request->terminal_requested) {
+                                request->terminal_requested = true;
+                                request->terminal = terminal;
+                                request->terminal_result = result;
+                                condition.notify_all();
+                                continue;
+                            }
+                            if (next_submit_sequence != 0) {
+                                request->submit_sequence = next_submit_sequence++;
+                                request->callback_received = false;
+                                request->actual_length = 0;
+                                try { pending.push_back(request->id); }
+                                catch (...) {
+                                    request->terminal_requested = true;
+                                    request->terminal = UsbRuntimeTerminal::failed;
+                                    request->terminal_result = exception_result();
+                                }
+                                condition.notify_all();
+                            } else {
+                                request->terminal_requested = true;
+                                request->terminal = UsbRuntimeTerminal::failed;
+                                request->terminal_result = make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+                            }
+                            continue;
                         }
                     }
                     push_completed_locked(request, terminal, result,
@@ -1354,10 +1392,31 @@ dtv_internal_result EnclosureRuntime::submit_shared_bulk_in(
     std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
     std::uint64_t generation,
     dtv_internal_result (*sink)(void *, const UsbRuntimePacket *), void *sink_user,
+    bool handoff_first_completion,
     std::uint64_t *request_id)
 {
     return state_->queue_shared_request(handle_index, endpoint, capacity, generation,
-                                        sink, sink_user, request_id);
+                                        sink, sink_user, handoff_first_completion, request_id);
+}
+
+dtv_internal_result EnclosureRuntime::wait_backend_admission(
+    std::uint64_t request_id, const dtv_runtime_clock *clock, std::uint64_t deadline_ns)
+{
+    std::unique_lock lock(state_->mutex);
+    const auto found = state_->requests.find(request_id);
+    if (found == state_->requests.end()) return invalid();
+    const auto request = found->second;
+    for (;;) {
+        if (request->reached_backend) return make_result(DTV_INTERNAL_RESULT_OK);
+        if (request->terminal_requested || request->completion_ready)
+            return request->terminal_result.code == DTV_INTERNAL_RESULT_OK
+                ? make_result(DTV_INTERNAL_RESULT_USB_IO) : request->terminal_result;
+        lock.unlock();
+        const auto checkpoint = claim_checkpoint(clock, nullptr, deadline_ns);
+        lock.lock();
+        if (checkpoint.code != DTV_INTERNAL_RESULT_OK) return checkpoint;
+        state_->condition.wait_for(lock, std::chrono::milliseconds(5));
+    }
 }
 
 dtv_internal_result EnclosureRuntime::cancel(std::uint64_t request_id)

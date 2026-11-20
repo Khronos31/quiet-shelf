@@ -3,6 +3,7 @@
 #define PIX_DT295_INTERNAL_HPP
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <span>
 
@@ -56,6 +57,20 @@ struct State {
 };
 
 dtv_internal_result open(dtv_context *, const dtv_usb_io *, const dtv_open_args *);
+dtv_internal_result initialize_open(dtv_context *,
+                                     std::span<const dtv::spi::PublicOpenIo>,
+                                     dtv_timeout, const std::atomic<bool> *);
+// Core92 data不要経路向けcallback。公開ModelEntryへの登録は別単位。
+bool identify_requires_initial_data(dtv_context *);
+dtv_internal_result identify_after_initialize(
+    dtv_context *, std::span<const unsigned char>, dtv_timeout,
+    const std::atomic<bool> *);
+dtv_internal_result plan_open(std::span<const dtv_usb_candidate_info>,
+                              std::span<const dtv_function>,
+                              std::span<dtv::spi::PublicOpenPlan>, std::size_t *);
+dtv_internal_result identify_shared(
+    dtv_context *, std::span<const unsigned char>, dtv_timeout,
+    const std::atomic<bool> *, dtv::spi::PublicOpenSession *);
 dtv_internal_result identify(dtv_context *, dtv_identify_info *, dtv_timeout);
 dtv_internal_result close(dtv_context *, dtv_timeout);
 dtv_internal_result plan_tune(dtv_context *, const dtv::spi::PublicTuneRequest *,

@@ -22,6 +22,7 @@ constexpr int32_t kInvalid = DTV_INTERNAL_RESULT_INVALID_ARGUMENT;
 constexpr int32_t kUnsupported = DTV_INTERNAL_RESULT_UNSUPPORTED;
 constexpr int32_t kUsbIo = DTV_INTERNAL_RESULT_USB_IO;
 constexpr int32_t kTimeout = DTV_INTERNAL_RESULT_TIMEOUT;
+constexpr int32_t kCancelled = DTV_INTERNAL_RESULT_CANCELLED;
 constexpr int32_t kInternal = DTV_INTERNAL_RESULT_INTERNAL;
 constexpr int32_t kNotReady = DTV_INTERNAL_RESULT_NOT_READY;
 constexpr uint32_t kFirmwareKey = 25;
@@ -686,61 +687,63 @@ dtv_internal_result satellite_initialization_and_sleep(const dtv_usb_io &io,
 dtv_internal_result issue_lease_command(const dtv_usb_io &io, uint32_t command,
                                         uint32_t argument, dtv_timeout timeout);
 
-dtv_internal_result recover_timed_out_lease_acquire(State &state)
+dtv_internal_result recover_timed_out_lease_acquire(State &state,
+                                                     const dtv_usb_io &io)
 {
     // 呼び出し元deadline後もcommand 10の成否を判定するため、新たに最大1秒だけ観測する。
     const dtv_timeout recovery_timeout{1000, 0};
-    auto result = wait_zero(state.io, kMainCommand, recovery_timeout, 1000);
+    auto result = wait_zero(io, kMainCommand, recovery_timeout, 1000);
     if (!succeeded(result)) {
         return result;
     }
     uint32_t status = 0;
-    result = read_u32(state.io, kMainResult, &status, recovery_timeout);
+    result = read_u32(io, kMainResult, &status, recovery_timeout);
     if (!succeeded(result) || status != 0) {
         return succeeded(result) ? make_result(kInternal, status) : result;
     }
     uint32_t owner = 0;
-    result = read_u32(state.io, 0xE1F60, &owner, recovery_timeout);
+    result = read_u32(io, 0xE1F60, &owner, recovery_timeout);
     if (!succeeded(result) || owner != 1) {
         return succeeded(result) ? make_result(kInternal, owner) : result;
     }
 
     // command 10の成功とowner=1を確認した場合だけ、解放command 11を一度発行する。
     state.lease = true;
-    result = write_u32(state.io, kMainCommand, 11, recovery_timeout);
+    result = write_u32(io, kMainCommand, 11, recovery_timeout);
     if (!succeeded(result)) {
         return result;
     }
-    result = wait_zero(state.io, kMainCommand, recovery_timeout, 1000);
+    result = wait_zero(io, kMainCommand, recovery_timeout, 1000);
     if (result.code == kTimeout) {
         // 最初の待機が尽きた後に独立した最大1秒を設け、command 11は再発行せず完了だけ観測する。
         const dtv_timeout recheck_timeout{1000, 0};
-        result = wait_zero(state.io, kMainCommand, recheck_timeout, 1000);
+        result = wait_zero(io, kMainCommand, recheck_timeout, 1000);
     }
     if (!succeeded(result)) {
         return result;
     }
     // command 11完了後に、元deadlineとは独立した最大1秒でstatusとownerを読み確定する。
     const dtv_timeout observe_timeout{1000, 0};
-    result = read_u32(state.io, kMainResult, &status, observe_timeout);
+    result = read_u32(io, kMainResult, &status, observe_timeout);
     if (!succeeded(result) || status != 0) {
         return succeeded(result) ? make_result(kInternal, status) : result;
     }
-    result = read_u32(state.io, 0xE1F60, &owner, observe_timeout);
+    result = read_u32(io, 0xE1F60, &owner, observe_timeout);
     if (succeeded(result) && owner == 0) {
         state.lease = false;
     }
     return result;
 }
 
-dtv_internal_result acquire_lease(State &state, dtv_timeout timeout)
+dtv_internal_result acquire_lease(State &state, const dtv_usb_io &io,
+                                  dtv_timeout timeout)
 {
-    const auto result = issue_lease_command(state.io, 10, 0, timeout);
+    const auto result = issue_lease_command(io, 10, 0, timeout);
     if (succeeded(result)) {
         state.lease = true;
     } else if (result.code == kTimeout) {
         // Coreの失敗cleanupに所有状態を伝え、確認済みleaseの解放を続けられるようにする。
-        (void)recover_timed_out_lease_acquire(state);
+        (void)recover_timed_out_lease_acquire(state, io);
     }
     return result;
 }
@@ -778,13 +781,27 @@ dtv_internal_result issue_lease_command(const dtv_usb_io &io, uint32_t command,
     return succeeded(result) && status != 0 ? make_result(kInternal, status) : result;
 }
 
-dtv_internal_result prepare_hardware(State &state, dtv_timeout timeout)
+dtv_internal_result prepare_hardware(State &state, const dtv_usb_io &io,
+                                     dtv_timeout timeout,
+                                     const std::atomic<bool> *cancel)
 {
-    auto result = i2c_controller_prepare(state.io, timeout);
-    if (succeeded(result)) result = initial_rf_reset(state.io, timeout);
-    if (succeeded(result)) result = terrestrial_initialization(state.io, timeout);
-    if (succeeded(result)) result = satellite_initialization_and_sleep(state.io, timeout);
-    if (succeeded(result)) result = acquire_lease(state, timeout);
+    auto result = i2c_controller_prepare(io, timeout);
+    if (succeeded(result) && cancel != nullptr && cancel->load()) {
+        return make_result(kCancelled);
+    }
+    if (succeeded(result)) result = initial_rf_reset(io, timeout);
+    if (succeeded(result) && cancel != nullptr && cancel->load()) {
+        return make_result(kCancelled);
+    }
+    if (succeeded(result)) result = terrestrial_initialization(io, timeout);
+    if (succeeded(result) && cancel != nullptr && cancel->load()) {
+        return make_result(kCancelled);
+    }
+    if (succeeded(result)) result = satellite_initialization_and_sleep(io, timeout);
+    if (succeeded(result) && cancel != nullptr && cancel->load()) {
+        return make_result(kCancelled);
+    }
+    if (succeeded(result)) result = acquire_lease(state, io, timeout);
     return result;
 }
 
@@ -1031,6 +1048,16 @@ dtv_internal_result fail_state(State &state, uint32_t phase, dtv_internal_result
         : sizeof("PIX-DT295 state UNKNOWN") - 1;
     dtv_internal_result_set_diagnostic(&result, diagnostic, diagnostic_size);
     return result;
+}
+
+dtv_internal_result fail_open_initialize(State &state, uint32_t phase,
+                                         dtv_internal_result cause)
+{
+    state.failed = true;
+    state.failure_phase = phase;
+    state.failure_result = cause;
+    state.prepared = false;
+    return cause;
 }
 
 dtv_internal_result identify_runtime(State &state, dtv_identify_info *info,
@@ -1383,6 +1410,93 @@ dtv_internal_result open(dtv_context *context, const dtv_usb_io *io,
         return make_result(kOk);
     }
     return fail_state(*state, 5, make_result(DTV_INTERNAL_RESULT_NOT_READY));
+}
+
+dtv_internal_result initialize_open(
+    dtv_context *context, std::span<const dtv::spi::PublicOpenIo> ios,
+    dtv_timeout timeout, const std::atomic<bool> *cancel)
+{
+    auto *state = static_cast<State *>(context);
+    if (state == nullptr || state->opened || state->failed || ios.size() != 1 ||
+        ios[0].handle_index != 0 || ios[0].io == nullptr ||
+        ios[0].io->control == nullptr || ios[0].io->clock == nullptr ||
+        ios[0].io->clock->monotonic_now_ns == nullptr ||
+        ios[0].io->clock->delay_until == nullptr) {
+        return make_result(kInvalid);
+    }
+    state->prepared = false;
+    const auto &io = *ios[0].io;
+    if (cancel != nullptr && cancel->load()) {
+        return fail_open_initialize(*state, 1, make_result(kCancelled));
+    }
+
+    ReadOnlyObservation observation{};
+    auto result = observe_state(io, timeout, &observation);
+    if (!succeeded(result)) return fail_open_initialize(*state, 1, result);
+    if (cancel != nullptr && cancel->load()) {
+        return fail_open_initialize(*state, 1, make_result(kCancelled));
+    }
+    if (!is_runtime_observation(observation)) {
+        return fail_open_initialize(*state, 5, make_result(kNotReady));
+    }
+    result = read_descriptor(io, timeout);
+    if (!succeeded(result)) return fail_open_initialize(*state, 2, result);
+    if (cancel != nullptr && cancel->load()) {
+        return fail_open_initialize(*state, 2, make_result(kCancelled));
+    }
+
+    state->device_state = DeviceState::runtime;
+    state->opened = true;
+    result = prepare_hardware(*state, io, timeout, cancel);
+    if (!succeeded(result)) return fail_open_initialize(*state, 6, result);
+    state->prepared = true;
+    return make_result(kOk);
+}
+
+bool identify_requires_initial_data(dtv_context *)
+{
+    // DT295はcontrol観測で識別する方針。今回のcontextやopen観測には依存しない。
+    return false;
+}
+
+dtv_internal_result identify_after_initialize(
+    dtv_context *context, std::span<const unsigned char>, dtv_timeout,
+    const std::atomic<bool> *)
+{
+    if (context == nullptr) return make_result(kInvalid);
+    const auto &state = *static_cast<const State *>(context);
+    if (state.failed || state.device_state != DeviceState::runtime ||
+        !state.opened || !state.prepared || !state.lease) {
+        return make_result(kNotReady);
+    }
+    return make_result(kOk);
+}
+
+dtv_internal_result plan_open(
+    std::span<const dtv_usb_candidate_info> candidates,
+    std::span<const dtv_function> functions,
+    std::span<dtv::spi::PublicOpenPlan> plans, std::size_t *plan_count)
+{
+    if (plan_count == nullptr) return make_result(kInvalid);
+    *plan_count = 0;
+    if (plans.empty()) return make_result(kInvalid);
+    if (candidates.size() != 1 || functions.size() != 1 || functions[0] != 1) {
+        return make_result(kUnsupported);
+    }
+    if (!is_pix_dt295_candidate(candidates[0])) return make_result(kUnsupported);
+    plans[0] = {0, 0x81, 16384, 1, 65536, 1, false, false};
+    *plan_count = 1;
+    return make_result(kOk);
+}
+
+dtv_internal_result identify_shared(
+    dtv_context *context, std::span<const unsigned char>, dtv_timeout timeout,
+    const std::atomic<bool> *cancel,
+    dtv::spi::PublicOpenSession *session)
+{
+    if (session == nullptr) return make_result(kInvalid);
+    // Core92のdata不要経路では未呼出し。sessionや初回TSを作らずStateだけを確認する。
+    return identify_after_initialize(context, {}, timeout, cancel);
 }
 
 dtv_internal_result select_usb_group(const dtv_usb_candidate_info *candidates,

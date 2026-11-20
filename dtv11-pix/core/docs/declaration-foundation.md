@@ -1552,3 +1552,22 @@ PR87 では、公開選局（`dtv_tune_by_frequency` / `dtv_tune_by_channel`）�
 - **検証状況と位置づけ:**
   - 内部 fixture（`usb_claim_lease_contract` の `--runtime-retire` および `--card-events`）の成功を確認済み（first-green 実行時刻は未保存）。
   - 長い修正後の全 target 再走、Windows、NDK、実機 USB は未実施であり、製品 open 初期化・信号・実機完成を主張しない。PR81（筐体 close 改善）は別未マージであり、統合時に final-close 経路の調整を要する。公開 L3 および正本仕様の変更はない。
+
+
+
+## 任意open初期化I/Oの借用境界と閉鎖ライフサイクル（PR90、内部基盤）
+
+PR90 では、筐体オープン（`dtv_open_enclosure`）処理において、製品独自の初期化パケット送信等を可能にする任意の内部 SPI コールバック `PublicOpenOps::initialize` を追加している。製品側の利用仕様および詳細な契約規則は [product-integration.md](product-integration.md) を参照のこと。
+
+- **借用 I/O 境界とハンドル構造:**
+  - 選択された入力ハンドルごとに `PublicOpenIo`（`handle_index` および `const dtv_usb_io *io`）を介して control、bulk_out、bulk_in 転送を提供する（isochronous は非対応）。
+  - 各エントリおよび `dtv_usb_io` ビューはコールバック内限定で借用され、コールバック終了後に製品側で保持してはならない。
+- **順序配置と既存契約の維持:**
+  - Core ランタイム起動後、かつ初回 bulk-IN 要求の投入前にコールバックを実行する（全製品のハードウェア必須順とは規定しない）。
+  - コールバック成功後は、従来の計画に基づく初回 IN 要求の実受信完了、バイト列連結、および `identify` / `identify_shared` 呼び出し順序を完全に維持する（偽ペイロードや先行バインドは行わない）。
+- **障害時および閉鎖ライフサイクル:**
+  - コールバック失敗・キャンセル・タイムアウト時は直ちに I/O 受付を停止し、未完了要求の物理 retire を待機した上で製品 `stop` を最大 1 回呼び出してランタイムを停止する。
+  - `dtv_open_enclosure` は元エラーを返す。クリーンアップ（product stop および runtime stop）が正常に完了した場合の通常 `dtv_close_enclosure` は `CLOSED` / `DTV_ERROR_OK` を返し、`dtv_get_enclosure_close_state` は `CLOSED` とともに元のオープン失敗エラーを報告する（product stop や runtime stop 自体が失敗した場合はその停止エラーが close error や first_error に残り得ること、および retire 未完時は `DTV_CLOSE_PENDING` となることに留意）。
+- **検証状況と位置づけ:**
+  - 内部 fixture（`usb_claim_lease_contract --public-open-init-short`）にて、正常初期化（64-byte identify 成功）および失敗時クローズ（CLOSED / 元 USB_IO 報告）を観測済み。
+  - コールバック/close 競合、PENDING 継続、非同期物理 retire 安全は未観測であり、実装意図と観測事実を区別する。本 PR は内部 SPI 候補であり、公開 L3 仕様や正本 C ABI に変更はない。
