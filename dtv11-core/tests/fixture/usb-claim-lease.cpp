@@ -46,6 +46,11 @@ void set_scan_group_case(unsigned);
 void set_scan_public_open_case(unsigned);
 unsigned scan_open_initialize_call_count();
 std::size_t scan_open_initialize_io_count_value();
+unsigned scan_open_plan_call_count();
+std::size_t scan_open_plan_count_value();
+std::size_t scan_open_plan_handle_value(std::size_t);
+unsigned scan_open_plan_endpoint_value(std::size_t);
+std::size_t scan_open_plan_shared_depth_value(std::size_t);
 unsigned scan_open_stop_call_count();
 void set_scan_card_reply_mode(unsigned);
 void set_scan_card_transport_drop_reply(bool);
@@ -99,6 +104,7 @@ extern "C" int dtv_public_test_receiver_transition(dtv_enclosure *root)
         root, update).code == DTV_INTERNAL_RESULT_OK ? 0 : 1;
 }
 std::size_t scan_open_identify_size();
+unsigned scan_open_identify_call_count();
 bool scan_open_identify_is_blocked();
 void release_scan_open_identify();
 dtv::spi::PublicOpenSession scan_shared_open_session();
@@ -190,8 +196,13 @@ public:
     {
         std::lock_guard lock(async_mutex);
         ++submit_calls;
-        if (fail_submit || (fail_submit_call != 0 && submit_calls == fail_submit_call))
+        if (fail_submit || (fail_submit_call != 0 && submit_calls == fail_submit_call) ||
+            (fail_endpoint_submit_enabled && transfer->endpoint == fail_endpoint_submit)) {
+            if (fail_endpoint_submit_enabled && transfer->endpoint == fail_endpoint_submit)
+                fail_endpoint_submit_enabled = false;
+            ++failed_submit_count;
             return LIBUSB_ERROR_IO;
+        }
         if ((transfer->endpoint & LIBUSB_ENDPOINT_IN) == 0 && transfer->length > 0) {
             outputs.emplace_back(transfer->buffer, transfer->buffer + transfer->length);
         }
@@ -252,15 +263,21 @@ public:
         auto *transfer = *found;
         submitted.erase(found);
         const bool was_cancelled = cancelled.erase(transfer) != 0;
+        bool forced_error = false;
+        if (!was_cancelled && completion_error_counts[transfer->endpoint] != 0) {
+            --completion_error_counts[transfer->endpoint];
+            forced_error = true;
+        }
         if (!complete_all && ready_counts[transfer->endpoint] != 0) --ready_counts[transfer->endpoint];
         lock.unlock();
-        transfer->status = was_cancelled ? LIBUSB_TRANSFER_CANCELLED : LIBUSB_TRANSFER_COMPLETED;
+        transfer->status = was_cancelled ? LIBUSB_TRANSFER_CANCELLED
+            : forced_error ? LIBUSB_TRANSFER_ERROR : LIBUSB_TRANSFER_COMPLETED;
         const bool control = transfer->type == LIBUSB_TRANSFER_TYPE_CONTROL;
         const auto requested_length = control
             ? (transfer->length > static_cast<int>(LIBUSB_CONTROL_SETUP_SIZE)
                 ? static_cast<std::size_t>(transfer->length - LIBUSB_CONTROL_SETUP_SIZE) : 0)
             : static_cast<std::size_t>((std::max)(transfer->length, 0));
-        transfer->actual_length = was_cancelled ? 0
+        transfer->actual_length = was_cancelled || forced_error ? 0
             : static_cast<int>((std::min)(requested_length, actual_length_limit));
         const bool input = control
             ? (libusb_control_transfer_get_setup(transfer)->bmRequestType & LIBUSB_ENDPOINT_IN) != 0
@@ -366,6 +383,22 @@ public:
     {
         std::lock_guard lock(async_mutex);
         fail_submit_call = submit_calls + 1;
+    }
+    void fail_next_endpoint_submit(std::uint8_t endpoint)
+    {
+        std::lock_guard lock(async_mutex);
+        fail_endpoint_submit = endpoint;
+        fail_endpoint_submit_enabled = true;
+    }
+    void fail_next_endpoint_completion(std::uint8_t endpoint)
+    {
+        std::lock_guard lock(async_mutex);
+        ++completion_error_counts[endpoint];
+    }
+    unsigned failed_submit_count_value()
+    {
+        std::lock_guard lock(async_mutex);
+        return failed_submit_count;
     }
     bool wait_for_cancellations(unsigned count)
     {
@@ -523,6 +556,10 @@ public:
     bool fail_submit = false;
     unsigned submit_calls = 0;
     unsigned fail_submit_call = 0;
+    unsigned failed_submit_count = 0;
+    std::uint8_t fail_endpoint_submit = 0;
+    bool fail_endpoint_submit_enabled = false;
+    std::map<std::uint8_t, unsigned> completion_error_counts;
     std::size_t actual_length_limit = (std::numeric_limits<std::size_t>::max)();
     unsigned free_count = 0;
     unsigned cancel_count = 0;
@@ -6743,6 +6780,303 @@ int public_open_initialize_success()
     return 0;
 }
 
+int public_open_without_initial_data()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    set_scan_public_open_case(21);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 154), snapshot(context, 4, 155)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    backend->defer_next_control();
+    const auto control_before = backend->endpoint_submission_count(0);
+    const auto input_81_before = backend->endpoint_submission_count(0x81);
+    const auto input_82_before = backend->endpoint_submission_count(0x82);
+    int opened = DTV_ERROR_INTERNAL;
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    std::atomic<bool> open_done{false};
+    std::thread opener([&] {
+        opened = dtv_open_enclosure(root, nullptr, &open_error);
+        open_done.store(true, std::memory_order_release);
+    });
+    if (!backend->wait_for_pending_endpoint(0)) {
+        backend->complete_transfers();
+        release_scan_open_identify();
+        opener.join();
+        std::fprintf(stderr,
+            "case21 control wait timeout: done=%d opened=%d open_error=%d plan_calls=%u plan_count=%zu "
+            "plan0=(handle=%zu endpoint=0x%02x shared_depth=%zu) "
+            "plan1=(handle=%zu endpoint=0x%02x shared_depth=%zu) initialize_calls=%u initialize_ios=%zu "
+            "identify_calls=%u submissions=(control=%u->%u in81=%u->%u in82=%u->%u) "
+            "failed_submits=%u\n",
+            open_done.load(std::memory_order_acquire), opened, open_error.code,
+            scan_open_plan_call_count(), scan_open_plan_count_value(),
+            scan_open_plan_handle_value(0), scan_open_plan_endpoint_value(0),
+            scan_open_plan_shared_depth_value(0), scan_open_plan_handle_value(1),
+            scan_open_plan_endpoint_value(1), scan_open_plan_shared_depth_value(1),
+            scan_open_initialize_call_count(), scan_open_initialize_io_count_value(),
+            scan_open_identify_call_count(), control_before, backend->endpoint_submission_count(0),
+            input_81_before, backend->endpoint_submission_count(0x81),
+            input_82_before, backend->endpoint_submission_count(0x82),
+            backend->failed_submit_count_value());
+        return 30;
+    }
+    const bool control_precedes_identity = scan_open_initialize_call_count() == 1 &&
+        backend->endpoint_submission_count(0) == control_before + 1 &&
+        scan_open_identify_call_count() == 0 && scan_shared_packet_count() == 0;
+    backend->complete_endpoint(0);
+    bool identity_blocked = false;
+    for (unsigned attempt = 0; attempt < 2000 && !identity_blocked; ++attempt) {
+        identity_blocked = scan_open_identify_is_blocked();
+        if (!identity_blocked) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool no_input_before_identity =
+        backend->endpoint_submission_count(0x81) == input_81_before &&
+        backend->endpoint_submission_count(0x82) == input_82_before &&
+        scan_shared_packet_count() == 0;
+    release_scan_open_identify();
+    const bool inputs_submitted = backend->wait_for_endpoint_submissions(0x81,
+            static_cast<unsigned>(input_81_before + 1)) &&
+        backend->wait_for_endpoint_submissions(0x82,
+            static_cast<unsigned>(input_82_before + 1));
+    if (!inputs_submitted) backend->complete_transfers();
+    opener.join();
+    if (!control_precedes_identity || !identity_blocked || !no_input_before_identity ||
+        !inputs_submitted || opened != DTV_ERROR_OK || open_error.code != DTV_ERROR_OK ||
+        !open_done.load(std::memory_order_acquire) || scan_open_identify_size() != 0 ||
+        scan_open_identify_call_count() != 1 || scan_shared_packet_count() != 0) {
+        std::fprintf(stderr,
+            "public_open_without_initial_data order: control=%d blocked=%d no_input=%d submitted=%d opened=%d error=%d packets=%u\n",
+            control_precedes_identity, identity_blocked, no_input_before_identity,
+            inputs_submitted, opened, open_error.code, scan_shared_packet_count());
+        return 31;
+    }
+    backend->complete_endpoint(0x81);
+    bool first_packet = false;
+    for (unsigned attempt = 0; attempt < 2000 && !first_packet; ++attempt) {
+        first_packet = scan_shared_packet_count() != 0;
+        if (!first_packet) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool first_request_requeued = backend->wait_for_endpoint_submissions(0x81,
+        static_cast<unsigned>(input_81_before + 2));
+    dtv_error close_error{};
+    close_error.struct_size = sizeof(close_error);
+    const auto closed = dtv_close_enclosure(root, nullptr, &close_error);
+    const auto packet_count_after_close = scan_shared_packet_count();
+    if (!first_packet || scan_shared_length(0) == 0 || !first_request_requeued ||
+        closed != DTV_CLOSE_CLOSED ||
+        close_error.code != DTV_ERROR_OK || packet_count_after_close != 1 ||
+        scan_open_stop_call_count() != 1) return 32;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return 0;
+}
+
+int public_open_data_required_waits_for_bytes()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    set_scan_public_open_case(22);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 156), snapshot(context, 4, 157)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    backend->defer_next_control();
+    const auto control_before = backend->endpoint_submission_count(0);
+    int opened = DTV_ERROR_INTERNAL;
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    std::atomic<bool> open_done{false};
+    std::thread opener([&] {
+        opened = dtv_open_enclosure(root, nullptr, &open_error);
+        open_done.store(true, std::memory_order_release);
+    });
+    if (!backend->wait_for_pending_endpoint(0)) {
+        backend->complete_transfers();
+        opener.join();
+        return 30;
+    }
+    const bool initialize_reached = scan_open_initialize_call_count() == 1 &&
+        backend->endpoint_submission_count(0) == control_before + 1;
+    backend->complete_endpoint(0);
+    const bool input_81_pending = backend->wait_for_endpoint_submissions(0x81, 1);
+    const bool input_82_pending = backend->wait_for_endpoint_submissions(0x82, 1);
+    const bool identify_waits_for_bytes = scan_open_identify_call_count() == 0 &&
+        !open_done.load(std::memory_order_acquire);
+    if (!input_81_pending || !input_82_pending) backend->complete_transfers();
+    else {
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+    }
+    opener.join();
+    dtv_error close_error{};
+    close_error.struct_size = sizeof(close_error);
+    const auto closed = opened == DTV_ERROR_OK
+        ? dtv_close_enclosure(root, nullptr, &close_error) : DTV_CLOSE_CLOSED;
+    const bool passed = initialize_reached && input_81_pending && input_82_pending &&
+        identify_waits_for_bytes && opened == DTV_ERROR_OK && open_error.code == DTV_ERROR_OK &&
+        scan_open_identify_call_count() == 1 && scan_open_identify_size() != 0 &&
+        scan_shared_packet_count() != 0 && closed == DTV_CLOSE_CLOSED &&
+        close_error.code == DTV_ERROR_OK;
+    if (!passed) {
+        std::fprintf(stderr,
+            "public_open_data_required_waits_for_bytes: init=%d input81=%d input82=%d identify_wait=%d opened=%d calls=%u bytes=%zu packets=%u close=%u close_error=%d\n",
+            initialize_reached, input_81_pending, input_82_pending, identify_waits_for_bytes,
+            opened, scan_open_identify_call_count(), scan_open_identify_size(),
+            scan_shared_packet_count(), closed, close_error.code);
+        return 31;
+    }
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return 0;
+}
+
+int public_open_submit_failure_before_publish()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    backend->complete_all = true;
+    backend->fail_next_endpoint_submit(0x81);
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    set_scan_public_open_case(23);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 158), snapshot(context, 4, 159)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    const auto opened = dtv_open_enclosure(root, nullptr, &open_error);
+    const bool failed_after_queue = opened != DTV_ERROR_OK && open_error.code != DTV_ERROR_OK &&
+        backend->failed_submit_count_value() == 1 && scan_open_identify_call_count() == 1 &&
+        scan_open_identify_size() == 0;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return failed_after_queue ? 0 : 3;
+}
+
+int public_open_terminal_after_publish()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    set_scan_public_open_case(24);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 160), snapshot(context, 4, 161)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    const auto opened = dtv_open_enclosure(root, nullptr, nullptr);
+    const auto input_81 = backend->endpoint_submission_count(0x81);
+    const auto input_82 = backend->endpoint_submission_count(0x82);
+    const bool published_without_data = opened == DTV_ERROR_OK && input_81 != 0 &&
+        input_82 != 0 && scan_shared_packet_count() == 0;
+    backend->fail_next_endpoint_completion(0x81);
+    backend->complete_endpoint(0x81);
+    backend->complete_endpoint(0x82);
+    bool second_callback_seen = false;
+    for (unsigned attempt = 0; attempt < 2000 && !second_callback_seen; ++attempt) {
+        second_callback_seen = scan_shared_packet_count() != 0;
+        if (!second_callback_seen) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    dtv_error close_error{};
+    close_error.struct_size = sizeof(close_error);
+    const auto closed = dtv_close_enclosure(root, nullptr, &close_error);
+    dtv_error close_state_error{};
+    close_state_error.struct_size = sizeof(close_state_error);
+    const auto close_state = dtv_get_enclosure_close_state(root, &close_state_error);
+    const bool terminal_won_after_publish = published_without_data && second_callback_seen &&
+        closed == DTV_CLOSE_CLOSED && close_state == DTV_CLOSE_CLOSED &&
+        close_state_error.code == DTV_ERROR_USB_IO;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return terminal_won_after_publish ? 0 : 3;
+}
+
+int public_open_cancel_before_first_data()
+{
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    set_scan_public_open_case(24);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 162), snapshot(context, 4, 163)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error list_error{};
+    list_error.struct_size = sizeof(list_error);
+    auto *const *enclosures = dtv_list_enclosures(&list_error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    const auto opened = dtv_open_enclosure(root, nullptr, nullptr);
+    const bool still_no_data = opened == DTV_ERROR_OK &&
+        backend->endpoint_submission_count(0x81) != 0 &&
+        backend->endpoint_submission_count(0x82) != 0 && scan_shared_packet_count() == 0;
+    const auto free_count_before_cancel = backend->free_count;
+    backend->set_defer_cancel_completion(true);
+    std::uint32_t closed = DTV_CLOSE_PENDING;
+    dtv_error close_error{};
+    close_error.struct_size = sizeof(close_error);
+    std::thread closer([&] { closed = dtv_close_enclosure(root, nullptr, &close_error); });
+    const bool cancellation_sent = backend->wait_for_cancellations(2);
+    if (cancellation_sent) {
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+    } else {
+        backend->set_defer_cancel_completion(false);
+        backend->complete_transfers();
+    }
+    closer.join();
+    const bool passed = still_no_data && cancellation_sent && closed == DTV_CLOSE_CLOSED &&
+        scan_shared_packet_count() == 0 &&
+        backend->free_count >= free_count_before_cancel + 2;
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return passed ? 0 : 3;
+}
+
 int public_open_independent_enclosures()
 {
     auto backend = std::make_shared<FakeBackend>();
@@ -6892,6 +7226,26 @@ int main(int argc, char **argv)
         if (const int result = public_open_initialize_success(); result != 0) {
             std::fprintf(stderr, "public_open_initialize_success failed: %d\n", result);
             return result;
+        }
+        if (const int result = public_open_without_initial_data(); result != 0) {
+            std::fprintf(stderr, "public_open_without_initial_data failed: %d\n", result);
+            return 20 + result;
+        }
+        if (const int result = public_open_data_required_waits_for_bytes(); result != 0) {
+            std::fprintf(stderr, "public_open_data_required_waits_for_bytes failed: %d\n", result);
+            return 40 + result;
+        }
+        if (const int result = public_open_submit_failure_before_publish(); result != 0) {
+            std::fprintf(stderr, "public_open_submit_failure_before_publish failed: %d\n", result);
+            return 50 + result;
+        }
+        if (const int result = public_open_terminal_after_publish(); result != 0) {
+            std::fprintf(stderr, "public_open_terminal_after_publish failed: %d\n", result);
+            return 60 + result;
+        }
+        if (const int result = public_open_cancel_before_first_data(); result != 0) {
+            std::fprintf(stderr, "public_open_cancel_before_first_data failed: %d\n", result);
+            return 70 + result;
         }
         if (const int result = public_open_initialize_failure(); result != 0) {
             std::fprintf(stderr, "public_open_initialize_failure failed: %d\n", result);

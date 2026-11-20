@@ -2498,9 +2498,13 @@ bool begin_stream_delivery(const std::shared_ptr<PublicStreamState> &);
 bool stream_generation_matches(const std::shared_ptr<PublicStreamState> &, std::uint64_t);
 dtv_internal_result deliver_stream_message(const std::shared_ptr<PublicStreamState> &,
                                            const dtv::spi::PublicOpenMessage &);
+int32_t public_error_code(dtv_internal_result);
 
 struct PublicDiscoveryState {
     using ProductView = std::array<dtv_enclosure *, DTV_MAX_ENCLOSURES>;
+    struct OpenSlot;
+
+    static void record_open_terminal(const std::shared_ptr<OpenSlot> &, dtv_internal_result);
 
     struct SharedInOwner {
         struct Reply {
@@ -2532,6 +2536,7 @@ struct PublicDiscoveryState {
             std::uint64_t token = 0;
         };
         std::mutex mutex;
+        std::weak_ptr<OpenSlot> open_slot;
         std::condition_variable condition;
         const dtv::spi::PublicOpenOps *ops = nullptr;
         dtv_context *context = nullptr;
@@ -2555,37 +2560,44 @@ struct PublicDiscoveryState {
         bool stopping = false;
         dtv_internal_result terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 
+        void record_terminal(dtv_internal_result result)
+        {
+            {
+                std::lock_guard lock(mutex);
+                if (terminal.code != DTV_INTERNAL_RESULT_OK) return;
+                terminal = result.code == DTV_INTERNAL_RESULT_OK
+                    ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0) : result;
+                stopping = true;
+                condition.notify_all();
+            }
+            PublicDiscoveryState::record_open_terminal(open_slot.lock(), result);
+        }
+
         static dtv_internal_result receive(void *user, const UsbRuntimePacket *raw)
         {
             auto *self = static_cast<SharedInOwner *>(user);
             if (self == nullptr || raw == nullptr) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
             if (raw->terminal != UsbRuntimeTerminal::completed ||
                 raw->result.code != DTV_INTERNAL_RESULT_OK) {
-                std::lock_guard lock(self->mutex);
-                self->terminal = raw->result;
-                self->stopping = true;
-                self->condition.notify_all();
-                return raw->result.code == DTV_INTERNAL_RESULT_OK
+                const auto result = raw->result.code == DTV_INTERNAL_RESULT_OK
                     ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0) : raw->result;
+                self->record_terminal(result);
+                return result;
             }
             const auto endpoint = std::find(self->endpoints.begin(), self->endpoints.end(),
                 std::pair{raw->handle_index, raw->endpoint});
             if (raw->handle_index >= self->generations.size() ||
                 raw->generation != self->generations[raw->handle_index] ||
                 raw->actual_length > raw->bytes.size() || endpoint == self->endpoints.end()) {
-                std::lock_guard lock(self->mutex);
-                self->terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
-                self->stopping = true;
-                self->condition.notify_all();
-                return self->terminal;
+                const auto result = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
+                self->record_terminal(result);
+                return result;
             }
             const auto endpoint_index = static_cast<std::size_t>(endpoint - self->endpoints.begin());
             if (raw->submit_sequence <= self->last_sequences[endpoint_index]) {
-                std::lock_guard lock(self->mutex);
-                self->terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
-                self->stopping = true;
-                self->condition.notify_all();
-                return self->terminal;
+                const auto result = dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0);
+                self->record_terminal(result);
+                return result;
             }
             self->last_sequences[endpoint_index] = raw->submit_sequence;
             dtv::spi::PublicOpenPacket packet{raw->handle_index, raw->endpoint, raw->submit_sequence,
@@ -2595,10 +2607,7 @@ struct PublicDiscoveryState {
                 return self->ops->demux(self->context, &packet, &message);
             });
             if (classified.code != DTV_INTERNAL_RESULT_OK) {
-                std::lock_guard lock(self->mutex);
-                self->terminal = classified;
-                self->stopping = true;
-                self->condition.notify_all();
+                self->record_terminal(classified);
                 return classified;
             }
             std::unique_lock lock(self->mutex);
@@ -2618,20 +2627,20 @@ struct PublicDiscoveryState {
                     self->prestream_claimed)
                     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
                 if (message.payload.size() > self->prestream.size() - self->prestream_size) {
-                    self->terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
-                    self->stopping = true;
-                    self->condition.notify_all();
-                    return self->terminal;
+                    const auto failure = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+                    lock.unlock();
+                    self->record_terminal(failure);
+                    return failure;
                 }
                 std::copy(message.payload.begin(), message.payload.end(),
                     self->prestream.begin() + self->prestream_size);
                 self->prestream_size += message.payload.size();
             } else if (message.kind == dtv::spi::PublicOpenMessageKind::control_reply) {
                 if (message.payload.size() > self->reply_capacity) {
-                    self->terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
-                    self->stopping = true;
-                    self->condition.notify_all();
-                    return self->terminal;
+                    const auto failure = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+                    lock.unlock();
+                    self->record_terminal(failure);
+                    return failure;
                 }
                 for (const auto &tombstone : self->tombstones) {
                     if (tombstone.occupied && tombstone.scope == message.resource_scope &&
@@ -2666,10 +2675,10 @@ struct PublicDiscoveryState {
                         return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
                     }
                 }
-                self->terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
-                self->stopping = true;
-                self->condition.notify_all();
-                return self->terminal;
+                const auto failure = dtv_internal_result_make(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED, 0);
+                lock.unlock();
+                self->record_terminal(failure);
+                return failure;
             } else if (message.kind == dtv::spi::PublicOpenMessageKind::notification) {
                 if (message.generation != raw->generation || self->registry == nullptr ||
                     self->enclosure == nullptr) {
@@ -2703,9 +2712,8 @@ struct PublicDiscoveryState {
                     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
                 }
                 if (observed.code != DTV_INTERNAL_RESULT_OK) {
-                    self->terminal = observed;
-                    self->stopping = true;
-                    self->condition.notify_all();
+                    lock.unlock();
+                    self->record_terminal(observed);
                     return observed;
                 }
             }
@@ -2926,6 +2934,8 @@ struct PublicDiscoveryState {
         std::uint32_t first_error = DTV_ERROR_OK;
         std::uint32_t lnb_state = DTV_LNB_UNKNOWN;
         dtv_internal_result first_error_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+        bool initial_terminal = false;
+        dtv_internal_result initial_terminal_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         std::vector<std::uint64_t> connections;
         std::mutex operation_mutex;
         std::condition_variable operation_condition;
@@ -3155,6 +3165,24 @@ struct PublicDiscoveryState {
     EnclosureRegistry registry;
     DiscoverySession session;
 };
+
+void PublicDiscoveryState::record_open_terminal(const std::shared_ptr<OpenSlot> &slot,
+                                                 dtv_internal_result result)
+{
+    if (!slot) return;
+    std::lock_guard lock(slot->mutex);
+    if (slot->phase == OpenSlot::Phase::opening) {
+        if (!slot->initial_terminal) {
+            slot->initial_terminal = true;
+            slot->initial_terminal_result = result.code == DTV_INTERNAL_RESULT_OK
+                ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0) : result;
+        }
+    } else if (slot->phase == OpenSlot::Phase::open && slot->first_error == DTV_ERROR_OK) {
+        slot->first_error = public_error_code(result);
+        slot->first_error_result = result;
+    }
+    slot->condition.notify_all();
+}
 
 struct PublicStreamState {
     std::mutex mutex;
@@ -8964,6 +8992,7 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
             shared_owner->context = instance->context();
             shared_owner->registry = &state.registry;
             shared_owner->enclosure = object;
+            shared_owner->open_slot = slot;
             shared_owner->card_reader_handle_index = card_reader_handle;
             shared_owner->generations.resize(description.inputs.size());
             for (std::size_t index = 0; index < description.inputs.size(); ++index)
@@ -8993,6 +9022,15 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
                 slot->product_instance = instance;
                 slot->shared_in = shared_owner;
             }
+        }
+
+        const bool identify_requires_initial_data = instance == nullptr ||
+            open_ops->identify_requires_initial_data == nullptr ||
+            open_ops->identify_requires_initial_data(instance->context());
+        if (!identify_requires_initial_data && (!has_shared_in || open_ops->initialize == nullptr ||
+            open_ops->identify == nullptr || std::any_of(plans.begin(), plans.end(),
+                [](const auto &plan) { return plan.shared_in_depth == 0; }))) {
+            return finish_failure(dtv_internal_result_make(DTV_INTERNAL_RESULT_UNSUPPORTED, 0));
         }
 
         if (open_ops->initialize != nullptr) {
@@ -9053,6 +9091,52 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
                 return finish_failure(dtv_internal_result_make(DTV_INTERNAL_RESULT_TIMEOUT, 0));
         }
 
+        if (!identify_requires_initial_data) {
+            const auto empty = std::span<const unsigned char>{};
+            result = call_callback([&] {
+                return open_ops->identify(instance->context(), empty,
+                    remaining_timeout(*clock, deadline), &slot->cancelled);
+            });
+            if (result.code != DTV_INTERNAL_RESULT_OK) return finish_failure(result);
+            if (slot->cancelled.load(std::memory_order_acquire))
+                return finish_failure(dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0));
+
+            std::vector<std::uint64_t> initial_requests;
+            initial_requests.reserve(request_plans.size());
+            for (const auto &plan : request_plans) {
+                std::uint64_t request = 0;
+                result = shared_runtime->submit_shared_bulk_in(plan.handle_index, plan.endpoint,
+                    plan.buffer_capacity, description.inputs[plan.handle_index].connection_epoch,
+                    PublicDiscoveryState::SharedInOwner::receive, shared_owner.get(), true, &request);
+                if (result.code != DTV_INTERNAL_RESULT_OK) return finish_failure(result);
+                {
+                    std::lock_guard lock(slot->mutex);
+                    slot->requests.push_back(request);
+                }
+                initial_requests.push_back(request);
+            }
+            for (const auto request : initial_requests) {
+                result = shared_runtime->wait_backend_admission(request, clock, deadline);
+                if (result.code != DTV_INTERNAL_RESULT_OK) return finish_failure(result);
+            }
+            {
+                std::lock_guard lock(slot->mutex);
+                if (slot->cancelled.load(std::memory_order_acquire) || slot->initial_terminal) {
+                    result = slot->initial_terminal
+                        ? slot->initial_terminal_result
+                        : dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+                } else {
+                    slot->phase = PublicDiscoveryState::OpenSlot::Phase::open;
+                    slot->open_call_active = false;
+                    result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+                }
+            }
+            slot->condition.notify_all();
+            if (result.code != DTV_INTERNAL_RESULT_OK) return finish_failure(result);
+            set_public_error(error, DTV_ERROR_OK);
+            return DTV_ERROR_OK;
+        }
+
         std::vector<std::uint64_t> initial_requests;
         initial_requests.reserve(request_plans.size());
         for (const auto &plan : request_plans) {
@@ -9063,7 +9147,7 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
             result = plan.shared_in_depth != 0
                 ? shared_runtime->submit_shared_bulk_in(plan.handle_index, plan.endpoint,
                     plan.buffer_capacity, description.inputs[plan.handle_index].connection_epoch,
-                    PublicDiscoveryState::SharedInOwner::receive, shared_owner.get(), &request)
+                    PublicDiscoveryState::SharedInOwner::receive, shared_owner.get(), false, &request)
                 : shared_runtime->submit_bulk_in(plan.handle_index, plan.endpoint,
                     plan.buffer_capacity, description.inputs[plan.handle_index].connection_epoch,
                     clock, nullptr, deadline, &request);
@@ -9191,8 +9275,16 @@ extern "C" uint32_t dtv_close_enclosure(dtv_enclosure *object,
     const auto *clock = system_runtime_clock();
     const auto deadline = deadline_after(clock->monotonic_now_ns(clock->user),
                                          options == nullptr ? 0 : options->timeout_ms);
-    slot->cancelled.store(true, std::memory_order_release);
-    slot->cancelled.notify_all();
+    {
+        std::lock_guard lock(slot->mutex);
+        slot->cancelled.store(true, std::memory_order_release);
+        slot->cancelled.notify_all();
+        if (slot->phase == PublicDiscoveryState::OpenSlot::Phase::opening &&
+            !slot->initial_terminal) {
+            slot->initial_terminal = true;
+            slot->initial_terminal_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+        }
+    }
     cancel_open_operations(slot, true);
     if (!wait_for_operation_retire(slot, *clock, deadline, true, true)) {
         std::lock_guard lock(slot->mutex);
@@ -9926,6 +10018,10 @@ extern "C" int32_t dtv_cancel_enclosure(dtv_enclosure *object, dtv_error *error)
         if (opening) {
             slot->cancelled.store(true, std::memory_order_release);
             slot->cancelled.notify_all();
+            if (!slot->initial_terminal) {
+                slot->initial_terminal = true;
+                slot->initial_terminal_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_CANCELLED, 0);
+            }
             if (runtime) {
                 for (const auto request : slot->requests) {
                     (void)runtime->cancel(request);
