@@ -53,6 +53,7 @@ add_library(dtv-userland STATIC
     src/firmware.cpp
     src/l3.cpp
     src/l3-registry.cpp
+    src/product-instance.cpp
     src/result.cpp
     src/ts-framer.cpp
     src/usb.cpp

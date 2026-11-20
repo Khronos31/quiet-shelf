@@ -11,7 +11,6 @@
 
 #include <dtv/cli.h>
 #include <dtv/dtv.h>
-#include <dtv/internal/result.hpp>
 #include <dtv/spi/types.h>
 #include <dtv/spi/feature.hpp>
 
@@ -410,35 +409,10 @@ struct ProductEntry {
 
 class ProductInstance {
 public:
-    ProductInstance(const ModelEntry &model, dtv_device_id device) : model_(&model)
-    {
-        if ((model_->create_state == nullptr) != (model_->destroy_state == nullptr)) {
-            result_ = dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
-            return;
-        }
-        if (model_->create_state) {
-            dtv_context *temporary = nullptr;
-            result_ = dtv::internal::call_callback([&] {
-                return model_->create_state(device, &temporary);
-            });
-            if (result_.code == DTV_INTERNAL_RESULT_OK) {
-                context_ = temporary;
-            } else if (temporary != nullptr) {
-                destroy(temporary);
-            }
-        }
-    }
+    ProductInstance(const ModelEntry &model, dtv_device_id device);
+    ~ProductInstance();
 
-    ~ProductInstance() { reset(); }
-
-    void reset() noexcept
-    {
-        auto *context = context_;
-        context_ = nullptr;
-        if (context && model_->destroy_state) {
-            destroy(context);
-        }
-    }
+    void reset() noexcept;
 
     ProductInstance(const ProductInstance &) = delete;
     ProductInstance &operator=(const ProductInstance &) = delete;
@@ -447,15 +421,7 @@ public:
     dtv_internal_result result() const { return result_; }
 
 private:
-    void destroy(dtv_context *context) noexcept
-    {
-        if (model_->destroy_state) {
-            try {
-                model_->destroy_state(context);
-            } catch (...) {
-            }
-        }
-    }
+    void destroy(dtv_context *context) noexcept;
 
     const ModelEntry *model_;
     dtv_context *context_ = nullptr;
