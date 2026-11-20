@@ -14,6 +14,7 @@ constexpr std::uint8_t request_i2c_read = 0x02;
 constexpr std::uint8_t request_i2c_write = 0x03;
 constexpr std::uint8_t request_i2c_write_no_stop = 0x14;
 constexpr std::uint8_t request_gpio = 0x08;
+constexpr std::uint8_t request_gpio_ex = 0x10;
 constexpr std::uint8_t request_stage_fill = 0x0d;
 constexpr std::uint8_t request_stage_send = 0x0e;
 constexpr std::uint8_t request_i2c_read_nowait = 0x19;
@@ -350,6 +351,26 @@ dtv_internal_result read_gpio(const IoContext &context, std::uint8_t *value,
                                  response.size(), false, length_diagnostic, nullptr);
     if (result.code == DTV_INTERNAL_RESULT_OK) *value = response[0];
     return result;
+}
+
+dtv_internal_result write_gpio(const IoContext &context, std::uint8_t value,
+                               std::uint8_t mask, const char *length_diagnostic,
+                               const char *status_diagnostic)
+{
+    std::array<std::uint8_t, 1> response{};
+    return transfer(context, request_gpio,
+        static_cast<std::uint16_t>((static_cast<std::uint16_t>(mask) << 8) | value), 0,
+        response.data(), response.size(), true, length_diagnostic, status_diagnostic);
+}
+
+dtv_internal_result write_gpio_ex(const IoContext &context, std::uint8_t value,
+                                  std::uint8_t mask, const char *length_diagnostic,
+                                  const char *status_diagnostic)
+{
+    std::array<std::uint8_t, 1> response{};
+    return transfer(context, request_gpio_ex,
+        static_cast<std::uint16_t>((static_cast<std::uint16_t>(mask) << 8) | value), 0,
+        response.data(), response.size(), true, length_diagnostic, status_diagnostic);
 }
 
 dtv_internal_result write_gpio_verified(const IoContext &context, std::uint8_t value,
