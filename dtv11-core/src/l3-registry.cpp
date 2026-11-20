@@ -45,9 +45,26 @@ namespace {
 thread_local dtv_enclosure *active_lnb_operation = nullptr;
 thread_local bool active_lnb_transport_completed = false;
 std::atomic<bool> public_open_retire_diagnostic{false};
+std::atomic<bool> public_open_data_sink_barrier_enabled{false};
+std::atomic<bool> public_open_data_sink_barrier_entered{false};
+std::atomic<bool> public_open_data_sink_barrier_released{true};
+std::atomic<std::uint8_t> public_open_data_sink_barrier_endpoint{0};
+std::atomic<std::uint64_t> public_open_data_sink_request{0};
 std::atomic<bool> public_open_terminal_sink_barrier_enabled{false};
 std::atomic<bool> public_open_terminal_sink_barrier_entered{false};
 std::atomic<bool> public_open_terminal_sink_barrier_released{true};
+std::atomic<std::uint64_t> public_open_terminal_sink_barrier_request{0};
+std::atomic<unsigned> public_open_terminal_sink_count_81{0};
+std::atomic<unsigned> public_open_terminal_sink_count_82{0};
+std::atomic<std::uint64_t> public_open_terminal_sink_request_81{0};
+std::atomic<std::uint64_t> public_open_terminal_sink_request_82{0};
+std::atomic<int> public_open_terminal_sink_terminal_81{-1};
+std::atomic<int> public_open_terminal_sink_terminal_82{-1};
+std::atomic<int> public_open_terminal_sink_result_81{-1};
+std::atomic<int> public_open_terminal_sink_result_82{-1};
+std::atomic<std::uint64_t> public_open_cancel_observer_request{0};
+std::atomic<std::uint64_t> public_open_cancel_observed_request{0};
+std::atomic<int> public_open_cancel_result{-1};
 
 struct ActiveLnbOperationScope {
     dtv_enclosure *previous_operation;
@@ -2583,10 +2600,29 @@ struct PublicDiscoveryState {
             if (self == nullptr || raw == nullptr) return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
             if (raw->terminal != UsbRuntimeTerminal::completed ||
                 raw->result.code != DTV_INTERNAL_RESULT_OK) {
+                if (raw->endpoint == 0x81) {
+                    public_open_terminal_sink_request_81.store(raw->request_id,
+                        std::memory_order_release);
+                    public_open_terminal_sink_terminal_81.store(static_cast<int>(raw->terminal),
+                        std::memory_order_release);
+                    public_open_terminal_sink_result_81.store(raw->result.code,
+                        std::memory_order_release);
+                    public_open_terminal_sink_count_81.fetch_add(1, std::memory_order_acq_rel);
+                } else if (raw->endpoint == 0x82) {
+                    public_open_terminal_sink_request_82.store(raw->request_id,
+                        std::memory_order_release);
+                    public_open_terminal_sink_terminal_82.store(static_cast<int>(raw->terminal),
+                        std::memory_order_release);
+                    public_open_terminal_sink_result_82.store(raw->result.code,
+                        std::memory_order_release);
+                    public_open_terminal_sink_count_82.fetch_add(1, std::memory_order_acq_rel);
+                }
                 const auto result = raw->result.code == DTV_INTERNAL_RESULT_OK
                     ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0) : raw->result;
                 self->record_terminal(result);
-                if (public_open_terminal_sink_barrier_enabled.exchange(
+                if (raw->request_id == public_open_terminal_sink_barrier_request.load(
+                        std::memory_order_acquire) &&
+                    public_open_terminal_sink_barrier_enabled.exchange(
                         false, std::memory_order_acq_rel)) {
                     public_open_terminal_sink_barrier_entered.store(true, std::memory_order_release);
                     public_open_terminal_sink_barrier_entered.notify_all();
@@ -2620,6 +2656,16 @@ struct PublicDiscoveryState {
             if (classified.code != DTV_INTERNAL_RESULT_OK) {
                 self->record_terminal(classified);
                 return classified;
+            }
+            if (raw->endpoint == public_open_data_sink_barrier_endpoint.load(
+                    std::memory_order_acquire) &&
+                public_open_data_sink_barrier_enabled.exchange(false,
+                    std::memory_order_acq_rel)) {
+                public_open_data_sink_request.store(raw->request_id, std::memory_order_release);
+                public_open_data_sink_barrier_entered.store(true, std::memory_order_release);
+                public_open_data_sink_barrier_entered.notify_all();
+                while (!public_open_data_sink_barrier_released.load(std::memory_order_acquire))
+                    public_open_data_sink_barrier_released.wait(false);
             }
             std::unique_lock lock(self->mutex);
             if (self->stopping) return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
@@ -2964,6 +3010,7 @@ struct PublicDiscoveryState {
         bool shutdown_owner_active = false;
         ShutdownStage shutdown_stage = ShutdownStage::idle;
         bool cleanup_started = false;
+        bool expired_open_cleanup_requires_explicit_close = false;
         bool cleanup_callback_done = false;
         dtv_internal_result cleanup_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         std::uint64_t cleanup_deadline = UINT64_MAX;
@@ -4518,14 +4565,15 @@ OpenShutdownResult finish_open_shutdown(
     }
 
     if (!cleanup_started) {
-        if (!allow_cleanup_start && instance && ops != nullptr && ops->cleanup != nullptr) {
-            std::lock_guard lock(slot->mutex);
-            slot->shutdown_stage = PublicDiscoveryState::OpenSlot::ShutdownStage::cleanup_deferred;
-            slot->phase = PublicDiscoveryState::OpenSlot::Phase::pending;
-            return {true, DTV_ERROR_OK, dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0)};
-        }
         {
             std::lock_guard lock(slot->mutex);
+            if (!allow_cleanup_start && slot->expired_open_cleanup_requires_explicit_close &&
+                instance && ops != nullptr && ops->cleanup != nullptr) {
+                slot->shutdown_stage = PublicDiscoveryState::OpenSlot::ShutdownStage::cleanup_deferred;
+                slot->phase = PublicDiscoveryState::OpenSlot::Phase::pending;
+                return {true, DTV_ERROR_OK,
+                    dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0)};
+            }
             if (instance && ops != nullptr && ops->cleanup != nullptr &&
                 deadline != UINT64_MAX && clock.monotonic_now_ns(clock.user) >= deadline) {
                 slot->shutdown_stage = PublicDiscoveryState::OpenSlot::ShutdownStage::cleanup_deferred;
@@ -4757,11 +4805,46 @@ void set_public_open_retire_diagnostic_for_test(bool enabled)
     public_open_retire_diagnostic.store(enabled, std::memory_order_release);
 }
 
-void arm_public_open_terminal_sink_barrier_for_test()
+void arm_public_open_data_sink_barrier_for_test(std::uint8_t endpoint)
+{
+    public_open_data_sink_barrier_entered.store(false, std::memory_order_release);
+    public_open_data_sink_barrier_released.store(false, std::memory_order_release);
+    public_open_data_sink_barrier_endpoint.store(endpoint, std::memory_order_release);
+    public_open_data_sink_request.store(0, std::memory_order_release);
+    public_open_data_sink_barrier_enabled.store(true, std::memory_order_release);
+}
+
+bool public_open_data_sink_barrier_entered_for_test()
+{
+    return public_open_data_sink_barrier_entered.load(std::memory_order_acquire);
+}
+
+std::uint64_t public_open_data_sink_request_for_test()
+{
+    return public_open_data_sink_request.load(std::memory_order_acquire);
+}
+
+void release_public_open_data_sink_barrier_for_test()
+{
+    public_open_data_sink_barrier_released.store(true, std::memory_order_release);
+    public_open_data_sink_barrier_released.notify_all();
+    public_open_data_sink_barrier_enabled.store(false, std::memory_order_release);
+}
+
+void arm_public_open_terminal_sink_barrier_for_test(std::uint64_t request_id)
 {
     public_open_terminal_sink_barrier_entered.store(false, std::memory_order_release);
     public_open_terminal_sink_barrier_released.store(false, std::memory_order_release);
+    public_open_terminal_sink_barrier_request.store(request_id, std::memory_order_release);
     public_open_terminal_sink_barrier_enabled.store(true, std::memory_order_release);
+    public_open_terminal_sink_count_81.store(0, std::memory_order_release);
+    public_open_terminal_sink_count_82.store(0, std::memory_order_release);
+    public_open_terminal_sink_request_81.store(0, std::memory_order_release);
+    public_open_terminal_sink_request_82.store(0, std::memory_order_release);
+    public_open_terminal_sink_terminal_81.store(-1, std::memory_order_release);
+    public_open_terminal_sink_terminal_82.store(-1, std::memory_order_release);
+    public_open_terminal_sink_result_81.store(-1, std::memory_order_release);
+    public_open_terminal_sink_result_82.store(-1, std::memory_order_release);
 }
 
 bool public_open_terminal_sink_barrier_entered_for_test()
@@ -4774,6 +4857,51 @@ void release_public_open_terminal_sink_barrier_for_test()
     public_open_terminal_sink_barrier_released.store(true, std::memory_order_release);
     public_open_terminal_sink_barrier_released.notify_all();
     public_open_terminal_sink_barrier_enabled.store(false, std::memory_order_release);
+}
+
+unsigned public_open_terminal_sink_count_for_test(std::uint8_t endpoint)
+{
+    if (endpoint == 0x81) return public_open_terminal_sink_count_81.load(std::memory_order_acquire);
+    if (endpoint == 0x82) return public_open_terminal_sink_count_82.load(std::memory_order_acquire);
+    return 0;
+}
+
+std::uint64_t public_open_terminal_sink_request_for_test(std::uint8_t endpoint)
+{
+    if (endpoint == 0x81) return public_open_terminal_sink_request_81.load(std::memory_order_acquire);
+    if (endpoint == 0x82) return public_open_terminal_sink_request_82.load(std::memory_order_acquire);
+    return 0;
+}
+
+int public_open_terminal_sink_terminal_for_test(std::uint8_t endpoint)
+{
+    if (endpoint == 0x81) return public_open_terminal_sink_terminal_81.load(std::memory_order_acquire);
+    if (endpoint == 0x82) return public_open_terminal_sink_terminal_82.load(std::memory_order_acquire);
+    return -1;
+}
+
+int public_open_terminal_sink_result_for_test(std::uint8_t endpoint)
+{
+    if (endpoint == 0x81) return public_open_terminal_sink_result_81.load(std::memory_order_acquire);
+    if (endpoint == 0x82) return public_open_terminal_sink_result_82.load(std::memory_order_acquire);
+    return -1;
+}
+
+void arm_public_open_cancel_observer_for_test(std::uint64_t request_id)
+{
+    public_open_cancel_observed_request.store(0, std::memory_order_release);
+    public_open_cancel_result.store(-1, std::memory_order_release);
+    public_open_cancel_observer_request.store(request_id, std::memory_order_release);
+}
+
+std::uint64_t public_open_cancel_observed_request_for_test()
+{
+    return public_open_cancel_observed_request.load(std::memory_order_acquire);
+}
+
+int public_open_cancel_result_for_test()
+{
+    return public_open_cancel_result.load(std::memory_order_acquire);
 }
 
 void set_public_discovery_journal_hook_for_test(std::function<void()> hook)
@@ -9281,6 +9409,14 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
         slot->held = true;
     }
 
+    auto mark_expired_open_cleanup = [&] {
+        if (deadline == UINT64_MAX || clock->monotonic_now_ns(clock->user) < deadline) return;
+        std::lock_guard lock(slot->mutex);
+        if (!slot->cleanup_started && slot->product_instance && slot->ops != nullptr &&
+            slot->ops->cleanup != nullptr)
+            slot->expired_open_cleanup_requires_explicit_close = true;
+    };
+
     auto finish_failure = [&](dtv_internal_result failure) {
         if (failure.code == DTV_INTERNAL_RESULT_OK) {
             failure = dtv_internal_result_make(DTV_INTERNAL_RESULT_INTERNAL, 0);
@@ -9308,6 +9444,7 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
             slot->first_error_result = reported_result;
         }
         if (!wait_for_operation_retire(slot, *clock, deadline, true, true)) {
+            mark_expired_open_cleanup();
             {
                 std::lock_guard lock(slot->mutex);
                 slot->phase = PublicDiscoveryState::OpenSlot::Phase::pending;
@@ -9320,6 +9457,7 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
         const auto now = clock->monotonic_now_ns(clock->user);
         const auto shutdown = finish_open_shutdown(slot, *clock, deadline,
             deadline == UINT64_MAX || now < deadline);
+        if (shutdown.pending) mark_expired_open_cleanup();
         {
             std::lock_guard lock(slot->mutex);
             if (shutdown.pending) slot->phase = PublicDiscoveryState::OpenSlot::Phase::pending;
@@ -9801,7 +9939,14 @@ static uint32_t close_enclosure_impl(dtv_enclosure *object,
         shared_owner->terminal = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
         shared_owner->condition.notify_all();
     }
-    for (const auto request : slot_requests) if (runtime) (void)runtime->cancel(request);
+    for (const auto request : slot_requests) {
+        if (!runtime) continue;
+        const auto cancel_result = runtime->cancel(request);
+        if (request == public_open_cancel_observer_request.load(std::memory_order_acquire)) {
+            public_open_cancel_result.store(cancel_result.code, std::memory_order_release);
+            public_open_cancel_observed_request.store(request, std::memory_order_release);
+        }
+    }
     {
         std::unique_lock lock(slot->mutex);
         while (slot->open_call_active) {

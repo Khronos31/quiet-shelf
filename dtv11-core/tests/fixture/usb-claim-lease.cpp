@@ -6639,7 +6639,7 @@ int public_open_preflight_and_identify_failures()
         if (mode == 6 && (backend->open_count != 0 || backend->claim_count != 0)) return 9;
         if (mode == 7 && (backend->open_count != 2 || backend->claim_count != 2 ||
                           backend->close_count != 2)) return 10;
-        const auto close_expected = mode == 3 || mode == 5 ? DTV_ERROR_OK : expected;
+        const auto close_expected = DTV_ERROR_OK;
         if (dtv_close_enclosure(root, nullptr, &error) != DTV_CLOSE_CLOSED ||
             error.code != close_expected ||
             error.cause_domain != (close_expected == expected ? expected_cause_domain
@@ -6687,10 +6687,15 @@ int public_open_error_boundaries()
     dtv_error cleanup_error{};
     cleanup_error.struct_size = sizeof(cleanup_error);
     if (dtv_close_enclosure(root, nullptr, &cleanup_error) != DTV_CLOSE_CLOSED ||
-        cleanup_error.code != DTV_ERROR_USB_IO ||
-        cleanup_error.cause_domain != DTV_ERROR_DOMAIN_LIBUSB ||
-        cleanup_error.cause_code != LIBUSB_ERROR_IO) return 4;
-    if (dtv_get_enclosure_close_state(root, nullptr) != DTV_CLOSE_CLOSED) return 5;
+        cleanup_error.code != DTV_ERROR_OK ||
+        cleanup_error.cause_domain != DTV_ERROR_DOMAIN_NONE ||
+        cleanup_error.cause_code != 0) return 4;
+    dtv_error state_error{};
+    state_error.struct_size = sizeof(state_error);
+    if (dtv_get_enclosure_close_state(root, &state_error) != DTV_CLOSE_CLOSED ||
+        state_error.code != DTV_ERROR_USB_IO ||
+        state_error.cause_domain != DTV_ERROR_DOMAIN_LIBUSB ||
+        state_error.cause_code != LIBUSB_ERROR_IO) return 5;
     dtv_release_enclosure(root);
     dtv_drop_enclosure(root);
     return 0;
@@ -7022,6 +7027,9 @@ int public_open_cleanup_adopted_boundaries()
         set_scan_public_open_cleanup_behavior_for_test(2);
         block_scan_open_callback_for_test();
         const auto output_before = backend->endpoint_submission_count(0x02);
+        const auto pending_before_close = backend->pending_transfer_count();
+        const auto cancelled_before_close = backend->cancelled_transfer_count();
+        const auto stop_calls_before_close = scan_open_stop_call_count();
         const dtv_call_options close_call{sizeof(dtv_call_options), 80};
         std::uint32_t close_result = DTV_CLOSE_CLOSED;
         dtv_error close_error{};
@@ -7037,22 +7045,61 @@ int public_open_cleanup_adopted_boundaries()
         if (callback_blocked) backend->set_defer_cancel_completion(true);
         release_scan_open_identify();
         closer.join();
+        const auto second_cleanup_result = scan_open_cleanup_second_result_value();
+        const auto output_after_first_close = backend->endpoint_submission_count(0x02);
         const auto pending_before_release = backend->pending_transfer_count();
-        const bool held_a = close_result == DTV_CLOSE_PENDING &&
-            scan_open_cleanup_second_result_value() == DTV_INTERNAL_RESULT_TIMEOUT &&
-            backend->endpoint_submission_count(0x02) == output_before + 1 &&
-            pending_before_release != 0 && backend->cancelled_transfer_count() != 0 &&
-            scan_open_stop_call_count() == 0;
+        const auto cancelled_before_release = backend->cancelled_transfer_count();
+        const auto stop_calls_before_release = scan_open_stop_call_count();
+        const bool first_close_pending = close_result == DTV_CLOSE_PENDING;
+        const bool second_cleanup_timed_out = second_cleanup_result == DTV_INTERNAL_RESULT_TIMEOUT;
+        const bool one_output_submitted = output_after_first_close == output_before + 1;
+        const bool pending_before_release_nonzero = pending_before_release != 0;
+        const bool cancelled_before_release_nonzero = cancelled_before_release != 0;
+        const bool stop_not_called_before_release = stop_calls_before_release == 0;
+        const bool held_a = first_close_pending && second_cleanup_timed_out &&
+            one_output_submitted && pending_before_release_nonzero &&
+            cancelled_before_release_nonzero && stop_not_called_before_release;
         backend->set_defer_cancel_completion(false);
         backend->complete_endpoint(0x02);
         const dtv_call_options retry_call{sizeof(dtv_call_options), 1000};
         dtv_error retry_error{};
         retry_error.struct_size = sizeof(retry_error);
         const auto retried = dtv_close_enclosure(root, &retry_call, &retry_error);
-        const bool passed = opened && callback_blocked && held_a &&
-            retried == DTV_CLOSE_CLOSED && retry_error.code == DTV_ERROR_TIMEOUT &&
-            scan_open_cleanup_call_count() == 1 && scan_open_stop_call_count() == 1 &&
-            backend->endpoint_submission_count(0x02) == output_before + 1;
+        const auto output_after_retry = backend->endpoint_submission_count(0x02);
+        const auto cleanup_calls_after_retry = scan_open_cleanup_call_count();
+        const auto stop_calls_after_retry = scan_open_stop_call_count();
+        const bool retry_closed = retried == DTV_CLOSE_CLOSED;
+        const bool retry_error_timed_out = retry_error.code == DTV_ERROR_TIMEOUT;
+        const bool cleanup_called_once = cleanup_calls_after_retry == 1;
+        const bool stop_called_once = stop_calls_after_retry == 1;
+        const bool output_not_resubmitted = output_after_retry == output_before + 1;
+        const bool passed = opened && callback_blocked && held_a && retry_closed &&
+            retry_error_timed_out && cleanup_called_once && stop_called_once &&
+            output_not_resubmitted;
+        if (!passed) {
+            std::fprintf(stderr,
+                "public_open_cleanup_adopted_boundaries case212: opened=%d callback_blocked=%d "
+                "held_a=%d first_close_pending=%d second_cleanup_timeout=%d "
+                "one_output_submitted=%d pending_nonzero=%d cancelled_nonzero=%d "
+                "stop_not_called=%d first_close=%u first_close_error=%u second_cleanup=%u "
+                "output_before=%u output_after_first_close=%u pending_before_close=%zu "
+                "pending_before_release=%zu cancelled_before_close=%zu "
+                "cancelled_before_release=%zu stop_before_close=%u "
+                "stop_before_release=%u retry_closed=%d retry_error_timeout=%d "
+                "retry_result=%u retry_error=%u output_after_retry=%u "
+                "cleanup_after_retry=%u stop_after_retry=%u cleanup_once=%d "
+                "stop_once=%d output_not_resubmitted=%d passed=%d\n",
+                opened, callback_blocked, held_a, first_close_pending,
+                second_cleanup_timed_out, one_output_submitted,
+                pending_before_release_nonzero, cancelled_before_release_nonzero,
+                stop_not_called_before_release, close_result, close_error.code,
+                second_cleanup_result, output_before, output_after_first_close,
+                pending_before_close, pending_before_release, cancelled_before_close,
+                cancelled_before_release, stop_calls_before_close, stop_calls_before_release,
+                retry_closed, retry_error_timed_out, retried, retry_error.code,
+                output_after_retry, cleanup_calls_after_retry, stop_calls_after_retry,
+                cleanup_called_once, stop_called_once, output_not_resubmitted, passed);
+        }
         drop_root(root);
         if (!passed) return 4;
     }
@@ -7163,28 +7210,118 @@ int public_open_cleanup_adopted_boundaries()
         open_error.struct_size = sizeof(open_error);
         const bool opened = open_public_cleanup_fixture(root, *backend, &open_error);
         set_scan_public_open_cleanup_behavior_for_test(0);
-        dtv::internal::arm_public_open_terminal_sink_barrier_for_test();
-        const auto cancellations_before = backend->cancel_count_snapshot();
+        dtv::internal::arm_public_open_data_sink_barrier_for_test(0x81);
+        backend->complete_endpoint(0x81);
+        bool data_callback_blocked = false;
+        for (unsigned attempt = 0; attempt < 2000 && !data_callback_blocked; ++attempt) {
+            data_callback_blocked = dtv::internal::public_open_data_sink_barrier_entered_for_test();
+            if (!data_callback_blocked) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const auto target_request = dtv::internal::public_open_data_sink_request_for_test();
+        dtv::internal::arm_public_open_cancel_observer_for_test(target_request);
+        dtv::internal::arm_public_open_terminal_sink_barrier_for_test(target_request);
         bool callback_blocked = false;
-        std::uint32_t close_result = DTV_CLOSE_PENDING;
+        std::atomic<std::uint32_t> close_result{DTV_CLOSE_PENDING};
+        std::atomic<bool> close_done{false};
         dtv_error close_error{};
         close_error.struct_size = sizeof(close_error);
         const dtv_call_options close_call{sizeof(dtv_call_options), 5000};
         std::thread closer([&] {
-            close_result = dtv_close_enclosure(root, &close_call, &close_error);
+            close_result.store(dtv_close_enclosure(root, &close_call, &close_error),
+                               std::memory_order_release);
+            close_done.store(true, std::memory_order_release);
         });
+        bool logical_cancel_observed = false;
+        for (unsigned attempt = 0; attempt < 2000 && !logical_cancel_observed; ++attempt) {
+            logical_cancel_observed =
+                dtv::internal::public_open_cancel_observed_request_for_test() == target_request;
+            if (!logical_cancel_observed) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        dtv::internal::release_public_open_data_sink_barrier_for_test();
         for (unsigned attempt = 0; attempt < 2000 && !callback_blocked; ++attempt) {
             callback_blocked = dtv::internal::public_open_terminal_sink_barrier_entered_for_test();
             if (!callback_blocked) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        const bool cancellation_started = backend->wait_for_cancellations(cancellations_before + 1);
-        const bool withheld = callback_blocked && cancellation_started &&
-            scan_open_cleanup_call_count() == 0 &&
+        for (unsigned attempt = 0; attempt < 6000 && !close_done.load(std::memory_order_acquire); ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool close_pending_while_sink_blocked = close_done.load(std::memory_order_acquire) &&
+            close_result.load(std::memory_order_acquire) == DTV_CLOSE_PENDING;
+        const bool cleanup_stop_withheld = scan_open_cleanup_call_count() == 0 &&
             scan_open_stop_call_count() == 0;
+        const bool target_terminal_once_while_blocked = target_request != 0 &&
+            dtv::internal::public_open_terminal_sink_count_for_test(0x81) == 1 &&
+            dtv::internal::public_open_terminal_sink_request_for_test(0x81) == target_request;
+        const bool target_cause_preserved =
+            dtv::internal::public_open_terminal_sink_terminal_for_test(0x81) ==
+                static_cast<int>(dtv::internal::UsbRuntimeTerminal::cancelled) &&
+            dtv::internal::public_open_terminal_sink_result_for_test(0x81) ==
+                DTV_INTERNAL_RESULT_TIMEOUT;
+        const bool logical_cancel_succeeded = logical_cancel_observed &&
+            dtv::internal::public_open_cancel_result_for_test() == DTV_INTERNAL_RESULT_OK;
+        const bool withheld = data_callback_blocked && callback_blocked && logical_cancel_succeeded &&
+            cleanup_stop_withheld && close_pending_while_sink_blocked &&
+            target_terminal_once_while_blocked && target_cause_preserved;
         dtv::internal::release_public_open_terminal_sink_barrier_for_test();
         closer.join();
-        const bool passed = opened && withheld && close_result == DTV_CLOSE_CLOSED &&
-            scan_open_cleanup_call_count() == 1 && scan_open_stop_call_count() == 1;
+        const auto first_close_result = close_result.load(std::memory_order_acquire);
+        auto final_close_result = first_close_result;
+        if (first_close_result == DTV_CLOSE_PENDING) {
+            close_error = {};
+            close_error.struct_size = sizeof(close_error);
+            final_close_result = dtv_close_enclosure(root, &close_call, &close_error);
+        }
+        const bool closed_after_sink_return =
+            final_close_result == DTV_CLOSE_CLOSED;
+        const bool both_requests_notified_once =
+            dtv::internal::public_open_terminal_sink_count_for_test(0x81) == 1 &&
+            dtv::internal::public_open_terminal_sink_count_for_test(0x82) == 1;
+        const bool both_request_ids_observed =
+            dtv::internal::public_open_terminal_sink_request_for_test(0x81) == target_request &&
+            dtv::internal::public_open_terminal_sink_request_for_test(0x82) != 0 &&
+            dtv::internal::public_open_terminal_sink_request_for_test(0x82) != target_request;
+        const bool both_causes_preserved =
+            dtv::internal::public_open_terminal_sink_terminal_for_test(0x81) ==
+                static_cast<int>(dtv::internal::UsbRuntimeTerminal::cancelled) &&
+            dtv::internal::public_open_terminal_sink_result_for_test(0x81) ==
+                DTV_INTERNAL_RESULT_TIMEOUT &&
+            dtv::internal::public_open_terminal_sink_terminal_for_test(0x82) ==
+                static_cast<int>(dtv::internal::UsbRuntimeTerminal::cancelled) &&
+            dtv::internal::public_open_terminal_sink_result_for_test(0x82) ==
+                DTV_INTERNAL_RESULT_TIMEOUT;
+        const bool cleanup_stop_once = scan_open_cleanup_call_count() == 1 &&
+            scan_open_stop_call_count() == 1;
+        const bool passed = opened && withheld && closed_after_sink_return &&
+            both_requests_notified_once && both_request_ids_observed && both_causes_preserved &&
+            cleanup_stop_once;
+        if (!passed) {
+            std::fprintf(stderr,
+                "public_open_cleanup_adopted_boundaries handoff: opened=%d data_blocked=%d "
+                "target_request=%llu logical_cancel=%d cancel_result=%d terminal_blocked=%d "
+                "close_done=%d close_pending=%d first_close=%u "
+                "cleanup_stop_withheld=%d target_once_blocked=%d target_cause=%d "
+                "withheld=%d close_closed=%d both_once=%d both_ids=%d both_causes=%d "
+                "cleanup_stop_once=%d count81=%u request81=%llu terminal81=%d "
+                "result81=%d count82=%u request82=%llu terminal82=%d result82=%d "
+                "cleanup=%u stop=%u passed=%d\n",
+                opened, data_callback_blocked, static_cast<unsigned long long>(target_request),
+                logical_cancel_succeeded, dtv::internal::public_open_cancel_result_for_test(),
+                callback_blocked, close_done.load(std::memory_order_acquire),
+                close_pending_while_sink_blocked, first_close_result,
+                cleanup_stop_withheld, target_terminal_once_while_blocked, target_cause_preserved,
+                withheld, closed_after_sink_return, both_requests_notified_once,
+                both_request_ids_observed, both_causes_preserved, cleanup_stop_once,
+                dtv::internal::public_open_terminal_sink_count_for_test(0x81),
+                static_cast<unsigned long long>(
+                    dtv::internal::public_open_terminal_sink_request_for_test(0x81)),
+                dtv::internal::public_open_terminal_sink_terminal_for_test(0x81),
+                dtv::internal::public_open_terminal_sink_result_for_test(0x81),
+                dtv::internal::public_open_terminal_sink_count_for_test(0x82),
+                static_cast<unsigned long long>(
+                    dtv::internal::public_open_terminal_sink_request_for_test(0x82)),
+                dtv::internal::public_open_terminal_sink_terminal_for_test(0x82),
+                dtv::internal::public_open_terminal_sink_result_for_test(0x82),
+                scan_open_cleanup_call_count(), scan_open_stop_call_count(), passed);
+        }
         drop_root(root);
         if (!passed) return 12;
     }
@@ -7565,6 +7702,14 @@ int main(int argc, char **argv)
         if (const int result = public_open_initialize_failure(); result != 0) {
             std::fprintf(stderr, "public_open_initialize_failure failed: %d\n", result);
             return 10 + result;
+        }
+        if (const int result = public_open_preflight_and_identify_failures(); result != 0) {
+            std::fprintf(stderr, "public_open_preflight_and_identify_failures failed: %d\n", result);
+            return 90 + result;
+        }
+        if (const int result = public_open_error_boundaries(); result != 0) {
+            std::fprintf(stderr, "public_open_error_boundaries failed: %d\n", result);
+            return 100 + result;
         }
         return 0;
     }

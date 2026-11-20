@@ -1117,17 +1117,54 @@ struct EnclosureRuntime::State {
                         if (terminal == UsbRuntimeTerminal::completed)
                             packet.bytes = std::span<const unsigned char>(request->buffer.data(),
                                 (std::min)(packet.actual_length, request->buffer.size()));
+                        const bool handoff_initial_data = request->handoff_first_completion &&
+                            packet.terminal == UsbRuntimeTerminal::completed;
                         lock.unlock();
                         const auto sink_result = call_callback([&] {
                             return request->sink(request->sink_user, &packet);
                         });
                         lock.lock();
-                        if (sink_result.code != DTV_INTERNAL_RESULT_OK) {
+                        if (handoff_initial_data) {
+                            if (!request->terminal_requested && stopping) {
+                                request->terminal_requested = true;
+                                request->terminal = UsbRuntimeTerminal::stopped;
+                                request->terminal_result = make_result(DTV_INTERNAL_RESULT_NOT_READY);
+                            } else if (!request->terminal_requested &&
+                                       sink_result.code != DTV_INTERNAL_RESULT_OK) {
+                                request->terminal_requested = true;
+                                request->terminal = UsbRuntimeTerminal::failed;
+                                request->terminal_result = sink_result;
+                            }
+                            if (request->terminal_requested) {
+                                terminal = request->terminal;
+                                result = request->terminal_result;
+                                request->initial_published = true;
+                                if (!request->terminal_sink_delivered) {
+                                    UsbRuntimePacket terminal_packet;
+                                    terminal_packet.request_id = request->id;
+                                    terminal_packet.submit_sequence = request->submit_sequence;
+                                    terminal_packet.generation = request->generation;
+                                    terminal_packet.handle_index = request->handle_index;
+                                    terminal_packet.endpoint = request->endpoint;
+                                    terminal_packet.terminal = terminal;
+                                    terminal_packet.result = result;
+                                    lock.unlock();
+                                    (void)call_callback([&] {
+                                        return request->sink(request->sink_user, &terminal_packet);
+                                    });
+                                    lock.lock();
+                                    request->terminal_sink_delivered = true;
+                                }
+                                condition.notify_all();
+                                continue;
+                            }
+                        } else if (sink_result.code != DTV_INTERNAL_RESULT_OK) {
                             terminal = UsbRuntimeTerminal::failed;
                             result = sink_result;
                         }
-                        if (terminal != UsbRuntimeTerminal::completed || stopping ||
-                            request->terminal_requested)
+                        if (!handoff_initial_data &&
+                            (terminal != UsbRuntimeTerminal::completed || stopping ||
+                             request->terminal_requested))
                             request->terminal_sink_delivered = true;
                         if (request->handoff_first_completion) {
                             request->initial_published = true;
@@ -1207,13 +1244,33 @@ struct EnclosureRuntime::State {
             packet.bytes = std::span<const unsigned char>(request->buffer.data(),
                 (std::min)(packet.actual_length, request->buffer.size()));
             const auto sink_result = call_callback([&] { return request->sink(request->sink_user, &packet); });
-            std::lock_guard lock(mutex);
+            std::unique_lock lock(mutex);
             if (sink_result.code != DTV_INTERNAL_RESULT_OK || stopping || request->terminal_requested) {
-                request->terminal_requested = true;
-                request->terminal = stopping ? UsbRuntimeTerminal::stopped : UsbRuntimeTerminal::failed;
-                request->terminal_result = stopping
-                    ? make_result(DTV_INTERNAL_RESULT_NOT_READY) : sink_result;
+                if (!request->terminal_requested) {
+                    request->terminal_requested = true;
+                    request->terminal = stopping ? UsbRuntimeTerminal::stopped : UsbRuntimeTerminal::failed;
+                    request->terminal_result = stopping
+                        ? make_result(DTV_INTERNAL_RESULT_NOT_READY) : sink_result;
+                }
                 condition.notify_all();
+                if (!request->terminal_sink_delivered) {
+                    UsbRuntimePacket terminal_packet;
+                    terminal_packet.request_id = request->id;
+                    terminal_packet.submit_sequence = request->submit_sequence;
+                    terminal_packet.generation = request->generation;
+                    terminal_packet.handle_index = request->handle_index;
+                    terminal_packet.endpoint = request->endpoint;
+                    terminal_packet.terminal = request->terminal;
+                    terminal_packet.result = request->terminal_result;
+                    lock.unlock();
+                    (void)call_callback([&] {
+                        return request->sink(request->sink_user, &terminal_packet);
+                    });
+                    lock.lock();
+                    request->terminal_sink_delivered = true;
+                    condition.notify_all();
+                }
+                lock.unlock();
                 continue;
             }
             if (next_submit_sequence == 0) {
