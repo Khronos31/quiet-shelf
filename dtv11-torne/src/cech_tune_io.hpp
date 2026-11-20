@@ -92,6 +92,7 @@ struct TemperatureCalibrationIoState {
     std::uint64_t measurement_ready_ns = 0;
     std::size_t plan_steps_completed = 0;
     std::int16_t temperature = 0;
+    bool temperature_valid = false;
     std::uint8_t calibration_flags_to_clear = 0;
     TemperatureCalibrationIoPhase phase = TemperatureCalibrationIoPhase::idle;
 };
@@ -106,9 +107,74 @@ struct TemperatureCalibrationIoResult {
     std::uint8_t calibration_flags_to_clear = 0;
 };
 
+enum class InitialCalibrationPassStatus { pending, complete, failed };
+
+enum class InitialCalibrationPassPhase { idle, running, complete, failed };
+
+enum class InitialCalibrationPassStage { none, dc, wbd, temperature };
+
+struct InitialCalibrationPassInput {
+    std::uint8_t pending_flags = 0;
+    TunerVariant variant = TunerVariant::standard;
+    std::uint64_t requested_frequency_hz = 0;
+    std::uint64_t retained_rf_frequency_hz = 0;
+    std::uint16_t previous_wbd_gain = 0;
+    bool previous_wbd_gain_valid = false;
+    std::uint16_t previous_wbd_offset = 0;
+    bool previous_wbd_offset_valid = false;
+    std::int16_t previous_temperature = 0;
+    bool previous_temperature_valid = false;
+};
+
+struct InitialCalibrationPassState {
+    InitialCalibrationPassPhase phase = InitialCalibrationPassPhase::idle;
+    InitialCalibrationPassStage active_stage = InitialCalibrationPassStage::none;
+    dtv_internal_result failure = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    std::uint8_t pending_flags = 0;
+    std::uint8_t completed_flags = 0;
+    std::uint64_t requested_frequency_hz = 0;
+    std::uint64_t retained_rf_frequency_hz = 0;
+    TunerVariant variant = TunerVariant::standard;
+    DcCalibrationIoState dc{};
+    WbdCalibrationIoState wbd{};
+    TemperatureCalibrationIoState temperature_io{};
+    std::uint16_t wbd_gain = 0;
+    bool wbd_gain_valid = false;
+    std::uint16_t wbd_offset = 0;
+    bool wbd_offset_valid = false;
+    std::int16_t temperature = 0;
+    bool temperature_valid = false;
+};
+
+struct InitialCalibrationPassResult {
+    InitialCalibrationPassStatus status = InitialCalibrationPassStatus::failed;
+    InitialCalibrationPassStage active_stage = InitialCalibrationPassStage::none;
+    dtv_internal_result io_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    std::uint32_t poll_interval_ms = 0;
+    std::size_t dc_plan_steps_completed = 0;
+    std::size_t wbd_plan_steps_completed = 0;
+    std::size_t temperature_plan_steps_completed = 0;
+    std::uint8_t pending_flags = 0;
+    std::uint8_t completed_flags = 0;
+    std::uint64_t retained_rf_frequency_hz = 0;
+    std::uint16_t wbd_gain = 0;
+    bool wbd_gain_valid = false;
+    std::uint16_t wbd_offset = 0;
+    bool wbd_offset_valid = false;
+    std::int16_t temperature = 0;
+    bool temperature_valid = false;
+};
+
 enum class NormalCapTrimCalibrationIoStatus { pending, complete, failed };
 
-enum class NormalCapTrimCalibrationIoPhase { idle, waiting_measurement, complete, failed };
+enum class NormalCapTrimCalibrationIoPhase {
+    idle,
+    waiting_measurement,
+    waiting_retune_candidate,
+    waiting_retune_final_write,
+    complete,
+    failed
+};
 
 struct NormalCapTrimCalibrationIoState {
     CapTrimCalibrationState machine{};
@@ -153,6 +219,20 @@ struct P1gCapTrimCalibrationIoResult {
     bool calibration_valid = false;
     std::uint16_t captrim_value = 0;
     std::uint8_t calibration_flags_to_clear = 0;
+};
+
+enum class TunerInitializationIoStatus { complete, failed };
+
+struct TunerInitializationIoResult {
+    TunerInitializationIoStatus status = TunerInitializationIoStatus::failed;
+    dtv_internal_result io_result = dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+    std::size_t plan_steps_completed = 0;
+    std::uint16_t identity_raw = 0;
+    TunerIdentityValues identity{};
+    bool identity_observed = false;
+    bool identity_valid = false;
+    bool initialization_valid = false;
+    std::uint8_t calibration_flags_to_set = 0;
 };
 
 enum class DemodSearchIoStatus {
@@ -239,6 +319,8 @@ public:
     dtv_internal_result read_tuner(std::uint8_t reg, std::uint16_t *value);
     dtv_internal_result write_tuner(std::uint8_t reg, std::uint16_t value);
     dtv_internal_result apply_tune_plan(const TunePlan &plan);
+    dtv_internal_result apply_tune_plan_before_captrim(const TunePlan &plan);
+    dtv_internal_result apply_tune_plan_after_captrim(const TunePlan &plan);
     WbdCalibrationIoResult begin_wbd_calibration(std::uint64_t frequency_hz,
                                                   std::uint16_t previous_gain,
                                                   std::uint16_t previous_offset,
@@ -251,7 +333,14 @@ public:
         TemperatureCalibrationIoState *state);
     TemperatureCalibrationIoResult poll_temperature_calibration_io(
         TemperatureCalibrationIoState *state);
+    InitialCalibrationPassResult begin_initial_calibration_pass(
+        const InitialCalibrationPassInput &input,
+        InitialCalibrationPassState *state);
+    InitialCalibrationPassResult poll_initial_calibration_pass(
+        InitialCalibrationPassState *state);
     NormalCapTrimCalibrationIoResult begin_normal_captrim_calibration_io(
+        bool pll_fraction_zero, NormalCapTrimCalibrationIoState *state);
+    NormalCapTrimCalibrationIoResult begin_normal_retune_captrim_calibration_io(
         bool pll_fraction_zero, NormalCapTrimCalibrationIoState *state);
     NormalCapTrimCalibrationIoResult poll_normal_captrim_calibration_io(
         NormalCapTrimCalibrationIoState *state);
@@ -259,6 +348,8 @@ public:
         P1gCapTrimCalibrationIoState *state);
     P1gCapTrimCalibrationIoResult poll_p1g_captrim_calibration_io(
         P1gCapTrimCalibrationIoState *state);
+    // Run synchronously while the callback-scoped I/O view remains valid.
+    TunerInitializationIoResult initialize_tuner();
     dtv_internal_result observe_cnr(CnrObservation *observation);
     DemodSyncIoResult begin_sync(DemodTransmissionMode mode, std::uint8_t guard,
                                  bool differential,
@@ -283,8 +374,13 @@ private:
     dtv_internal_result transact(std::uint8_t address, std::uint16_t operation,
                                  std::span<const std::uint8_t> output,
                                  std::span<std::uint8_t> input);
+    dtv_internal_result apply_tune_plan_writes(const TunePlan &plan,
+                                                std::size_t first,
+                                                std::size_t last);
     dtv_internal_result initialize_cursor();
     dtv_internal_result finish_pending(std::span<std::uint8_t> input);
+    InitialCalibrationPassResult advance_initial_calibration_pass(
+        InitialCalibrationPassState *state);
 
     const dtv_usb_io *io_;
     dtv_timeout timeout_;

@@ -253,6 +253,8 @@ bool build_tune_plan(std::uint64_t frequency_hz, std::uint8_t package,
     plan->frequency_khz = frequency_khz;
     plan->rf_request_khz = rf_request_khz;
     plan->band = band;
+    plan->variant = variant;
+    plan->pll_fraction_zero = fraction == 0;
     append(plan, 0x0B, static_cast<std::uint16_t>(0xB800 | tuner->switch_trim));
     append(plan, 0x15, static_cast<std::uint16_t>(feedback_divider));
     append(plan, 0x16, static_cast<std::uint16_t>((denominator << 8) | 6));
@@ -260,6 +262,7 @@ bool build_tune_plan(std::uint64_t frequency_hz, std::uint8_t package,
     append(plan, 0x19, static_cast<std::uint16_t>(control));
     append(plan, 0x1C, static_cast<std::uint16_t>(loop_filter));
     append(plan, 0x24, static_cast<std::uint16_t>((tuner->enable & 0xFF9F) | 0x0006));
+    plan->captrim_post_write_offset = plan->write_count;
     append(plan, 0x1E, 0x07FF);
     append(plan, 0x10, static_cast<std::uint16_t>((wbd_gain(frequency_hz) << 13) | 0x1F83));
     if (variant == TunerVariant::p1g && band == FrequencyBand::c_band &&
@@ -967,18 +970,38 @@ bool build_frontend_power_plan(FrontendPowerPlan *plan)
     return true;
 }
 
-bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity,
-                           std::uint16_t redundancy_a, std::uint16_t redundancy_b,
-                           std::uint16_t calibration_raw, TunerInitPlan *plan)
+bool decode_tuner_identity(std::uint16_t identity, TunerIdentityValues *values)
 {
-    if (plan == nullptr || ((identity >> 8) & 0x7) != 2) return false;
+    if (values == nullptr || ((identity >> 8) & 0x7) != 2) return false;
     const auto version = static_cast<std::uint8_t>(identity);
     const auto package = static_cast<std::uint8_t>((version >> 5) & 0x7);
     const auto revision = static_cast<std::uint8_t>(version & 0x1F);
-    if ((version & 0x3) == 2 || !known_package(package) || !known_revision(revision)) return false;
+    if ((version & 0x3) == 2 || !known_package(package) || !known_revision(revision))
+        return false;
+    *values = {package, revision, version,
+        p1g_revision(revision) ? TunerVariant::p1g : TunerVariant::standard};
+    return true;
+}
 
+bool tuner_init_needs_calibration_measurement(const TunerIdentityValues &identity,
+                                             std::uint16_t redundancy_a)
+{
+    return identity.revision >= 3 &&
+        (identity.version_byte == 3 || identity.version_byte == 7 || redundancy_a == 0xFFFF);
+}
+
+bool build_tuner_init_gate_plan(TunerInitPlan *plan)
+{
+    if (plan == nullptr) return false;
     *plan = {};
     append(plan, InitTarget::demodulator, InitStepKind::write, 1025, 0xC000);
+    return true;
+}
+
+bool build_tuner_init_reset_plan(TunerInitPlan *plan)
+{
+    if (plan == nullptr) return false;
+    *plan = {};
     append(plan, InitTarget::demodulator, InitStepKind::masked_write, 1030, 0, 0xFFFE);
     append(plan, InitTarget::demodulator, InitStepKind::delay_ms, 0, 10);
     append(plan, InitTarget::demodulator, InitStepKind::masked_write, 1030, 0, 0xFFDF);
@@ -990,6 +1013,16 @@ bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity
     append(plan, InitTarget::tuner, InitStepKind::write, 0x20, 0x3B00);
     append(plan, InitTarget::tuner, InitStepKind::write, 0x23, 0x0A30);
     append(plan, InitTarget::tuner, InitStepKind::masked_write, 0x21, 0x8000, 0x7FFF);
+    return true;
+}
+
+bool build_tuner_init_defaults_plan(const TunerIdentityValues &identity,
+                                    std::uint16_t second_identity,
+                                    TunerInitPlan *plan)
+{
+    if (plan == nullptr || !known_package(identity.package_code) ||
+        !known_revision(identity.revision)) return false;
+    *plan = {};
     append(plan, InitTarget::tuner, InitStepKind::write, 0x1B,
         (second_identity & 0x0040) != 0 ? 0x00EB : 0x00A2);
     constexpr std::uint16_t standard_defaults[]{
@@ -1006,16 +1039,26 @@ bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity
     append(plan, InitTarget::tuner, InitStepKind::write, 0x24, 0x22EB);
     append(plan, InitTarget::tuner, InitStepKind::write, 0x3C, 0x03FF);
     append(plan, InitTarget::tuner, InitStepKind::write, 0x3D, 0x0111);
-    if (p1g_revision(revision)) {
+    if (identity.variant == TunerVariant::p1g) {
         append(plan, InitTarget::tuner, InitStepKind::write, 0x05, 0xABCD);
         append(plan, InitTarget::tuner, InitStepKind::write, 0x11, 0x00B4);
         append(plan, InitTarget::tuner, InitStepKind::write, 0x1C, 0xFFFD);
         append(plan, InitTarget::tuner, InitStepKind::write, 0x40, 0x0108);
     }
+    return true;
+}
 
+bool build_tuner_init_finish_plan(const TunerIdentityValues &identity,
+                                 std::uint16_t redundancy_a,
+                                 std::uint16_t redundancy_b,
+                                 std::uint16_t calibration_raw,
+                                 TunerInitPlan *plan)
+{
+    if (plan == nullptr || !known_package(identity.package_code) ||
+        !known_revision(identity.revision)) return false;
+    *plan = {};
     // 測定条件は冗長値A/Bの統合前に判定する。
-    if ((revision & 0x1F) >= 3 &&
-        (version == 3 || version == 7 || redundancy_a == 0xFFFF)) {
+    if (tuner_init_needs_calibration_measurement(identity, redundancy_a)) {
         auto measurement = static_cast<std::uint16_t>((calibration_raw >> 6) & 0x03FF);
         if (measurement < 670 || measurement == 1023) measurement = 850;
         const auto poly = static_cast<std::uint16_t>(165 - ((measurement * 10) >> 6));
@@ -1042,6 +1085,30 @@ bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity
     append(plan, InitTarget::demodulator, InitStepKind::masked_write, 1030, 0, 0xFFFE);
     append(plan, InitTarget::tuner, InitStepKind::masked_write, 0x23, 0x4000, 0xBFFF);
     return plan->step_count <= sizeof(plan->steps) / sizeof(plan->steps[0]);
+}
+
+bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity,
+                           std::uint16_t redundancy_a, std::uint16_t redundancy_b,
+                           std::uint16_t calibration_raw, TunerInitPlan *plan)
+{
+    TunerIdentityValues values{};
+    if (plan == nullptr || !decode_tuner_identity(identity, &values)) return false;
+    *plan = {};
+    const auto append_segment = [plan](const TunerInitPlan &segment) {
+        if (segment.step_count > sizeof(plan->steps) / sizeof(plan->steps[0]) -
+                plan->step_count) return false;
+        for (std::size_t index = 0; index < segment.step_count; ++index)
+            plan->steps[plan->step_count++] = segment.steps[index];
+        return true;
+    };
+    TunerInitPlan segment{};
+    if (!build_tuner_init_gate_plan(&segment) || !append_segment(segment) ||
+        !build_tuner_init_reset_plan(&segment) || !append_segment(segment) ||
+        !build_tuner_init_defaults_plan(values, second_identity, &segment) ||
+        !append_segment(segment) ||
+        !build_tuner_init_finish_plan(values, redundancy_a, redundancy_b,
+            calibration_raw, &segment) || !append_segment(segment)) return false;
+    return true;
 }
 
 bool build_wbd_calibration_plan(std::uint64_t frequency_hz,

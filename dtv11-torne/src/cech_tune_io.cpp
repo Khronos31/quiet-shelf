@@ -757,12 +757,217 @@ dtv_internal_result CechI2cIo::write_tuner(std::uint8_t reg, std::uint16_t value
     return transact(0xC0, 1, bytes, {});
 }
 
+TunerInitializationIoResult CechI2cIo::initialize_tuner()
+{
+    TunerInitializationIoResult init_result{};
+    init_result.io_result = result(DTV_INTERNAL_RESULT_OK);
+    if (io_ == nullptr || io_->clock == nullptr ||
+        io_->clock->monotonic_now_ns == nullptr || io_->clock->delay_until == nullptr) {
+        init_result.io_result = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        return init_result;
+    }
+
+    const auto check_operation = [this]() {
+        if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire))
+            return result(DTV_INTERNAL_RESULT_CANCELLED);
+        if (io_ == nullptr || io_->clock == nullptr ||
+            io_->clock->monotonic_now_ns == nullptr)
+            return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        const auto now_ns = io_->clock->monotonic_now_ns(io_->clock->user);
+        if (timeout_.operation_deadline_ns != 0 &&
+            now_ns >= timeout_.operation_deadline_ns)
+            return result(DTV_INTERNAL_RESULT_TIMEOUT);
+        return result(DTV_INTERNAL_RESULT_OK);
+    };
+    const auto delay_ms = [this, &check_operation](std::uint32_t duration_ms) {
+        auto checked = check_operation();
+        if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+        const auto now_ns = io_->clock->monotonic_now_ns(io_->clock->user);
+        const auto wait_ns = static_cast<std::uint64_t>(duration_ms) * 1000000ULL;
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        const auto wake_ns = now_ns > maximum - wait_ns ? maximum : now_ns + wait_ns;
+        const auto deadline_ns = timeout_.operation_deadline_ns == 0
+            ? maximum : timeout_.operation_deadline_ns;
+        for (;;) {
+            checked = check_operation();
+            if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+            if (io_->clock->monotonic_now_ns(io_->clock->user) >= wake_ns)
+                return result(DTV_INTERNAL_RESULT_OK);
+            std::uint32_t cancelled = 0;
+            // The request atomic is checked after the wait; Core's cancel token is not attached here.
+            const auto waited = io_->clock->delay_until(io_->clock->user, wake_ns,
+                deadline_ns, nullptr, &cancelled);
+            if (waited.code != DTV_INTERNAL_RESULT_OK) return waited;
+            if (cancelled != 0 || (cancelled_ != nullptr &&
+                    cancelled_->load(std::memory_order_acquire)))
+                return result(DTV_INTERNAL_RESULT_CANCELLED);
+        }
+    };
+    const auto apply_plan = [this, &init_result, &check_operation, &delay_ms](
+                                const TunerInitPlan &plan) {
+        if (plan.step_count > sizeof(plan.steps) / sizeof(plan.steps[0]))
+            return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        for (std::size_t index = 0; index < plan.step_count; ++index) {
+            const auto &step = plan.steps[index];
+            auto checked = check_operation();
+            if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+            dtv_internal_result applied = result(DTV_INTERNAL_RESULT_INTERNAL);
+            if (step.kind == InitStepKind::delay_ms) {
+                if (step.value > std::numeric_limits<std::uint32_t>::max())
+                    return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                applied = delay_ms(static_cast<std::uint32_t>(step.value));
+            } else if (step.kind == InitStepKind::write ||
+                       step.kind == InitStepKind::masked_write) {
+                std::uint16_t previous = 0;
+                if (step.kind == InitStepKind::masked_write) {
+                    if (step.target == InitTarget::demodulator) {
+                        if (step.reg > std::numeric_limits<std::uint16_t>::max())
+                            return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                        applied = read_demodulator(static_cast<std::uint16_t>(step.reg),
+                            &previous);
+                    } else if (step.target == InitTarget::tuner) {
+                        if (step.reg > std::numeric_limits<std::uint8_t>::max())
+                            return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                        applied = read_tuner(static_cast<std::uint8_t>(step.reg), &previous);
+                    } else {
+                        return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+                    }
+                    if (applied.code != DTV_INTERNAL_RESULT_OK) return applied;
+                    checked = check_operation();
+                    if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+                }
+                const auto value = static_cast<std::uint16_t>(
+                    (step.kind == InitStepKind::masked_write
+                        ? static_cast<std::uint32_t>(previous) & step.mask : 0U) |
+                    step.value);
+                if (step.target == InitTarget::demodulator) {
+                    if (step.reg > std::numeric_limits<std::uint16_t>::max())
+                        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                    applied = write_demodulator(static_cast<std::uint16_t>(step.reg), value);
+                } else if (step.target == InitTarget::tuner) {
+                    if (step.reg > std::numeric_limits<std::uint8_t>::max())
+                        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+                    applied = write_tuner(static_cast<std::uint8_t>(step.reg), value);
+                } else {
+                    return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+                }
+            } else {
+                return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+            }
+            if (applied.code != DTV_INTERNAL_RESULT_OK) return applied;
+            ++init_result.plan_steps_completed;
+            checked = check_operation();
+            if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+        }
+        return result(DTV_INTERNAL_RESULT_OK);
+    };
+    const auto fail = [&init_result](dtv_internal_result failure) {
+        init_result.status = TunerInitializationIoStatus::failed;
+        init_result.io_result = failure;
+        return init_result;
+    };
+
+    TunerInitPlan plan{};
+    if (!build_tuner_init_gate_plan(&plan))
+        return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+    auto applied = apply_plan(plan);
+    if (applied.code != DTV_INTERNAL_RESULT_OK) return fail(applied);
+
+    auto checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+    auto transferred = read_tuner(0x1A, &init_result.identity_raw);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return fail(transferred);
+    init_result.identity_observed = true;
+    checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+    if (!decode_tuner_identity(init_result.identity_raw, &init_result.identity))
+        return fail(result(DTV_INTERNAL_RESULT_UNSUPPORTED));
+    init_result.identity_valid = true;
+
+    if (!build_tuner_init_reset_plan(&plan))
+        return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+    applied = apply_plan(plan);
+    if (applied.code != DTV_INTERNAL_RESULT_OK) return fail(applied);
+
+    std::uint16_t second_identity = 0;
+    checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+    transferred = read_tuner(0x1A, &second_identity);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return fail(transferred);
+    checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+    if (!build_tuner_init_defaults_plan(init_result.identity, second_identity, &plan))
+        return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+    applied = apply_plan(plan);
+    if (applied.code != DTV_INTERNAL_RESULT_OK) return fail(applied);
+
+    std::uint16_t redundancy_a = 0;
+    checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+    transferred = read_tuner(0x26, &redundancy_a);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return fail(transferred);
+    std::uint16_t redundancy_b = 0;
+    checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+    transferred = read_tuner(0x28, &redundancy_b);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return fail(transferred);
+
+    std::uint16_t calibration_measurement = 0;
+    if (tuner_init_needs_calibration_measurement(init_result.identity, redundancy_a)) {
+        checked = check_operation();
+        if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+        transferred = write_tuner(0x22, 0x0010);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return fail(transferred);
+        checked = check_operation();
+        if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+        transferred = read_tuner(0x22, &calibration_measurement);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return fail(transferred);
+    }
+
+    if (!build_tuner_init_finish_plan(init_result.identity, redundancy_a,
+            redundancy_b, calibration_measurement, &plan))
+        return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+    applied = apply_plan(plan);
+    if (applied.code != DTV_INTERNAL_RESULT_OK) return fail(applied);
+    checked = check_operation();
+    if (checked.code != DTV_INTERNAL_RESULT_OK) return fail(checked);
+
+    init_result.status = TunerInitializationIoStatus::complete;
+    init_result.io_result = result(DTV_INTERNAL_RESULT_OK);
+    init_result.initialization_valid = true;
+    init_result.calibration_flags_to_set = 7;
+    return init_result;
+}
+
 dtv_internal_result CechI2cIo::apply_tune_plan(const TunePlan &plan)
 {
     // 公開tune caller未接合。呼出し側は最初のI/O前にbegin_effectを呼ぶ。
-    if (plan.write_count > sizeof(plan.writes) / sizeof(plan.writes[0]))
+    return apply_tune_plan_writes(plan, 0, plan.write_count);
+}
+
+dtv_internal_result CechI2cIo::apply_tune_plan_before_captrim(const TunePlan &plan)
+{
+    if (plan.captrim_post_write_offset > plan.write_count)
         return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    for (std::size_t index = 0; index < plan.write_count; ++index) {
+    return apply_tune_plan_writes(plan, 0, plan.captrim_post_write_offset);
+}
+
+dtv_internal_result CechI2cIo::apply_tune_plan_after_captrim(const TunePlan &plan)
+{
+    if (plan.captrim_post_write_offset > plan.write_count)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    return apply_tune_plan_writes(plan, plan.captrim_post_write_offset,
+                                  plan.write_count);
+}
+
+dtv_internal_result CechI2cIo::apply_tune_plan_writes(const TunePlan &plan,
+                                                        std::size_t first,
+                                                        std::size_t last)
+{
+    if (plan.write_count > sizeof(plan.writes) / sizeof(plan.writes[0]) ||
+        first > last || last > plan.write_count)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    for (std::size_t index = first; index < last; ++index) {
         const auto &write = plan.writes[index];
         const auto transferred = write_tuner(write.address, write.value);
         if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
@@ -1541,6 +1746,8 @@ TemperatureCalibrationIoResult CechI2cIo::poll_temperature_calibration_io(
         calibration_result.plan_steps_completed = state->plan_steps_completed;
         return calibration_result;
     }
+    state->temperature = completed_temperature;
+    state->temperature_valid = true;
     for (std::size_t index = 0; index < state->plan.step_count; ++index) {
         const auto &step = state->plan.steps[index];
         if (step.target != InitTarget::tuner || step.kind != InitStepKind::write ||
@@ -1562,7 +1769,6 @@ TemperatureCalibrationIoResult CechI2cIo::poll_temperature_calibration_io(
         ++state->plan_steps_completed;
     }
 
-    state->temperature = completed_temperature;
     state->calibration_flags_to_clear = state->plan.calibration_flags_to_clear;
     state->phase = TemperatureCalibrationIoPhase::complete;
     calibration_result.status = TemperatureCalibrationIoStatus::complete;
@@ -1571,6 +1777,193 @@ TemperatureCalibrationIoResult CechI2cIo::poll_temperature_calibration_io(
     calibration_result.temperature = state->temperature;
     calibration_result.calibration_flags_to_clear = state->calibration_flags_to_clear;
     return calibration_result;
+}
+
+InitialCalibrationPassResult CechI2cIo::begin_initial_calibration_pass(
+    const InitialCalibrationPassInput &input, InitialCalibrationPassState *state)
+{
+    if (state == nullptr) {
+        InitialCalibrationPassResult pass_result{};
+        pass_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return pass_result;
+    }
+    if (state->phase != InitialCalibrationPassPhase::idle) {
+        InitialCalibrationPassResult pass_result{};
+        pass_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        pass_result.pending_flags = state->pending_flags;
+        pass_result.completed_flags = state->completed_flags;
+        pass_result.retained_rf_frequency_hz = state->retained_rf_frequency_hz;
+        pass_result.wbd_gain = state->wbd_gain;
+        pass_result.wbd_gain_valid = state->wbd_gain_valid;
+        pass_result.wbd_offset = state->wbd_offset;
+        pass_result.wbd_offset_valid = state->wbd_offset_valid;
+        pass_result.temperature = state->temperature;
+        pass_result.temperature_valid = state->temperature_valid;
+        return pass_result;
+    }
+
+    *state = {};
+    state->phase = InitialCalibrationPassPhase::running;
+    state->pending_flags = input.pending_flags;
+    state->requested_frequency_hz = input.requested_frequency_hz;
+    state->retained_rf_frequency_hz = input.retained_rf_frequency_hz;
+    state->variant = input.variant;
+    state->wbd_gain = input.previous_wbd_gain;
+    state->wbd_gain_valid = input.previous_wbd_gain_valid;
+    state->wbd_offset = input.previous_wbd_offset;
+    state->wbd_offset_valid = input.previous_wbd_offset_valid;
+    state->temperature = input.previous_temperature;
+    state->temperature_valid = input.previous_temperature_valid;
+    return advance_initial_calibration_pass(state);
+}
+
+InitialCalibrationPassResult CechI2cIo::poll_initial_calibration_pass(
+    InitialCalibrationPassState *state)
+{
+    if (state == nullptr) {
+        InitialCalibrationPassResult pass_result{};
+        pass_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return pass_result;
+    }
+    return advance_initial_calibration_pass(state);
+}
+
+InitialCalibrationPassResult CechI2cIo::advance_initial_calibration_pass(
+    InitialCalibrationPassState *state)
+{
+    const auto make_result = [state](InitialCalibrationPassStatus status,
+                                     std::uint32_t poll_interval_ms,
+                                     dtv_internal_result io_result) {
+        InitialCalibrationPassResult pass_result{};
+        pass_result.status = status;
+        pass_result.active_stage = state->active_stage;
+        pass_result.io_result = io_result;
+        pass_result.poll_interval_ms = poll_interval_ms;
+        pass_result.dc_plan_steps_completed = state->dc.plan_steps_completed;
+        pass_result.wbd_plan_steps_completed = state->wbd.plan_steps_completed;
+        pass_result.temperature_plan_steps_completed =
+            state->temperature_io.plan_steps_completed;
+        pass_result.pending_flags = state->pending_flags;
+        pass_result.completed_flags = state->completed_flags;
+        pass_result.retained_rf_frequency_hz = state->retained_rf_frequency_hz;
+        pass_result.wbd_gain = state->wbd_gain;
+        pass_result.wbd_gain_valid = state->wbd_gain_valid;
+        pass_result.wbd_offset = state->wbd_offset;
+        pass_result.wbd_offset_valid = state->wbd_offset_valid;
+        pass_result.temperature = state->temperature;
+        pass_result.temperature_valid = state->temperature_valid;
+        return pass_result;
+    };
+    if (state->phase == InitialCalibrationPassPhase::complete)
+        return make_result(InitialCalibrationPassStatus::complete, 0,
+            result(DTV_INTERNAL_RESULT_OK));
+    if (state->phase == InitialCalibrationPassPhase::failed)
+        return make_result(InitialCalibrationPassStatus::failed, 0, state->failure);
+    if (state->phase != InitialCalibrationPassPhase::running)
+        return make_result(InitialCalibrationPassStatus::failed, 0,
+            result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT));
+
+    const auto fail = [state, &make_result](dtv_internal_result failure) {
+        state->phase = InitialCalibrationPassPhase::failed;
+        state->failure = failure;
+        return make_result(InitialCalibrationPassStatus::failed, 0, failure);
+    };
+    for (;;) {
+        if (state->active_stage == InitialCalibrationPassStage::none) {
+            if ((state->pending_flags & tuner_calibration_dc) != 0)
+                state->active_stage = InitialCalibrationPassStage::dc;
+            else if ((state->pending_flags & tuner_calibration_wbd) != 0)
+                state->active_stage = InitialCalibrationPassStage::wbd;
+            else if ((state->pending_flags & tuner_calibration_temp) != 0)
+                state->active_stage = InitialCalibrationPassStage::temperature;
+            else {
+                state->phase = InitialCalibrationPassPhase::complete;
+                return make_result(InitialCalibrationPassStatus::complete, 0,
+                    result(DTV_INTERNAL_RESULT_OK));
+            }
+        }
+
+        if (state->active_stage == InitialCalibrationPassStage::dc) {
+            const auto calibration_result = state->dc.phase == DcCalibrationIoPhase::idle
+                ? begin_dc_calibration_io(state->variant, &state->dc)
+                : poll_dc_calibration_io(&state->dc);
+            if (calibration_result.status == DcCalibrationIoStatus::failed)
+                return fail(calibration_result.io_result.code == DTV_INTERNAL_RESULT_OK
+                    ? result(DTV_INTERNAL_RESULT_INTERNAL) : calibration_result.io_result);
+            if (calibration_result.status == DcCalibrationIoStatus::pending)
+                return make_result(InitialCalibrationPassStatus::pending,
+                    calibration_result.poll_interval_ms, calibration_result.io_result);
+            if (calibration_result.calibration_flags_to_clear != tuner_calibration_dc)
+                return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+            state->completed_flags |= tuner_calibration_dc;
+            state->pending_flags &= static_cast<std::uint8_t>(~tuner_calibration_dc);
+            state->active_stage = InitialCalibrationPassStage::none;
+            continue;
+        }
+
+        if (state->active_stage == InitialCalibrationPassStage::wbd) {
+            if (!state->wbd_gain_valid)
+                return fail(result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT));
+            if (state->retained_rf_frequency_hz == 0)
+                state->retained_rf_frequency_hz = state->requested_frequency_hz;
+            const auto calibration_result = state->wbd.phase == WbdCalibrationIoPhase::idle
+                ? begin_wbd_calibration(state->retained_rf_frequency_hz,
+                    state->wbd_gain, state->wbd_offset, &state->wbd)
+                : poll_wbd_calibration(&state->wbd);
+            if (state->wbd.phase == WbdCalibrationIoPhase::waiting_measurement) {
+                state->wbd_gain = state->wbd.plan.calibration_gain;
+                state->wbd_gain_valid = true;
+            }
+            if (calibration_result.status == WbdCalibrationIoStatus::failed)
+                return fail(calibration_result.io_result.code == DTV_INTERNAL_RESULT_OK
+                    ? result(DTV_INTERNAL_RESULT_INTERNAL) : calibration_result.io_result);
+            if (calibration_result.status == WbdCalibrationIoStatus::pending)
+                return make_result(InitialCalibrationPassStatus::pending,
+                    calibration_result.poll_interval_ms, calibration_result.io_result);
+            if (!calibration_result.calibration_valid ||
+                calibration_result.calibration.calibration_flags_to_clear !=
+                    tuner_calibration_wbd)
+                return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+            state->wbd_gain = calibration_result.calibration.gain;
+            state->wbd_gain_valid = true;
+            if (state->wbd.plan.needs_measurement) {
+                state->wbd_offset = calibration_result.calibration.offset;
+                state->wbd_offset_valid = true;
+            }
+            state->completed_flags |= tuner_calibration_wbd;
+            state->pending_flags &= static_cast<std::uint8_t>(~tuner_calibration_wbd);
+            state->active_stage = InitialCalibrationPassStage::none;
+            continue;
+        }
+
+        if (state->active_stage == InitialCalibrationPassStage::temperature) {
+            const auto calibration_result =
+                state->temperature_io.phase == TemperatureCalibrationIoPhase::idle
+                ? begin_temperature_calibration_io(&state->temperature_io)
+                : poll_temperature_calibration_io(&state->temperature_io);
+            if (state->temperature_io.temperature_valid) {
+                state->temperature = state->temperature_io.temperature;
+                state->temperature_valid = true;
+            }
+            if (calibration_result.status == TemperatureCalibrationIoStatus::failed)
+                return fail(calibration_result.io_result.code == DTV_INTERNAL_RESULT_OK
+                    ? result(DTV_INTERNAL_RESULT_INTERNAL) : calibration_result.io_result);
+            if (calibration_result.status == TemperatureCalibrationIoStatus::pending)
+                return make_result(InitialCalibrationPassStatus::pending,
+                    calibration_result.poll_interval_ms, calibration_result.io_result);
+            if (!calibration_result.temperature_valid ||
+                calibration_result.calibration_flags_to_clear != tuner_calibration_temp)
+                return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+            state->temperature = calibration_result.temperature;
+            state->temperature_valid = true;
+            state->completed_flags |= tuner_calibration_temp;
+            state->pending_flags &= static_cast<std::uint8_t>(~tuner_calibration_temp);
+            state->active_stage = InitialCalibrationPassStage::none;
+            continue;
+        }
+
+        return fail(result(DTV_INTERNAL_RESULT_INTERNAL));
+    }
 }
 
 NormalCapTrimCalibrationIoResult CechI2cIo::begin_normal_captrim_calibration_io(
@@ -1720,6 +2113,160 @@ NormalCapTrimCalibrationIoResult CechI2cIo::begin_normal_captrim_calibration_io(
     return calibration_result;
 }
 
+NormalCapTrimCalibrationIoResult CechI2cIo::begin_normal_retune_captrim_calibration_io(
+    bool pll_fraction_zero, NormalCapTrimCalibrationIoState *state)
+{
+    NormalCapTrimCalibrationIoResult calibration_result{};
+    calibration_result.io_result = result(DTV_INTERNAL_RESULT_OK);
+    if (state == nullptr || state->phase != NormalCapTrimCalibrationIoPhase::idle) {
+        calibration_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+        return calibration_result;
+    }
+    if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+        calibration_result.io_result = state->failure;
+        return calibration_result;
+    }
+    if (io_ == nullptr || io_->clock == nullptr || io_->clock->monotonic_now_ns == nullptr) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        calibration_result.io_result = state->failure;
+        return calibration_result;
+    }
+
+    auto now_ns = io_->clock->monotonic_now_ns(io_->clock->user);
+    if (timeout_.operation_deadline_ns != 0 && now_ns >= timeout_.operation_deadline_ns) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_TIMEOUT);
+        calibration_result.io_result = state->failure;
+        return calibration_result;
+    }
+    if (!torne::cech_zd1j::build_captrim_start_plan(&state->plan) ||
+        !state->plan.complete || state->plan.step_count != 2 ||
+        state->plan.steps[0].target != InitTarget::tuner ||
+        state->plan.steps[0].kind != InitStepKind::write ||
+        state->plan.steps[0].reg != 0x10 || state->plan.steps[0].value != 0x02B1 ||
+        state->plan.steps[1].target != InitTarget::tuner ||
+        state->plan.steps[1].kind != InitStepKind::write ||
+        state->plan.steps[1].reg != 0x1E || state->plan.steps[1].value != 0x0032) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
+        calibration_result.io_result = state->failure;
+        return calibration_result;
+    }
+    for (std::size_t index = 0; index < state->plan.step_count; ++index) {
+        const auto &step = state->plan.steps[index];
+        state->failure = write_tuner(static_cast<std::uint8_t>(step.reg),
+            static_cast<std::uint16_t>(step.value));
+        if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        ++state->plan_steps_completed;
+        if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+    }
+
+    std::uint16_t current_register = 0;
+    state->failure = read_tuner(0x18, &current_register);
+    if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    if (!torne::cech_zd1j::begin_captrim_calibration(true, current_register,
+            &state->machine) || !state->machine.retune || !state->machine.started ||
+        state->machine.candidate != static_cast<std::int16_t>(current_register & 0x007F) ||
+        state->machine.best_candidate != state->machine.candidate ||
+        state->machine.step != 4 || state->machine.minimum_difference != 3000 ||
+        state->machine.updates_remaining != 2) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    state->pll_fraction_zero = pll_fraction_zero;
+    state->failure = write_tuner(0x18,
+        torne::cech_zd1j::captrim_register_value(state->machine.candidate));
+    if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    ++state->plan_steps_completed;
+    if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+
+    std::uint16_t measurement = 0;
+    state->failure = read_tuner(0x1D, &measurement);
+    if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    if (!torne::cech_zd1j::complete_captrim_measurement(&state->machine, true,
+            measurement, state->pll_fraction_zero, &state->calibration) ||
+        !state->calibration.needs_measurement || state->calibration.complete ||
+        state->calibration.wait_tenth_ms != 25 ||
+        state->calibration.calibration_flags_to_clear != 0) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+
+    now_ns = io_->clock->monotonic_now_ns(io_->clock->user);
+    if (timeout_.operation_deadline_ns != 0 && now_ns >= timeout_.operation_deadline_ns) {
+        state->phase = NormalCapTrimCalibrationIoPhase::failed;
+        state->failure = result(DTV_INTERNAL_RESULT_TIMEOUT);
+        calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+    const auto wait_ms = static_cast<std::uint64_t>(10U *
+        (static_cast<std::uint32_t>(state->calibration.wait_tenth_ms) + 99U) / 100U);
+    const auto wait_ns = wait_ms * 1000000ULL;
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    state->measurement_ready_ns = now_ns > maximum - wait_ns ? maximum : now_ns + wait_ns;
+    state->phase = NormalCapTrimCalibrationIoPhase::waiting_retune_candidate;
+    calibration_result.status = NormalCapTrimCalibrationIoStatus::pending;
+    calibration_result.poll_interval_ms = static_cast<std::uint32_t>(wait_ms);
+    calibration_result.plan_steps_completed = state->plan_steps_completed;
+    return calibration_result;
+}
+
 NormalCapTrimCalibrationIoResult CechI2cIo::poll_normal_captrim_calibration_io(
     NormalCapTrimCalibrationIoState *state)
 {
@@ -1743,7 +2290,12 @@ NormalCapTrimCalibrationIoResult CechI2cIo::poll_normal_captrim_calibration_io(
         calibration_result.plan_steps_completed = state->plan_steps_completed;
         return calibration_result;
     }
-    if (state->phase != NormalCapTrimCalibrationIoPhase::waiting_measurement) {
+    const bool retune_candidate =
+        state->phase == NormalCapTrimCalibrationIoPhase::waiting_retune_candidate;
+    const bool retune_final_write =
+        state->phase == NormalCapTrimCalibrationIoPhase::waiting_retune_final_write;
+    if (state->phase != NormalCapTrimCalibrationIoPhase::waiting_measurement &&
+        !retune_candidate && !retune_final_write) {
         calibration_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
         return calibration_result;
     }
@@ -1788,6 +2340,67 @@ NormalCapTrimCalibrationIoResult CechI2cIo::poll_normal_captrim_calibration_io(
         return calibration_result;
     }
 
+    if (retune_final_write) {
+        if (!state->calibration.complete || state->calibration.needs_measurement ||
+            state->calibration.calibration_flags_to_clear != tuner_calibration_captrim) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        state->failure = write_tuner(0x18, state->calibration.register_value);
+        if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        ++state->plan_steps_completed;
+        if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        state->phase = NormalCapTrimCalibrationIoPhase::complete;
+        calibration_result.status = NormalCapTrimCalibrationIoStatus::complete;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        calibration_result.register_value = state->calibration.register_value;
+        calibration_result.calibration_valid = true;
+        calibration_result.calibration_flags_to_clear =
+            state->calibration.calibration_flags_to_clear;
+        return calibration_result;
+    }
+
+    if (retune_candidate) {
+        if (!state->calibration.needs_measurement || state->calibration.complete ||
+            state->calibration.wait_tenth_ms != 25 ||
+            state->calibration.calibration_flags_to_clear != 0) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        state->failure = write_tuner(0x18, state->calibration.register_value);
+        if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        ++state->plan_steps_completed;
+        if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire)) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_CANCELLED);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+    }
+
     std::uint16_t measurement = 0;
     state->failure = read_tuner(0x1D, &measurement);
     if (state->failure.code != DTV_INTERNAL_RESULT_OK) {
@@ -1808,6 +2421,45 @@ NormalCapTrimCalibrationIoResult CechI2cIo::poll_normal_captrim_calibration_io(
         state->phase = NormalCapTrimCalibrationIoPhase::failed;
         state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
         calibration_result.io_result = state->failure;
+        calibration_result.plan_steps_completed = state->plan_steps_completed;
+        return calibration_result;
+    }
+
+    if (state->machine.retune) {
+        const bool needs_next_candidate = state->calibration.needs_measurement;
+        if ((!needs_next_candidate && (!state->calibration.complete ||
+                state->calibration.calibration_flags_to_clear !=
+                    tuner_calibration_captrim)) ||
+            (needs_next_candidate && (state->calibration.complete ||
+                state->calibration.wait_tenth_ms != 25 ||
+                state->calibration.calibration_flags_to_clear != 0))) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_INTERNAL);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        now_ns = io_->clock->monotonic_now_ns(io_->clock->user);
+        if (timeout_.operation_deadline_ns != 0 && now_ns >= timeout_.operation_deadline_ns) {
+            state->phase = NormalCapTrimCalibrationIoPhase::failed;
+            state->failure = result(DTV_INTERNAL_RESULT_TIMEOUT);
+            calibration_result.io_result = state->failure;
+            calibration_result.plan_steps_completed = state->plan_steps_completed;
+            return calibration_result;
+        }
+        const auto wait_tenth_ms = needs_next_candidate
+            ? state->calibration.wait_tenth_ms : 25;
+        const auto wait_ms = static_cast<std::uint64_t>(10U *
+            (static_cast<std::uint32_t>(wait_tenth_ms) + 99U) / 100U);
+        const auto wait_ns = wait_ms * 1000000ULL;
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        state->measurement_ready_ns = now_ns > maximum - wait_ns
+            ? maximum : now_ns + wait_ns;
+        state->phase = needs_next_candidate
+            ? NormalCapTrimCalibrationIoPhase::waiting_retune_candidate
+            : NormalCapTrimCalibrationIoPhase::waiting_retune_final_write;
+        calibration_result.status = NormalCapTrimCalibrationIoStatus::pending;
+        calibration_result.poll_interval_ms = static_cast<std::uint32_t>(wait_ms);
         calibration_result.plan_steps_completed = state->plan_steps_completed;
         return calibration_result;
     }

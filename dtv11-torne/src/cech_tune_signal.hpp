@@ -19,8 +19,11 @@ struct TunePlan {
     std::uint32_t frequency_khz;
     std::uint32_t rf_request_khz;
     FrequencyBand band;
+    TunerVariant variant;
+    bool pll_fraction_zero;
     RegisterWrite writes[14];
     std::size_t write_count;
+    std::size_t captrim_post_write_offset;
 };
 
 bool build_tune_plan(std::uint64_t frequency_hz, std::uint8_t package,
@@ -251,6 +254,27 @@ struct TunerInitPlan {
     InitStep steps[80];
     std::size_t step_count;
 };
+
+struct TunerIdentityValues {
+    std::uint8_t package_code = 0;
+    std::uint8_t revision = 0;
+    std::uint8_t version_byte = 0;
+    TunerVariant variant = TunerVariant::standard;
+};
+
+bool decode_tuner_identity(std::uint16_t identity, TunerIdentityValues *values);
+bool tuner_init_needs_calibration_measurement(const TunerIdentityValues &identity,
+                                              std::uint16_t redundancy_a);
+bool build_tuner_init_gate_plan(TunerInitPlan *plan);
+bool build_tuner_init_reset_plan(TunerInitPlan *plan);
+bool build_tuner_init_defaults_plan(const TunerIdentityValues &identity,
+                                    std::uint16_t second_identity,
+                                    TunerInitPlan *plan);
+bool build_tuner_init_finish_plan(const TunerIdentityValues &identity,
+                                  std::uint16_t redundancy_a,
+                                  std::uint16_t redundancy_b,
+                                  std::uint16_t calibration_measurement,
+                                  TunerInitPlan *plan);
 
 bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity,
                            std::uint16_t redundancy_a, std::uint16_t redundancy_b,
