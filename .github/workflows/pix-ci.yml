@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: quiet-shelf pix product build
+
+on:
+  push:
+    paths:
+      - 'dtv11-pix/**'
+      - '.github/workflows/pix-ci.yml'
+  pull_request:
+    paths:
+      - 'dtv11-pix/**'
+      - '.github/workflows/pix-ci.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libusb (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
+      - name: Install libusb (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install libusb:x64-windows
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin') -Encoding utf8NoBOM
+      - name: Configure product (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S dtv11-pix -B build-product -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Configure product (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CL: /utf-8
+        run: >-
+          cmake -S dtv11-pix -B build-product -DBUILD_TESTING=OFF
+          "-DLIBUSB_INCLUDE_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\include\libusb-1.0"
+          "-DLIBUSB_LIBRARY=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib\libusb-1.0.lib"
+      - name: Build product library and CLI (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --build build-product --parallel 2 --target pix i0pixctl
+      - name: Build product library and CLI (Windows)
+        if: runner.os == 'Windows'
+        env:
+          CL: /utf-8
+        run: cmake --build build-product --config Release --parallel 2 --target pix i0pixctl
+      - name: Check metadata CLI (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./build-product/i0pixctl --help
+          ./build-product/i0pixctl --version
+          ./build-product/i0pixctl --models
+      - name: Check metadata CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ".\build-product\Release\i0pixctl.exe" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".\build-product\Release\i0pixctl.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".\build-product\Release\i0pixctl.exe" --models
