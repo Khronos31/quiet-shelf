@@ -276,6 +276,81 @@ TsFramerResult feed(std::span<const std::uint8_t> input,
 本 framer は入力 byte 列を有界メモリ上で整列・検証するための純粋なストリームフレーマであり、USB の非同期 IN 転送予約、パケット再並べ替え（reorder）、変換済みキューイング、製品コールバック、公開 188 バイトストリーム、および L3 / CLI / wire への接続は未実装・未接続である。
 `max_pending_bytes` は framer 内部の有界 pending 上限であり、USB IN 予約容量やハードウェアバッファ容量とは区別される。
 
+## 任意 open 初期化 I/O（PublicOpenOps::initialize）
+
+PR90 では、筐体オープン時（`dtv_open_enclosure`）に、製品が USB 転送を用いた独自の初期化シーケンス（レジスタ設定や初期化パケット送信など）を安全に実行するための内部 SPI フック `PublicOpenOps::initialize` を追加している。
+
+### 1. SPI 定義と引数構造
+
+`include/dtv/spi/device_ops.hpp` の `PublicOpenOps` 末尾に、省略可能な関数ポインタ `initialize` が追加されている。
+
+```cpp
+struct PublicOpenIo {
+    std::size_t handle_index = 0;
+    const dtv_usb_io *io = nullptr;
+};
+
+struct PublicOpenOps {
+    // ... 既存コールバック ...
+    dtv_internal_result (*initialize)(dtv_context *context,
+                                      std::span<const PublicOpenIo> ios,
+                                      dtv_timeout timeout,
+                                      const std::atomic<bool> *cancel) = nullptr;
+};
+```
+
+- **ハンドル別 I/O ビュー（`PublicOpenIo`）:**
+  - 選択された入力ハンドルごとに `handle_index` と借用された `io`（`const dtv_usb_io *`）のペアが配列（`std::span<const PublicOpenIo>`）として渡される。
+  - 提供される `dtv_usb_io` は、制御転送（`control`）、バルク出力（`bulk_out`）、バルク入力（`bulk_in`）のみをサポートする（アイソクロナス転送は提供されない）。
+  - 操作クロック（`dtv_runtime_clock`）が紐付けられ、呼び出し期限（`timeout`）の管理に使用される。
+
+### 2. 借用 I/O 境界とライフサイクル規則（製品コード側の制約）
+
+- **コールバック内限定の借用寿命:**
+  - 引数として渡される `std::span`、`PublicOpenIo` の各エントリ、`dtv_usb_io` ビュー、および内部コンテキストは、**`initialize` コールバックの実行中のみ借用される**。
+  - 製品コードは、これらのポインタや参照をグローバル変数や製品インスタンス内に保持（leak / retain）してはならず、コールバックからのリターン後に参照してはならない。
+- **コールバック完了後の受付停止:**
+  - `initialize` コールバックの終了時点で、Core は直ちに `accepting = false` を設定し、それ以降の新たな I/O 要求の受付を排他ロック下で遮断する。
+- **所有権とリクエストライフサイクル:**
+  - USB デバイスの claim、転送ワーカースレッド、リクエスト所有権（request owner）、および操作チケットはすべて Core が管理・所有する。
+  - コールバック中に投入された要求が未完了のまま残る場合でも、物理的な完了コールバック処理と転送解放（retire）が終わるまで、リクエストオーナーを通じて内部リソース（`PublicOpenIoOwner`）が保持される。製品側で非同期転送の生存期間を個別管理する必要はない。
+
+### 3. 呼び出し順序と既存契約の維持
+
+- **ソフトウェア上の配置順序:**
+  - コールバックは、Core ランタイムの起動後（および共有 IN 設定前）、かつ**初回の bulk-IN 要求を投入する前**に呼び出される。
+  - **重要:** これは Core におけるソフトウェア上のフック配置順序であり、**すべての対象ハードウェアにおける必須順序を規定するものではない**。
+- **既存 identify 契約の完全維持:**
+  - `initialize` が成功した場合（かつキャンセル・タイムアウトがない場合）、Core は従来どおり計画された初回 IN 要求（initial IN requests）を投入し、その物理的な受信完了を待機する。
+  - 完了した実際の受信バイト列を連結し、既存の `identify` または `identify_shared` コールバックへ渡す。
+  - **偽のペイロード（合成・空データ）を生成・供給したり、先行バインドを行うことはない**。従来の「初回 IN 完了待ち → 連結バイト取得 → identify 照合」という確定済みの順序・契約は完全に維持される。
+
+### 4. 失敗・キャンセル・クローズ処理と状態遷移
+
+- **初期化失敗時の動作:**
+  - コールバックが非 OK の内部結果を返した場合、またはキャンセル／タイムアウトが検出された場合、Core は新規 I/O 要求の受付を停止し、実行中の呼び出し元の完了および物理要求の retire を待機する。
+  - 筐体オープンは失敗となり、`dtv_open_enclosure` は初期化時のエラー（例: `DTV_ERROR_USB_IO`）を返す。
+  - 製品の `stop` コールバックは最大 1 回のみ呼び出され（二重呼出し防止ガード）、Core ランタイムが停止される。
+- **クローズ処理と PENDING / CLOSED:**
+  - 初期化失敗後、クリーンアップ処理（product `stop` および runtime stop）が正常に完了した場合の通常のクローズ（`dtv_close_enclosure`）は `CLOSED`（`DTV_ERROR_OK`）を返し、`dtv_get_enclosure_close_state` は `CLOSED` とともに初期オープン失敗の原因となった元のエラーコード（例: `DTV_ERROR_USB_IO`）を報告する。
+  - ただし、product `stop` や runtime stop 自体が失敗した場合は、その停止失敗エラーが close エラーや `first_error` に残り得るため、無条件に `DTV_ERROR_OK` や元オープンエラーが返ることを保証するものではない（クリーンアップ成功時の観測動作に限定）。
+  - 物理リクエストの retire が期限内に完了しない場合は `DTV_CLOSE_PENDING` を返し、リソースを保持して次回クローズ試行へ委ねる（PENDING を CLOSED 成功とみなすことはない）。
+
+### 5. 検証状況と実観測・未観測境界
+
+- **作者短時間検証における実観測事実:**
+  - 標準 Release ビルド（`-O3 -DNDEBUG`）にて、以下の動作を内部 fixture（`tests/fixture/usb-claim-lease.cpp`）で観測・確認済みである。
+    - **正常系:** `initialize` コールバック呼び出し（バルク OUT 1 回）→ 通常の初回バルク IN 完了（2 入力各 32 バイト、計 64 バイト）→ 既存 `identify` 照合成功によるオープン完了。
+    - **異常系:** `initialize` 失敗（バルク OUT 1 回後に `USB_IO` エラー模擬）→ 初回 IN の投入抑止 → `stop` コールバック 1 回呼び出し → 通常 `dtv_close_enclosure` で `CLOSED` / `DTV_ERROR_OK` 返却 → `dtv_get_enclosure_close_state` で `CLOSED` / 元の `DTV_ERROR_USB_IO` 返却 → `dtv_release_enclosure` による正常解放。
+- **未観測事項（実装意図と検証済み事実の区別）:**
+  - コールバック実行と外部 close 要求の直接競合。
+  - `DTV_CLOSE_PENDING` 状態の継続と複数回ポーリング。
+  - 非同期物理 retire 発生時におけるランタイム破棄・停止の完全な並行安全性。
+  - これらは Core の設計・実装上の意図として組み込まれているものの、作者の短時間スコープでは実観測されておらず、検証済みの事実とは区別される。
+- **位置づけと非保証境界:**
+  - 本 PR90 はドラフト実装候補であり、Core の正式採用や「製品 open / 暗号寿命の完成」を主張するものではない。
+  - 公開 C ABI、正規の L3 宣言・仕様（`spec/dtv11-l3-spec.md`）には変更はなく、本フックは内部 SPI に留まる。
+
 ## ライセンスと由来
 
 本リポジトリの Core ソースコードは dtv11 向けに新規作成されたものであり、読み取り専用の参照用 Core からコードをコピーしていない。各ソースファイルおよび文書ファイルには GPL-2.0-or-later の SPDX 識別子が付与されている。将来サードパーティ製ソースを追加する場合は、取り込み前にライセンスの互換性を確認しなければならない。

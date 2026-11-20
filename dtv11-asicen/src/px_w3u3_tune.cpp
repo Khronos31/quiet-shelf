@@ -7,17 +7,6 @@ namespace asicen::px_w3u3::detail {
 
 namespace ground_tune = ::asicen::detail::ground_tune;
 
-namespace {
-
-std::uint64_t rounded_frequency_khz(std::uint64_t frequency_hz)
-{
-    const auto whole_khz = frequency_hz / 1000;
-    const auto remainder_hz = frequency_hz % 1000;
-    return whole_khz + (remainder_hz >= 500 ? 1 : 0);
-}
-
-}
-
 const DemodulatorWrite ground_tune_prepare[2] = {
     {ground_tune::prepare[0].reg, ground_tune::prepare[0].value},
     {ground_tune::prepare[1].reg, ground_tune::prepare[1].value},
@@ -31,9 +20,11 @@ const DemodulatorWrite ground_tune_finish[3] = {
 
 bool calculate_ground_tune(std::uint64_t frequency_hz, GroundTuneValues *out)
 {
-    if (out == nullptr) return false;
+    if (out == nullptr || frequency_hz == 0) return false;
 
-    const auto input_frequency_khz = rounded_frequency_khz(frequency_hz);
+    // W3U3のHz入力は1000で整数除算し、1kHz未満を切り捨てる。
+    const auto input_frequency_khz = frequency_hz / 1000;
+    if (input_frequency_khz == 0) return false;
     ground_tune::TuneValues values{};
     if (!ground_tune::calculate_khz(input_frequency_khz, &values)) return false;
     *out = {

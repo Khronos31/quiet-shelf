@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <dtv/dtv.h>
+#include <dtv/spi/types.h>
 
 namespace dtv::spi {
 
@@ -88,6 +89,8 @@ struct model_information {
     };
     const device_receiver_information *device_receivers = nullptr;
     std::size_t device_receiver_count = 0;
+    /* 宣言しなければ nullptr。宣言がなければ device が1つの筐体はその raw、2つ以上は NULL。 */
+    dtv_derive_enclosure_serial_fn derive_enclosure_serial = nullptr;
 };
 
 struct model_operation_table {

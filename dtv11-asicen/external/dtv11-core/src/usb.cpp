@@ -185,6 +185,15 @@ public:
     {
         libusb_free_config_descriptor(descriptor);
     }
+    int get_string_descriptor(libusb_device_handle *handle, std::uint8_t index,
+                              std::uint16_t langid, unsigned char *data, int length,
+                              unsigned int timeout_ms) override
+    {
+        return libusb_control_transfer(handle, 0x80, 0x06,
+                                       static_cast<std::uint16_t>((0x03 << 8) | index),
+                                       langid, data, static_cast<std::uint16_t>(length),
+                                       timeout_ms);
+    }
     int open_device(libusb_device *device, libusb_device_handle **handle) override
     {
         return libusb_open(device, handle);
@@ -288,6 +297,12 @@ struct UsbContext::State {
     std::vector<std::pair<UsbConnectionIdentity, std::uint64_t>> connection_epochs;
     std::uint64_t next_connection_token = 1;
     std::mutex scan_mutex;
+    struct SerialCacheEntry {
+        std::uint32_t state = DTV_USB_SERIAL_ABSENT;
+        std::string utf8;
+    };
+    std::mutex serial_cache_mutex;
+    std::unordered_map<std::uint64_t, SerialCacheEntry> serial_cache;
     bool stop_event_thread = false;
     bool stop_lifecycle_thread = false;
     void mark_callbacks_returned();
@@ -521,7 +536,15 @@ struct EnclosureRuntime::State {
         std::uint64_t generation = 0;
         std::size_t handle_index = 0;
         std::uint8_t endpoint = 0;
+        bool control = false;
         bool input = false;
+        std::uint8_t control_request_type = 0;
+        std::uint8_t control_request = 0;
+        std::uint16_t control_value = 0;
+        std::uint16_t control_index = 0;
+        EnclosureRuntime::DispatchCallback dispatch = nullptr;
+        void *dispatch_user = nullptr;
+        std::shared_ptr<void> dispatch_owner;
         bool continuous = false;
         bool initial_published = false;
         dtv_internal_result (*sink)(void *, const UsbRuntimePacket *) = nullptr;
@@ -597,13 +620,21 @@ struct EnclosureRuntime::State {
         request->completion.result = result;
         request->completion.actual_length = actual_length;
         request->completion.reached_backend = request->reached_backend;
+        const auto data_offset = request->control ? LIBUSB_CONTROL_SETUP_SIZE : 0;
         if (include_bytes && request->continuous) {
-            const auto size = (std::min)(actual_length, request->buffer.size());
-            request->completion.bytes.assign(request->buffer.begin(), request->buffer.begin() + size);
+            const auto size = (std::min)(actual_length, request->buffer.size() - data_offset);
+            request->completion.bytes.assign(request->buffer.begin() + data_offset,
+                                             request->buffer.begin() + data_offset + size);
         } else if (include_bytes) {
-            const auto size = (std::min)(actual_length, request->buffer.size());
-            request->buffer.resize(size);
-            request->completion.bytes = std::move(request->buffer);
+            const auto size = (std::min)(actual_length, request->buffer.size() - data_offset);
+            if (request->control) {
+                request->completion.bytes.assign(request->buffer.begin() + data_offset,
+                                                 request->buffer.begin() + data_offset + size);
+                request->buffer.clear();
+            } else {
+                request->buffer.resize(size);
+                request->completion.bytes = std::move(request->buffer);
+            }
         } else {
             request->buffer.clear();
         }
@@ -659,7 +690,9 @@ struct EnclosureRuntime::State {
         std::size_t handle_index, std::uint8_t endpoint, bool input,
         std::span<const unsigned char> output, std::size_t input_capacity,
         std::uint64_t generation, const dtv_runtime_clock *clock,
-        const dtv_cancel *cancel, std::uint64_t deadline, std::uint64_t *request_id)
+        const dtv_cancel *cancel, std::uint64_t deadline, std::uint64_t *request_id,
+        EnclosureRuntime::DispatchCallback dispatch = nullptr, void *dispatch_user = nullptr,
+        std::shared_ptr<void> dispatch_owner = {})
     {
         if (request_id == nullptr || handle_index >= handles.size() ||
             (input ? input_capacity > INT_MAX : output.size() > INT_MAX)) return invalid();
@@ -672,6 +705,9 @@ struct EnclosureRuntime::State {
             request->generation = generation;
             request->deadline = deadline;
             request->cancel = cancel;
+            request->dispatch = dispatch;
+            request->dispatch_user = dispatch_user;
+            request->dispatch_owner = std::move(dispatch_owner);
             if (clock != nullptr) {
                 request->clock = *clock;
                 request->has_clock = true;
@@ -721,6 +757,64 @@ struct EnclosureRuntime::State {
             request->generation = generation;
             request->buffer.resize(input_capacity);
             request->completion.bytes.resize(input_capacity);
+            std::lock_guard lock(mutex);
+            if (stopping || !started || requests.size() >= kRequestCapacity ||
+                next_request_id == 0 || next_submit_sequence == 0) {
+                return stopping ? make_result(DTV_INTERNAL_RESULT_NOT_READY)
+                                : make_result(DTV_INTERNAL_RESULT_RESOURCE_EXHAUSTED);
+            }
+            request->id = next_request_id++;
+            request->submit_sequence = next_submit_sequence++;
+            requests.emplace(request->id, request);
+            try { pending.push_back(request->id); }
+            catch (...) { requests.erase(request->id); throw; }
+            *request_id = request->id;
+            condition.notify_all();
+            return make_result(DTV_INTERNAL_RESULT_OK);
+        } catch (...) {
+            return exception_result();
+        }
+    }
+
+    dtv_internal_result queue_control_request(
+        std::size_t handle_index, std::uint8_t request_type, std::uint8_t control_request,
+        std::uint16_t value, std::uint16_t index, std::uint16_t length,
+        std::span<const unsigned char> output, bool input, std::uint64_t generation,
+        const dtv_runtime_clock *clock, const dtv_cancel *cancel, std::uint64_t deadline,
+        EnclosureRuntime::DispatchCallback dispatch, void *dispatch_user,
+        std::shared_ptr<void> dispatch_owner, std::uint64_t *request_id)
+    {
+        if (request_id == nullptr || handle_index >= handles.size() ||
+            (input ? (request_type & LIBUSB_ENDPOINT_IN) == 0
+                   : (request_type & LIBUSB_ENDPOINT_IN) != 0) ||
+            (input ? !output.empty() : output.size() != length)) return invalid();
+        try {
+            auto request = std::make_shared<Request>();
+            request->owner = this;
+            request->handle_index = handle_index;
+            request->control = true;
+            request->input = input;
+            request->control_request_type = request_type;
+            request->control_request = control_request;
+            request->control_value = value;
+            request->control_index = index;
+            request->dispatch = dispatch;
+            request->dispatch_user = dispatch_user;
+            request->dispatch_owner = std::move(dispatch_owner);
+            request->generation = generation;
+            request->deadline = deadline;
+            request->cancel = cancel;
+            if (clock != nullptr) {
+                request->clock = *clock;
+                request->has_clock = true;
+            }
+            request->buffer.resize(LIBUSB_CONTROL_SETUP_SIZE + length);
+            libusb_fill_control_setup(request->buffer.data(), request_type, control_request,
+                                      value, index, length);
+            if (!input && length != 0) {
+                std::copy(output.begin(), output.end(),
+                          request->buffer.begin() + LIBUSB_CONTROL_SETUP_SIZE);
+            }
             std::lock_guard lock(mutex);
             if (stopping || !started || requests.size() >= kRequestCapacity ||
                 next_request_id == 0 || next_submit_sequence == 0) {
@@ -852,9 +946,14 @@ struct EnclosureRuntime::State {
                 continue;
             }
             request->transfer = transfer;
-            libusb_fill_bulk_transfer(transfer, lease->handle, request->endpoint,
-                request->buffer.data(), static_cast<int>(request->buffer.size()),
-                transfer_completed, request.get(), 0);
+            if (request->control) {
+                libusb_fill_control_transfer(transfer, lease->handle, request->buffer.data(),
+                    transfer_completed, request.get(), 0);
+            } else {
+                libusb_fill_bulk_transfer(transfer, lease->handle, request->endpoint,
+                    request->buffer.data(), static_cast<int>(request->buffer.size()),
+                    transfer_completed, request.get(), 0);
+            }
             {
                 std::lock_guard lock(mutex);
                 const auto slot = std::find_if(active.begin(), active.end(),
@@ -869,13 +968,25 @@ struct EnclosureRuntime::State {
                 *slot = request;
                 ++active_size;
             }
-            int status = LIBUSB_ERROR_OTHER;
-            try {
-                status = context->backend->submit_transfer(transfer);
-            } catch (...) {
-                status = LIBUSB_ERROR_OTHER;
+            struct SubmitState {
+                UsbTransferBackend *backend;
+                libusb_transfer *transfer;
+                int status = LIBUSB_ERROR_OTHER;
+            } submit{context->backend.get(), transfer};
+            const auto submit_action = [](void *user) -> int {
+                auto *state = static_cast<SubmitState *>(user);
+                try { state->status = state->backend->submit_transfer(state->transfer); }
+                catch (...) { state->status = LIBUSB_ERROR_OTHER; }
+                return state->status;
+            };
+            dtv_internal_result dispatch_result = make_result(DTV_INTERNAL_RESULT_OK);
+            if (request->dispatch != nullptr) {
+                dispatch_result = request->dispatch(request->dispatch_user, submit_action, &submit);
+            } else {
+                (void)submit_action(&submit);
             }
-            if (status != LIBUSB_SUCCESS) {
+            if (dispatch_result.code != DTV_INTERNAL_RESULT_OK ||
+                submit.status != LIBUSB_SUCCESS) {
                 {
                     std::lock_guard lock(mutex);
                     const auto slot = std::find_if(active.begin(), active.end(),
@@ -886,7 +997,8 @@ struct EnclosureRuntime::State {
                     }
                     request->transfer = nullptr;
                 }
-                dtv_internal_result result = usb_result(status);
+                dtv_internal_result result = dispatch_result.code != DTV_INTERNAL_RESULT_OK
+                    ? dispatch_result : usb_result(submit.status);
                 try { context->backend->free_transfer(transfer); }
                 catch (...) { result = exception_result(); }
                 finish_without_transfer(request, UsbRuntimeTerminal::failed, result);
@@ -1203,6 +1315,39 @@ dtv_internal_result EnclosureRuntime::submit_bulk_in(
 {
     return state_->queue_request(handle_index, endpoint, true, {}, capacity, generation,
                                  clock, cancel, deadline_ns, request_id);
+}
+
+dtv_internal_result EnclosureRuntime::submit_tune_bulk_out(
+    std::size_t handle_index, std::uint8_t endpoint, std::span<const unsigned char> bytes,
+    std::uint64_t generation, const dtv_runtime_clock *clock, std::uint64_t deadline_ns,
+    DispatchCallback dispatch, void *dispatch_user, std::shared_ptr<void> dispatch_owner,
+    std::uint64_t *request_id)
+{
+    return state_->queue_request(handle_index, endpoint, false, bytes, 0, generation, clock,
+        nullptr, deadline_ns, request_id, dispatch, dispatch_user, std::move(dispatch_owner));
+}
+
+dtv_internal_result EnclosureRuntime::submit_tune_bulk_in(
+    std::size_t handle_index, std::uint8_t endpoint, std::size_t capacity,
+    std::uint64_t generation, const dtv_runtime_clock *clock, std::uint64_t deadline_ns,
+    DispatchCallback dispatch, void *dispatch_user, std::shared_ptr<void> dispatch_owner,
+    std::uint64_t *request_id)
+{
+    return state_->queue_request(handle_index, endpoint, true, {}, capacity, generation, clock,
+        nullptr, deadline_ns, request_id, dispatch, dispatch_user, std::move(dispatch_owner));
+}
+
+dtv_internal_result EnclosureRuntime::submit_control(
+    std::size_t handle_index, std::uint8_t request_type, std::uint8_t request,
+    std::uint16_t value, std::uint16_t index, std::uint16_t length,
+    std::span<const unsigned char> output, bool input, std::uint64_t generation,
+    const dtv_runtime_clock *clock, const dtv_cancel *cancel, std::uint64_t deadline_ns,
+    DispatchCallback dispatch, void *dispatch_user, std::shared_ptr<void> dispatch_owner,
+    std::uint64_t *request_id)
+{
+    return state_->queue_control_request(handle_index, request_type, request, value, index,
+        length, output, input, generation, clock, cancel, deadline_ns, dispatch, dispatch_user,
+        std::move(dispatch_owner), request_id);
 }
 
 dtv_internal_result EnclosureRuntime::submit_shared_bulk_in(
@@ -2241,6 +2386,9 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             snapshot.bus_number = state_->backend->get_bus_number(devices[i]);
             snapshot.device_address = state_->backend->get_device_address(devices[i]);
             snapshot.configuration_count = descriptor.bNumConfigurations;
+            snapshot.serial_number_index = descriptor.iSerialNumber;
+            snapshot.serial_state = descriptor.iSerialNumber == 0
+                ? DTV_USB_SERIAL_ABSENT : DTV_USB_SERIAL_UNREADABLE;
             snapshot.candidate_id = static_cast<std::uint64_t>(i) + 1;
             snapshot.selection_token = selection_token;
             std::uint8_t ports[8]{};
@@ -2333,6 +2481,14 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate(dtv_internal_result *result
             std::remove_if(state_->connection_epochs.begin(), state_->connection_epochs.end(),
                 [&](const auto &entry) { return !observed_connections.contains(entry.second); }),
             state_->connection_epochs.end());
+        std::lock_guard serial_lock(state_->serial_cache_mutex);
+        for (auto entry = state_->serial_cache.begin(); entry != state_->serial_cache.end();) {
+            if (observed_connections.contains(entry->first)) {
+                ++entry;
+            } else {
+                entry = state_->serial_cache.erase(entry);
+            }
+        }
     }
     state_->backend->free_device_list(devices, 1);
     if (result != nullptr) {
@@ -2389,6 +2545,9 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate_fds(
             snapshot.bus_number = state_->backend->get_bus_number(device);
             snapshot.device_address = state_->backend->get_device_address(device);
             snapshot.configuration_count = descriptor.bNumConfigurations;
+            snapshot.serial_number_index = descriptor.iSerialNumber;
+            snapshot.serial_state = descriptor.iSerialNumber == 0
+                ? DTV_USB_SERIAL_ABSENT : DTV_USB_SERIAL_UNREADABLE;
             snapshot.candidate_id = static_cast<std::uint64_t>(index) + 1;
             std::uint8_t ports[8]{};
             const int port_count = state_->backend->get_port_numbers(device, ports, sizeof(ports));
@@ -2457,6 +2616,203 @@ std::vector<UsbDeviceSnapshot> UsbContext::enumerate_fds(
     if (result != nullptr) *result = make_result(DTV_INTERNAL_RESULT_UNSUPPORTED);
     return snapshots;
 #endif
+}
+
+namespace {
+
+void append_utf8(std::string &out, std::uint32_t code_point)
+{
+    if (code_point <= 0x7f) {
+        out.push_back(static_cast<char>(code_point));
+    } else if (code_point <= 0x7ff) {
+        out.push_back(static_cast<char>(0xc0 | (code_point >> 6)));
+        out.push_back(static_cast<char>(0x80 | (code_point & 0x3f)));
+    } else if (code_point <= 0xffff) {
+        out.push_back(static_cast<char>(0xe0 | (code_point >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (code_point & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (code_point >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (code_point & 0x3f)));
+    }
+}
+
+/* USB の STRING 記述子の中身（UTF-16LE）を、置換せず UTF-8 へ復号する。 */
+bool decode_utf16le(const unsigned char *data, std::size_t length, std::string *out)
+{
+    if ((length % 2) != 0) return false;
+    for (std::size_t index = 0; index < length; index += 2) {
+        std::uint32_t unit = static_cast<std::uint32_t>(data[index]) |
+                             (static_cast<std::uint32_t>(data[index + 1]) << 8);
+        if (unit >= 0xd800 && unit <= 0xdbff) {
+            if (index + 3 >= length) return false;
+            const std::uint32_t low = static_cast<std::uint32_t>(data[index + 2]) |
+                                      (static_cast<std::uint32_t>(data[index + 3]) << 8);
+            if (low < 0xdc00 || low > 0xdfff) return false;
+            append_utf8(*out, 0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00));
+            index += 2;
+        } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+            return false;
+        } else {
+            append_utf8(*out, unit);
+        }
+    }
+    return true;
+}
+
+bool next_utf8_code_point(std::string_view text, std::size_t &index, std::uint32_t *out)
+{
+    const auto lead = static_cast<unsigned char>(text[index]);
+    std::size_t width = 0;
+    std::uint32_t code_point = 0;
+    if (lead <= 0x7f) {
+        width = 1;
+        code_point = lead;
+    } else if ((lead & 0xe0) == 0xc0) {
+        width = 2;
+        code_point = lead & 0x1f;
+    } else if ((lead & 0xf0) == 0xe0) {
+        width = 3;
+        code_point = lead & 0x0f;
+    } else if ((lead & 0xf8) == 0xf0) {
+        width = 4;
+        code_point = lead & 0x07;
+    } else {
+        return false;
+    }
+    if (index + width > text.size()) return false;
+    for (std::size_t offset = 1; offset < width; ++offset) {
+        const auto byte = static_cast<unsigned char>(text[index + offset]);
+        if ((byte & 0xc0) != 0x80) return false;
+        code_point = (code_point << 6) | (byte & 0x3f);
+    }
+    static constexpr std::uint32_t minimum[5]{0, 0, 0x80, 0x800, 0x10000};
+    if (code_point < minimum[width] || code_point > 0x10ffff ||
+        (code_point >= 0xd800 && code_point <= 0xdfff)) return false;
+    index += width;
+    *out = code_point;
+    return true;
+}
+
+std::uint64_t serial_clock_now_ns()
+{
+    if (const auto *clock = system_runtime_clock();
+        clock != nullptr && clock->monotonic_now_ns != nullptr) {
+        return clock->monotonic_now_ns(clock->user);
+    }
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+}
+
+bool valid_public_serial(std::string_view text)
+{
+    if (text.empty() || text.size() > DTV_SPI_SERIAL_MAX_BYTES) return false;
+    std::size_t index = 0;
+    while (index < text.size()) {
+        std::uint32_t code_point = 0;
+        if (!next_utf8_code_point(text, index, &code_point)) return false;
+        if (code_point <= 0x1f || code_point == 0x7f) return false;
+    }
+    return true;
+}
+
+dtv_internal_result UsbContext::observe_serials(
+    std::vector<UsbDeviceSnapshot> &snapshots,
+    std::span<const std::pair<std::uint16_t, std::uint16_t>> declared,
+    std::uint64_t deadline_ns, std::uint32_t per_candidate_timeout_ms) const
+{
+    if (!state_) return make_result(DTV_INTERNAL_RESULT_OK);
+    for (auto &snapshot : snapshots) {
+        const bool is_declared = std::any_of(declared.begin(), declared.end(),
+            [&](const auto &identity) {
+                return identity.first == snapshot.vendor_id && identity.second == snapshot.product_id;
+            });
+        if (!is_declared) continue;
+        snapshot.serial_utf8.clear();
+        if (snapshot.connection_token != 0) {
+            std::lock_guard lock(state_->serial_cache_mutex);
+            const auto cached = state_->serial_cache.find(snapshot.connection_token);
+            if (cached != state_->serial_cache.end() &&
+                cached->second.state == DTV_USB_SERIAL_PRESENT) {
+                snapshot.serial_state = cached->second.state;
+                snapshot.serial_utf8 = cached->second.utf8;
+                continue;
+            }
+        }
+        if (snapshot.serial_number_index == 0) {
+            snapshot.serial_state = DTV_USB_SERIAL_ABSENT;
+            continue;
+        }
+        const auto now = serial_clock_now_ns();
+        if (now >= deadline_ns) {
+            snapshot.serial_state = DTV_USB_SERIAL_UNREADABLE;
+            continue;
+        }
+        const auto candidate_deadline = (std::min)(
+            deadline_ns,
+            now + static_cast<std::uint64_t>(per_candidate_timeout_ms) * 1000000u);
+        const auto remaining_timeout = [&]() -> std::uint32_t {
+            const auto current = serial_clock_now_ns();
+            if (current >= candidate_deadline) return 0;
+            return static_cast<std::uint32_t>((std::max)(
+                std::uint64_t{1},
+                (candidate_deadline - current + 999999) / 1000000));
+        };
+        libusb_device_handle *handle = nullptr;
+        bool owned = false;
+        if (snapshot.state_ && snapshot.state_->owner) {
+            handle = std::static_pointer_cast<UsbHandleLease>(snapshot.state_->owner)->handle;
+        } else if (snapshot.state_ && snapshot.state_->device != nullptr) {
+            if (state_->backend->open_device(snapshot.state_->device, &handle) == LIBUSB_SUCCESS)
+                owned = true;
+        }
+        if (handle == nullptr) {
+            snapshot.serial_state = DTV_USB_SERIAL_UNREADABLE;
+            continue;
+        }
+        std::uint32_t observed_state = DTV_USB_SERIAL_UNREADABLE;
+        std::string observed_utf8;
+        auto timeout_ms = remaining_timeout();
+        if (timeout_ms != 0) {
+            std::uint8_t language_ids[256]{};
+            const int language_result = state_->backend->get_string_descriptor(
+                handle, 0, 0, language_ids, sizeof(language_ids), timeout_ms);
+            std::uint16_t language = 0x0409;
+            if (language_result >= 4 && language_ids[1] == 0x03 && language_ids[0] >= 4) {
+                language = static_cast<std::uint16_t>(language_ids[2]) |
+                           (static_cast<std::uint16_t>(language_ids[3]) << 8);
+            }
+            timeout_ms = remaining_timeout();
+            std::uint8_t data[256]{};
+            const int read = timeout_ms == 0 ? -1 : state_->backend->get_string_descriptor(
+                handle, snapshot.serial_number_index, language, data, sizeof(data), timeout_ms);
+            if (read < 0) {
+                observed_state = DTV_USB_SERIAL_UNREADABLE;
+            } else if (read < 2 || data[0] < 2 || data[1] != 0x03 || read < data[0] ||
+                       ((data[0] - 2) % 2) != 0) {
+                observed_state = DTV_USB_SERIAL_MALFORMED;
+            } else if (!decode_utf16le(data + 2, data[0] - 2, &observed_utf8)) {
+                observed_state = DTV_USB_SERIAL_MALFORMED;
+            } else {
+                observed_state = DTV_USB_SERIAL_PRESENT;
+            }
+        }
+        if (owned) state_->backend->close_handle(handle);
+        snapshot.serial_state = observed_state;
+        if (observed_state == DTV_USB_SERIAL_PRESENT) {
+            snapshot.serial_utf8 = std::move(observed_utf8);
+            if (snapshot.connection_token != 0) {
+                std::lock_guard lock(state_->serial_cache_mutex);
+                state_->serial_cache[snapshot.connection_token] =
+                    UsbContext::State::SerialCacheEntry{snapshot.serial_state, snapshot.serial_utf8};
+            }
+        }
+    }
+    return make_result(DTV_INTERNAL_RESULT_OK);
 }
 
 dtv_internal_result UsbContext::acquire_claims(

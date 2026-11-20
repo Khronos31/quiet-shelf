@@ -1439,3 +1439,135 @@ PR40では、公開C API関数 `dtv_tune_by_channel()` による厳密なチャ�
   - 製品実機のlock観測source/byte/閾値・校正CNR電力測定・実機tuneコマンド・実機ストリーム転送・機器丸め/RF変換は未接続・未設定（実値・性能SLAの推測なし）。card APDU、daemon IPC、CLI channel/ts/card/firmware 実行も未接続。
   - 実機 Android 端末・USB 機器での実機動作確認、実機切断、permission 受渡し動作確認は未実施。架空の実機成功や全 OS 保証は行わない。
   - 製品実機の初期化・実機エンドポイント値・実機CARD/LOCK通知値・カードAPDU・公開操作接続・同期途中中断保証や数値 SLA は保証しない。
+
+## USB シリアル観測・機種導出 SPI・公開一意性契約（L3 決定 66）
+
+正本 L3 §4.4、決定 66（正本 `e8ec8eb9`）、およびユーザー決定（`core-20261118-fourth-merges-serial66-user-decision.json`）に基づき、Core による USB STRING 記述子（serial）の観測、機種固有の筐体シリアル導出 SPI（`dtv_derive_enclosure_serial_fn`）、公開シリアル文字列規則、公開 getter（`dtv_get_enclosure_serial`, `dtv_get_serial_unique`, `dtv_get_device_serial`）、および一意性判定規則を導入した。
+
+### 1. USB シリアル記述子の観測契約（Core 共通層）
+
+- **STRING 記述子の復号と状態管理:**
+  - Core は USB デバイスの STRING 記述子（UTF-16LE）を読み取り、可逆な lossless UTF-8 へ復号して保持する。
+  - 状態（`dtv_usb_serial_state`）は以下の 4 区分として明確に管理される:
+    - `DTV_USB_SERIAL_ABSENT` (0): デバイス記述子の `iSerialNumber` が 0（シリアル番号なし）。
+    - `DTV_USB_SERIAL_PRESENT` (1): UTF-16LE 記述子を正常に復号完了。`serial_utf8`（0..378 byte）が有効。
+    - `DTV_USB_SERIAL_UNREADABLE` (2): デバイス open 失敗、アクセス権限不足、BUSY、タイムアウト等による読取失敗。
+    - `DTV_USB_SERIAL_MALFORMED` (3): 記述子長不正、種別不正、または不正なサロゲートペア等の異常。
+- **観測範囲と制限:**
+  - 観測対象は、ロード済み製品が宣言した VID:PID を持つデバイスのみに限定する。未宣言のデバイスに対する記述子読取は行わない。
+  - 走査時に `claim_interface`、`detach_kernel_driver`、`reset_device` は一切行わない（アクティブなストリームや他のプロセスに影響を与えない）。
+- **走査予算とキャッシュ（未測定試値）:**
+  - 走査全体の予算は 2 秒、候補デバイスごとの予算は 250ms とする。候補ごとの 250ms は LANGID 取得と STRING 取得の 2 回の制御転送で共有される。
+  - これらの数値（250ms / 2s）は合成検証用の未測定の試値であり、実機環境での確定 SLA ではない。
+  - 同一の物理 USB 接続（connection token）において成功した復号 raw 値は Core 内部でキャッシュされ、一時的な読取失敗が生じても既知の値を破棄せず維持する。キャッシュは物理切断または再列挙（connection identity 変更）時に破棄される。
+- **FD 経路・token 経路の所有権契約:**
+  - 通常走査のほか、Android 等の FD 走査（`dtv_list_enclosures_by_fds`）および token 走査においても serial 観測が実行される。
+  - FD 経路において、caller から渡されたファイルディスクリプタ（FD）の所有権は caller に留まり、Core が勝手に close したり所有ハンドルを破棄することはない。
+
+### 2. 機種導出 SPI とモデル情報（`dtv::spi`）
+
+- **候補情報への raw シリアル開示:**
+  - `dtv_usb_candidate_info` に `serial_state`、`serial_utf8`、`serial_utf8_bytes` を追加。
+  - `serial_utf8` は Core が復号した UTF-8 バイト列への借用ポインタであり、NUL 文字や制御文字を含みうる。`serial_state == DTV_USB_SERIAL_PRESENT` の場合のみ有効。コールバック期間中のみ有効な借用値である。
+- **機種シリアル導出コールバック (`dtv_derive_enclosure_serial_fn`):**
+  - `model_information` に `dtv_derive_enclosure_serial_fn derive_enclosure_serial = nullptr;` を追加。
+  - コールバック署名:
+    ```c
+    typedef dtv_internal_result (*dtv_derive_enclosure_serial_fn)(
+        const dtv_serial_derive_input *input,
+        dtv_serial_derive_output *output,
+        char *buffer,
+        uint32_t capacity);
+    ```
+  - **純関数条件:**
+    - コールバックは外部 I/O、スレッド生成、大域的・静的状態の変更を行ってはならない。入力情報のみに基づき決定論的に導出値を算出する純関数として実装される。
+  - **2 段階呼び出しプロトコル（サイズ問い合わせと書き込み）:**
+    1. **サイズ問い合わせ:** `buffer = nullptr`, `capacity = 0` で呼び出される。導出可能な場合、`output->outcome = DTV_SERIAL_DERIVE_VALUE` を設定し、`output->length` に必要なバイト数を返す。
+    2. **書き込み:** Core が所有する 513 バイトのバッファ（`capacity = 513`）を渡して呼び出される。コールバックは結果を書き込み、`output->length` に実際の長さを返す。
+  - **導出値の検証と失敗不変性:**
+    - 導出されるシリアルの長さは 1..512 バイトでなければならず、513 バイト以上や 0 バイト、UINT32_MAX 等は拒否される。
+    - 書き込まれた値は Core 側で `valid_public_serial`（strict UTF-8、NUL および制御文字なし）により再検証される。
+    - コールバックが `DTV_SERIAL_DERIVE_UNKNOWN` を返した場合、エラーコードを返した場合、または検証に失敗した場合、Core は導出失敗（シリアル NULL）として扱い、出力先バッファの内容を変更せず、グループ判定（完全な筐体としての認識）自体を破棄・削除しない（グループを維持し、シリアルのみを NULL とする）。
+- **未宣言時の既定動作（ハードウェア差の吸収）:**
+  - 機種が `derive_enclosure_serial` を宣言しない（`nullptr`）場合:
+    - 筐体に属する device が 1 つだけの場合: 当該 device の raw シリアルを採用する（公開規則検査を満たす場合のみ）。
+    - 筐体に属する device が 2 つ以上の場合: 筐体シリアルは `nullptr`（NULL）とする。
+
+### 3. 公開シリアル文字列規則と公開 API
+
+- **公開シリアル文字列規則 (`valid_public_serial`):**
+  - 公開されるすべてのシリアル番号（筐体シリアル、デバイスシリアル、孤立デバイスシリアル、および candidate シリアル）は、以下の条件をすべて満たす必要がある（正本 L3 §4.4 / 決定 66）:
+    1. バイト長が **1 〜 512 バイト** の範囲内であること。
+    2. 正しい（strict）UTF-8 文字列であること。
+    3. **NUL 文字（`\0`）を含まない**こと。
+    4. **制御文字（ASCII 0x01〜0x1F、0x7F 等）を含まない**こと。
+  - raw 記述子に NUL や制御文字が含まれていた場合、raw 借用構造体（`dtv_usb_candidate_info`）には保持されうるが、公開 API（`dtv_get_*_serial`、`dtv_candidate::serial`、`dtv_ungrouped_device::serial`）からは NULL として扱われ、外部に露出しない。
+- **公開 getter 関数:**
+  - `const char *dtv_get_enclosure_serial(dtv_enclosure *object)`: 筐体シリアル文字列、または `NULL` を返す。
+  - `const char *dtv_get_device_serial(dtv_device *object)`: USB デバイスのシリアル文字列、または `NULL` を返す。
+  - `uint32_t dtv_get_serial_unique(dtv_enclosure *object)`: 一意性指標（`DTV_YES`, `DTV_NO`, `DTV_UNKNOWN`）を返す。
+  - これらの getter は事前確保済みの内部状態を参照し、USB I/O や動的メモリ確保を行わない。
+
+### 4. シリアル番号の一意性契約（`dtv_get_serial_unique`）
+
+- **比較対象の集合:**
+  - 同一走査内で検出された全製品の完全な筐体（complete group）を比較対象とする。
+  - 一覧の最大容量（既定 128 筐体）を超過して一覧配列から省かれた完全な筐体も、比較対象に含まれる（省かれた筐体とシリアルが重複していれば NO となる）。
+  - 孤立 USB デバイス（`ungrouped_usb_devices`）は一意性比較の対象外である。
+- **一意性の判定基準:**
+  - **`DTV_YES` (一意):**
+    - 自筐体のシリアル番号が確定（known）しており、かつハードウェア走査が完了（`complete`）しており、同一走査内の他の完全な筐体とシリアルの重複が存在しない場合。
+    - **他の筐体のシリアルが NULL または UNKNOWN であっても、自筐体の一意性（`DTV_YES`）を妨げない**（決定 66。シリアル不明な筐体はシリアル指定による選択対象とならないため。旧仕様の「他が未知なら YES 保留」は撤回・旧版仕様へ合致）。
+  - **`DTV_NO` (重複あり):**
+    - 同一走査内の別の完全な筐体と同一のシリアル番号を持つことが確認された場合。走査が未完了であっても、重複が検出された時点で直ちに `DTV_NO` となる。
+  - **`DTV_UNKNOWN` (未確定・不明):**
+    - 自筐体のシリアル番号が NULL の場合。
+    - ハードウェア走査が未完了または失敗で終了した場合（ただし既知の重複がある場合を除く）。
+
+### 5. 接点および未検証・未接続境界
+
+- **合成検証の範囲:**
+  - Core 内部の合成テスト（`tests/usb-serial.cpp`, `tests/fixture/serial-contract.cpp`）により、観測・復号・予算共有・cache・FD 所有権、SPI 導出プロトコル、公開規則検証、および一意性判定の契約を確認済みである。
+- **「シリアル完成」「SPI 安定」の不成立:**
+  - **Core 単体での合成テスト成功をもって「シリアル機能の完成」や「SPI 安定」とは呼ばない**（決定 66）。
+  - 実際の PX-Q3U4 実機における 2 function raw 観測、14 桁 base シリアル導出、製品（px4-userland）側のコールバック宣言、および CLI / daemon による serial 機器選択動作は未確認・未接続である。
+  - USB 記述子読取の実測遅延、実機 USB での権限・BUSY 挙動、およびアクティブな TS ストリームへの影響は未測定である。走査予算（250ms / 2s）は未測定の試値であり、実測に基づく見直しが後続課題として残されている。
+  - 既存 CLI および daemon との接続は本 PR の対象外であり、未接続・未実装である。
+
+
+
+## 公開tuneコールバックの借用I/O接続と安全性境界（PR87、内部基盤）
+
+PR87 では、公開選局（`dtv_tune_by_frequency` / `dtv_tune_by_channel`）の機種コールバックにおいて、同一筐体の Core claim / `EnclosureRuntime` に属する USB 借用 I/O 境界を接続している。
+
+- **借用 I/O 境界と対象種別:**
+  - `PublicTunePlan::handle_index` で特定された claimed handle に対し、`PublicTuneSession::io`（`const dtv_usb_io *`）を通じて control および bulk 転送のみを提供する（control/bulk 以外の転送種別は非対応）。
+  - `PublicTuneSession::io` view はコールバック実行中のみ借用され、コールバック外で保持してはならない。
+- **バッファ所有権とフェンス順序:**
+  - control setup / data および bulk 要求バッファは Core ランタイムが所有・管理する（request-owned buffer / context）。
+  - 要求ディスパッチ直前にキャンセル状態、呼び出し deadline、接続エポック、および操作エポックをフェンス検査し、最初の効果（first-effect）順序を直列化してバックエンドへ投入する。
+- **物理 retire 待機とライフサイクル境界:**
+  - タイムアウトやキャンセルが発生した場合でも、物理的な完了コールバック処理・transfer 解放・完了抽出（retire）が完了するまで操作チケットを保持し、競合する次の tune 作用を待機させる。
+  - 筐体 close 処理においても同一の retire 待機バリアに含まれ、期限内に retire が完了しなければ `DTV_CLOSE_PENDING` を返す。
+- **検証状況と位置づけ:**
+  - 内部 fixture（`usb_claim_lease_contract` の `--runtime-retire` および `--card-events`）の成功を確認済み（first-green 実行時刻は未保存）。
+  - 長い修正後の全 target 再走、Windows、NDK、実機 USB は未実施であり、製品 open 初期化・信号・実機完成を主張しない。PR81（筐体 close 改善）は別未マージであり、統合時に final-close 経路の調整を要する。公開 L3 および正本仕様の変更はない。
+
+
+
+## 任意open初期化I/Oの借用境界と閉鎖ライフサイクル（PR90、内部基盤）
+
+PR90 では、筐体オープン（`dtv_open_enclosure`）処理において、製品独自の初期化パケット送信等を可能にする任意の内部 SPI コールバック `PublicOpenOps::initialize` を追加している。製品側の利用仕様および詳細な契約規則は [product-integration.md](product-integration.md) を参照のこと。
+
+- **借用 I/O 境界とハンドル構造:**
+  - 選択された入力ハンドルごとに `PublicOpenIo`（`handle_index` および `const dtv_usb_io *io`）を介して control、bulk_out、bulk_in 転送を提供する（isochronous は非対応）。
+  - 各エントリおよび `dtv_usb_io` ビューはコールバック内限定で借用され、コールバック終了後に製品側で保持してはならない。
+- **順序配置と既存契約の維持:**
+  - Core ランタイム起動後、かつ初回 bulk-IN 要求の投入前にコールバックを実行する（全製品のハードウェア必須順とは規定しない）。
+  - コールバック成功後は、従来の計画に基づく初回 IN 要求の実受信完了、バイト列連結、および `identify` / `identify_shared` 呼び出し順序を完全に維持する（偽ペイロードや先行バインドは行わない）。
+- **障害時および閉鎖ライフサイクル:**
+  - コールバック失敗・キャンセル・タイムアウト時は直ちに I/O 受付を停止し、未完了要求の物理 retire を待機した上で製品 `stop` を最大 1 回呼び出してランタイムを停止する。
+  - `dtv_open_enclosure` は元エラーを返す。クリーンアップ（product stop および runtime stop）が正常に完了した場合の通常 `dtv_close_enclosure` は `CLOSED` / `DTV_ERROR_OK` を返し、`dtv_get_enclosure_close_state` は `CLOSED` とともに元のオープン失敗エラーを報告する（product stop や runtime stop 自体が失敗した場合はその停止エラーが close error や first_error に残り得ること、および retire 未完時は `DTV_CLOSE_PENDING` となることに留意）。
+- **検証状況と位置づけ:**
+  - 内部 fixture（`usb_claim_lease_contract --public-open-init-short`）にて、正常初期化（64-byte identify 成功）および失敗時クローズ（CLOSED / 元 USB_IO 報告）を観測済み。
+  - コールバック/close 競合、PENDING 継続、非同期物理 retire 安全は未観測であり、実装意図と観測事実を区別する。本 PR は内部 SPI 候補であり、公開 L3 仕様や正本 C ABI に変更はない。
