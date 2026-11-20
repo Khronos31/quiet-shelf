@@ -132,6 +132,26 @@ dtv_internal_result read_demodulator(const dtv::spi::PublicTuneRequest &request,
                             length_diagnostic, status_diagnostic);
 }
 
+dtv_internal_result read_demodulator_bytes(
+    const dtv::spi::PublicTuneRequest &request,
+    const dtv::spi::PublicTuneSession &session, std::uint8_t address,
+    std::uint8_t reg, std::uint8_t mode, std::span<std::uint8_t> values,
+    const char *length_diagnostic, const char *status_diagnostic)
+{
+    if (values.empty() || values.data() == nullptr || values.size() > 16)
+        return make_result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+
+    // 複数byteの応答も既存transferでstatusと残りtimeoutを検査する。
+    std::array<std::uint8_t, 17> response{};
+    const auto result = transfer(context_from_tune(request, session), request_i2c_read,
+        static_cast<std::uint16_t>((static_cast<std::uint16_t>(reg) << 8) | address),
+        mode, response.data(), values.size() + 1, true,
+        length_diagnostic, status_diagnostic);
+    if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+    std::copy_n(response.begin() + 1, values.size(), values.begin());
+    return result;
+}
+
 dtv_internal_result write_demodulator(const IoContext &context, std::uint8_t address,
                                       std::uint8_t reg, std::uint8_t value,
                                       const char *length_diagnostic,

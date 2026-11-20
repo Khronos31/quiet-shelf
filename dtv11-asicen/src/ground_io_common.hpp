@@ -56,6 +56,10 @@ dtv_internal_result read_demodulator(const dtv::spi::PublicTuneRequest &,
                                      const dtv::spi::PublicTuneSession &, std::uint8_t,
                                      std::uint8_t, std::uint8_t, std::uint8_t *,
                                      const char *, const char *);
+dtv_internal_result read_demodulator_bytes(const dtv::spi::PublicTuneRequest &,
+                                           const dtv::spi::PublicTuneSession &,
+                                           std::uint8_t, std::uint8_t, std::uint8_t,
+                                           std::span<std::uint8_t>, const char *, const char *);
 dtv_internal_result write_demodulator(const dtv::spi::PublicTuneRequest &,
                                       const dtv::spi::PublicTuneSession &, std::uint8_t,
                                       std::uint8_t, std::uint8_t, const char *, const char *);
