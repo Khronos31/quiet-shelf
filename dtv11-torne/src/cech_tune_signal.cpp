@@ -1581,7 +1581,8 @@ void begin_demod_sync_failure(DemodSyncState *state, DemodInitPlan *plan)
 
 }
 
-bool begin_demod_sync(DemodTransmissionMode mode, bool differential,
+bool begin_demod_sync(DemodTransmissionMode mode, std::uint8_t guard,
+                      bool differential,
                       bool wait_mpeg,
                       const DemodLayerConfig (&layers)[3],
                       std::uint64_t now_ms, DemodSyncState *state,
@@ -1591,7 +1592,9 @@ bool begin_demod_sync(DemodTransmissionMode mode, bool differential,
         return false;
     std::uint16_t register_32 = 0;
     std::uint16_t register_37 = 0;
-    if (!calculate_demod_loop_values(mode, false, &register_32, &register_37))
+    std::uint16_t sync_wait = 0;
+    if (!calculate_demod_loop_values(mode, false, &register_32, &register_37) ||
+        !calculate_demod_sync_wait(mode, guard, &sync_wait))
         return false;
     *state = {};
     state->stage = DemodSyncStage::await_coff_cpil;
@@ -1604,6 +1607,7 @@ bool begin_demod_sync(DemodTransmissionMode mode, bool differential,
     *plan = {};
     append(plan, InitStepKind::write, 32, register_32);
     append(plan, InitStepKind::write, 37, register_37);
+    append(plan, InitStepKind::masked_write, 273, sync_wait << 4, 0x000F);
     *poll_interval_ms = 10;
     return true;
 }

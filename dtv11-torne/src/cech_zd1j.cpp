@@ -150,13 +150,6 @@ std::uint16_t packed_value(std::uint32_t address)
                                       ((address >> 24) & 0xFF));
 }
 
-dtv_internal_result open_control_write(const dtv_usb_io *io, dtv_timeout timeout,
-                                       std::uint32_t address,
-                                       std::span<const std::uint8_t> bytes);
-dtv_internal_result open_wide_control_write(const dtv_usb_io *io, dtv_timeout timeout,
-                                            std::uint32_t address,
-                                            std::span<const std::uint8_t> bytes);
-
 dtv_internal_result control_read(CeChState *state, std::uint32_t address,
                                  std::span<std::uint8_t> bytes, bool wide)
 {
@@ -176,11 +169,14 @@ dtv_internal_result control_read(CeChState *state, std::uint32_t address,
 dtv_internal_result control_write(CeChState *state, std::uint32_t address,
                                   std::span<const std::uint8_t> bytes, bool wide)
 {
-    if (state == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    const auto timeout = io_timeout(state->io);
-    if (wide)
-        return open_wide_control_write(state->io, timeout, address, bytes);
-    return open_control_write(state->io, timeout, address, bytes);
+    if (state == nullptr || state->io == nullptr || state->io->control == nullptr ||
+        bytes.empty() || address > 0x01FFFFFF || bytes.size() > 0x02000000 - address)
+        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
+    dtv_buffer buffer{const_cast<std::uint8_t *>(bytes.data()), bytes.size(), bytes.size()};
+    return state->io->control(state->io->user,
+        wide ? kWideWriteType : kNarrowWriteType,
+        wide ? kWideRequest : kNarrowRequest, packed_value(address),
+        static_cast<std::uint16_t>(address & 0xFFFF), &buffer, io_timeout(state->io));
 }
 
 std::uint32_t read_be32(const std::uint8_t *bytes)
@@ -240,19 +236,6 @@ dtv_internal_result open_control_write(const dtv_usb_io *io, dtv_timeout timeout
         packed_value(address), static_cast<std::uint16_t>(address), &buffer, timeout);
 }
 
-dtv_internal_result open_wide_control_write(const dtv_usb_io *io, dtv_timeout timeout,
-                                            std::uint32_t address,
-                                            std::span<const std::uint8_t> bytes)
-{
-    if (io == nullptr || io->control == nullptr || bytes.empty() || (address & 3) != 0 ||
-        address < 0x01000000 || address > 0x01FFFFFF ||
-        bytes.size() > 0x02000000 - address)
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    dtv_buffer buffer{const_cast<std::uint8_t *>(bytes.data()), bytes.size(), bytes.size()};
-    return io->control(io->user, kWideWriteType, kWideRequest,
-        packed_value(address), static_cast<std::uint16_t>(address), &buffer, timeout);
-}
-
 dtv_internal_result open_wide_control_read(const dtv_usb_io *io, dtv_timeout timeout,
                                            std::uint32_t address,
                                            std::span<std::uint8_t> bytes)
@@ -288,14 +271,6 @@ dtv_internal_result open_write_word(const dtv_usb_io *io, dtv_timeout timeout,
     return open_control_write(io, timeout, address, bytes);
 }
 
-dtv_internal_result open_wide_write_word(const dtv_usb_io *io, dtv_timeout timeout,
-                                         std::uint32_t address, std::uint32_t value)
-{
-    std::uint8_t bytes[4]{};
-    write_be32(bytes, value);
-    return open_wide_control_write(io, timeout, address, bytes);
-}
-
 dtv_internal_result open_delay_ms(const dtv_usb_io *io, dtv_timeout timeout,
                                   const std::atomic<bool> *cancelled,
                                   std::uint32_t milliseconds)
@@ -316,116 +291,6 @@ dtv_internal_result open_delay_ms(const dtv_usb_io *io, dtv_timeout timeout,
         (cancelled != nullptr && cancelled->load(std::memory_order_acquire)))
         return result(DTV_INTERNAL_RESULT_CANCELLED);
     return delayed;
-}
-
-dtv_internal_result apply_stream_plan(const dtv_usb_io *io, dtv_timeout timeout,
-                                      const std::atomic<bool> *cancelled,
-                                      const torne::cech_zd1j::StreamPlan &plan)
-{
-    if (io == nullptr || io->control == nullptr)
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    for (std::size_t index = 0; index < plan.step_count; ++index) {
-        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
-            return result(DTV_INTERNAL_RESULT_CANCELLED);
-        const auto &step = plan.steps[index];
-        dtv_internal_result transferred = result(DTV_INTERNAL_RESULT_UNSUPPORTED);
-        switch (step.kind) {
-        case torne::cech_zd1j::StreamStepKind::write24:
-        case torne::cech_zd1j::StreamStepKind::trigger_write24:
-            transferred = open_write_word(io, timeout, step.reg, step.value);
-            break;
-        case torne::cech_zd1j::StreamStepKind::masked_write24: {
-            std::uint32_t current = 0;
-            transferred = open_read_word(io, timeout, step.reg, &current);
-            if (transferred.code == DTV_INTERNAL_RESULT_OK && cancelled != nullptr &&
-                cancelled->load(std::memory_order_acquire))
-                transferred = result(DTV_INTERNAL_RESULT_CANCELLED);
-            if (transferred.code == DTV_INTERNAL_RESULT_OK)
-                transferred = open_write_word(io, timeout, step.reg,
-                    (current & step.mask) | step.value);
-            break;
-        }
-        case torne::cech_zd1j::StreamStepKind::wide_write32:
-        case torne::cech_zd1j::StreamStepKind::trigger_wide_write32:
-            transferred = open_wide_write_word(io, timeout, step.reg, step.value);
-            break;
-        case torne::cech_zd1j::StreamStepKind::poll_mask_clear24: {
-            if (io->clock == nullptr || io->clock->monotonic_now_ns == nullptr ||
-                io->clock->delay_until == nullptr)
-                return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
-            const auto now = io->clock->monotonic_now_ns(io->clock->user);
-            const auto maximum = std::numeric_limits<std::uint64_t>::max();
-            const auto duration = static_cast<std::uint64_t>(step.timeout_ms) * 1000000;
-            auto poll_deadline = now > maximum - duration ? maximum : now + duration;
-            if (timeout.operation_deadline_ns != 0)
-                poll_deadline = std::min(poll_deadline, timeout.operation_deadline_ns);
-            bool first_poll = true;
-            for (;;) {
-                if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
-                    return result(DTV_INTERNAL_RESULT_CANCELLED);
-                if (!first_poll && io->clock->monotonic_now_ns(io->clock->user) >= poll_deadline)
-                    return result(DTV_INTERNAL_RESULT_TIMEOUT);
-                first_poll = false;
-                std::uint32_t current = 0;
-                transferred = open_read_word(io, timeout, step.reg, &current);
-                if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-                const auto polled_at = io->clock->monotonic_now_ns(io->clock->user);
-                if (polled_at >= poll_deadline) return result(DTV_INTERNAL_RESULT_TIMEOUT);
-                if ((current & step.mask) == 0) break;
-                const auto poll_now = polled_at;
-                const auto interval = static_cast<std::uint64_t>(step.interval_ms) * 1000000;
-                const auto wake = poll_now > maximum - interval
-                    ? maximum : std::min(poll_now + interval, poll_deadline);
-                std::uint32_t clock_cancelled = 0;
-                transferred = io->clock->delay_until(io->clock->user, wake,
-                    timeout.operation_deadline_ns, nullptr, &clock_cancelled);
-                if (clock_cancelled != 0 ||
-                    (cancelled != nullptr && cancelled->load(std::memory_order_acquire)))
-                    return result(DTV_INTERNAL_RESULT_CANCELLED);
-                if (transferred.code != DTV_INTERNAL_RESULT_OK &&
-                    transferred.code != DTV_INTERNAL_RESULT_TIMEOUT)
-                    return transferred;
-            }
-            break;
-        }
-        }
-        if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-        if (cancelled != nullptr && cancelled->load(std::memory_order_acquire))
-            return result(DTV_INTERNAL_RESULT_CANCELLED);
-    }
-    return result(DTV_INTERNAL_RESULT_OK);
-}
-
-[[maybe_unused]] dtv_internal_result apply_stream_start_plans(
-    const dtv_usb_io *io, dtv_timeout timeout,
-    const std::atomic<bool> *cancelled)
-{
-    if (io == nullptr || io->control == nullptr)
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    torne::cech_zd1j::StreamPlan plan{};
-    if (!torne::cech_zd1j::build_stream_engine_plan(&plan))
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    auto transferred = apply_stream_plan(io, timeout, cancelled, plan);
-    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    if (!torne::cech_zd1j::build_stream_core0_run_plan(&plan))
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    transferred = apply_stream_plan(io, timeout, cancelled, plan);
-    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
-    if (!torne::cech_zd1j::build_stream_input_start_plan(&plan))
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    return apply_stream_plan(io, timeout, cancelled, plan);
-}
-
-[[maybe_unused]] dtv_internal_result apply_stream_input_close_plan(
-    const dtv_usb_io *io, dtv_timeout timeout,
-    const std::atomic<bool> *cancelled)
-{
-    if (io == nullptr || io->control == nullptr)
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    torne::cech_zd1j::StreamPlan plan{};
-    if (!torne::cech_zd1j::build_stream_input_close_plan(&plan))
-        return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
-    return apply_stream_plan(io, timeout, cancelled, plan);
 }
 
 [[maybe_unused]] dtv_internal_result initialize_frontend_power(

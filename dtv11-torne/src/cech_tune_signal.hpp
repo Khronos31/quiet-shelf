@@ -224,7 +224,8 @@ struct DemodSyncState {
 
 enum class DemodSyncStatus { pending, complete, failed, recovery_failed };
 
-bool begin_demod_sync(DemodTransmissionMode mode, bool differential,
+bool begin_demod_sync(DemodTransmissionMode mode, std::uint8_t guard,
+                      bool differential,
                       bool wait_mpeg,
                       const DemodLayerConfig (&layers)[3],
                       std::uint64_t now_ms, DemodSyncState *state,
