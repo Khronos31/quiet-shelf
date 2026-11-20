@@ -135,6 +135,80 @@ dtv_internal_result CechI2cIo::write_demodulator(std::uint16_t reg, std::uint16_
     return transact(0x24, 1, bytes, {});
 }
 
+dtv_internal_result CechI2cIo::sleep_frontend()
+{
+    if (io_ == nullptr || io_->clock == nullptr ||
+        io_->clock->monotonic_now_ns == nullptr)
+        return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+
+    const auto check_operation = [this]() {
+        if (cancelled_ != nullptr && cancelled_->load(std::memory_order_acquire))
+            return result(DTV_INTERNAL_RESULT_CANCELLED);
+        if (io_ == nullptr || io_->clock == nullptr ||
+            io_->clock->monotonic_now_ns == nullptr)
+            return result(DTV_INTERNAL_RESULT_UNSUPPORTED);
+        if (timeout_.operation_deadline_ns != 0 &&
+            io_->clock->monotonic_now_ns(io_->clock->user) >=
+                timeout_.operation_deadline_ns)
+            return result(DTV_INTERNAL_RESULT_TIMEOUT);
+        return result(DTV_INTERNAL_RESULT_OK);
+    };
+    const auto read = [this, &check_operation](std::uint16_t reg,
+                                               std::uint16_t *value) {
+        auto checked = check_operation();
+        if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+        const auto transferred = read_demodulator(reg, value);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+        return check_operation();
+    };
+    const auto write = [this, &check_operation](std::uint16_t reg,
+                                                std::uint16_t value) {
+        auto checked = check_operation();
+        if (checked.code != DTV_INTERNAL_RESULT_OK) return checked;
+        const auto transferred = write_demodulator(reg, value);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+        return check_operation();
+    };
+    const auto masked_write = [&read, &write](std::uint16_t reg,
+                                              std::uint16_t set_bits,
+                                              std::uint16_t retain_mask) {
+        std::uint16_t current = 0;
+        auto transferred = read(reg, &current);
+        if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+        return write(reg, static_cast<std::uint16_t>((current & retain_mask) | set_bits));
+    };
+
+    auto transferred = masked_write(1030, 0x0001, 0xFFFE);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = write(1286, 0);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = write(774, 0x3FFF);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = write(775, 0xFFFF);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = write(776, 0xFFFF);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = masked_write(900, 0x0003, 0xFFFC);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = masked_write(1280, 0, 0x00FF);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+
+    std::uint16_t adc_slow_off_value = 0;
+    std::uint16_t adc_current_value = 0;
+    transferred = read(907, &adc_current_value);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = read(908, &adc_slow_off_value);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = write(907, adc_current_value);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    transferred = write(908, static_cast<std::uint16_t>(adc_slow_off_value | 0x0003));
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+
+    transferred = write(907, 0x3000);
+    if (transferred.code != DTV_INTERNAL_RESULT_OK) return transferred;
+    return write(908, 0x007A);
+}
+
 dtv_internal_result CechI2cIo::observe_cnr(CnrObservation *observation)
 {
     if (observation == nullptr) return result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);

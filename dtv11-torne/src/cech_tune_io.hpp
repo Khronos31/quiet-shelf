@@ -350,6 +350,7 @@ public:
         P1gCapTrimCalibrationIoState *state);
     // Run synchronously while the callback-scoped I/O view remains valid.
     TunerInitializationIoResult initialize_tuner();
+    dtv_internal_result sleep_frontend();
     dtv_internal_result observe_cnr(CnrObservation *observation);
     DemodSyncIoResult begin_sync(DemodTransmissionMode mode, std::uint8_t guard,
                                  bool differential,
