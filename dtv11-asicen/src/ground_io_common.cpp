@@ -262,6 +262,20 @@ dtv_internal_result write_rf_tuner(const IoContext &context, std::uint8_t demodu
                        length_diagnostic, status_diagnostic);
 }
 
+dtv_internal_result write_rf_tuner_registers(
+    const IoContext &context, std::uint8_t demodulator,
+    std::span<const std::uint8_t, 6> values,
+    const char *length_diagnostic, const char *status_diagnostic)
+{
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const auto result = write_rf_tuner(context, demodulator,
+            static_cast<std::uint8_t>(i + 1), values[i],
+            length_diagnostic, status_diagnostic);
+        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
+    }
+    return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
 dtv_internal_result write_rf_tuner(const dtv::spi::PublicTuneRequest &request,
                                    const dtv::spi::PublicTuneSession &session,
                                    std::uint8_t demodulator, std::uint8_t reg, std::uint8_t value,

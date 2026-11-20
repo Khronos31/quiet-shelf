@@ -27,7 +27,7 @@ constexpr BandMultiplier band_multipliers[] = {
 std::uint64_t center_frequency_khz(std::uint64_t frequency_khz)
 {
     if (frequency_khz >= 165000 && frequency_khz <= 167000) return 167143;
-    if (frequency_khz >= 195000 && frequency_khz <= 197000) return 195143;
+    if (frequency_khz >= 195000 && frequency_khz <= 197999) return 195143;
     if (frequency_khz >= 471000 && frequency_khz <= 473000) return 473143;
     return (frequency_khz / 1000) * 1000 + 0x8f;
 }
@@ -57,7 +57,6 @@ bool calculate_khz(std::uint64_t frequency_khz, TuneValues *out)
     const auto am = xdiv % 8;
     std::uint64_t reg1 = am;
     if (am < 2) {
-        if (pm == 0) return false;
         reg1 += 8;
         --pm;
     }

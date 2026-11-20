@@ -144,12 +144,11 @@ dtv_internal_result write_tuner_registers(const dtv::spi::PublicTuneRequest &req
     const std::array<std::uint8_t, 6> registers{
         values.tuner.reg1, values.tuner.reg2, values.tuner.reg3,
         values.tuner.reg4, values.tuner.reg5, values.tuner.reg6};
-    for (std::size_t i = 0; i < registers.size(); ++i) {
-        const auto result = write_rf_tuner(request, session,
-            static_cast<std::uint8_t>(i + 1), registers[i]);
-        if (result.code != DTV_INTERNAL_RESULT_OK) return result;
-    }
-    return make_result(DTV_INTERNAL_RESULT_OK);
+    const ::asicen::detail::ground_io::IoContext context{
+        session.io, request.timeout, request.cancelled};
+    return ::asicen::detail::ground_io::write_rf_tuner_registers(
+        context, ground_demodulator, registers,
+        response_length_diagnostic, response_status_diagnostic);
 }
 
 dtv_internal_result tune_rf_tuner(const dtv::spi::PublicTuneRequest &request,

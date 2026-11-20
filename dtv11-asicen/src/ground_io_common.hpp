@@ -34,6 +34,9 @@ dtv_internal_result read_rf_tuner(const IoContext &, std::uint8_t, std::uint8_t,
                                   std::uint8_t *, const char *, const char *);
 dtv_internal_result write_rf_tuner(const IoContext &, std::uint8_t, std::uint8_t,
                                    std::uint8_t, const char *, const char *);
+dtv_internal_result write_rf_tuner_registers(const IoContext &, std::uint8_t,
+                                             std::span<const std::uint8_t, 6>,
+                                             const char *, const char *);
 dtv_internal_result read_gpio(const IoContext &, std::uint8_t *, const char *);
 dtv_internal_result write_gpio_verified(const IoContext &, std::uint8_t, std::uint8_t,
                                         std::uint8_t, const char *, const char *);
