@@ -533,6 +533,7 @@ struct EnclosureRuntime::State {
         State *owner = nullptr;
         std::uint64_t id = 0;
         std::uint64_t submit_sequence = 0;
+        std::uint64_t last_callback_submit_sequence = 0;
         std::uint64_t generation = 0;
         std::size_t handle_index = 0;
         std::uint8_t endpoint = 0;
@@ -561,6 +562,7 @@ struct EnclosureRuntime::State {
         bool reached_backend = false;
         bool callback_received = false;
         bool terminal_requested = false;
+        bool terminal_sink_delivered = false;
         bool cancel_sent = false;
         bool completion_ready = false;
         UsbRuntimeTerminal terminal = UsbRuntimeTerminal::failed;
@@ -600,6 +602,7 @@ struct EnclosureRuntime::State {
         std::lock_guard lock(request->owner->mutex);
         request->status = transfer->status;
         request->actual_length = transfer->actual_length;
+        request->last_callback_submit_sequence = request->submit_sequence;
         request->callback_received = true;
         request->owner->condition.notify_all();
     }
@@ -676,6 +679,9 @@ struct EnclosureRuntime::State {
             packet.terminal = terminal;
             packet.result = result;
             (void)call_callback([&] { return request->sink(request->sink_user, &packet); });
+            std::lock_guard lock(mutex);
+            request->terminal_sink_delivered = true;
+            condition.notify_all();
         }
     }
 
@@ -1120,6 +1126,9 @@ struct EnclosureRuntime::State {
                             terminal = UsbRuntimeTerminal::failed;
                             result = sink_result;
                         }
+                        if (terminal != UsbRuntimeTerminal::completed || stopping ||
+                            request->terminal_requested)
+                            request->terminal_sink_delivered = true;
                         if (request->handoff_first_completion) {
                             request->initial_published = true;
                             if (terminal != UsbRuntimeTerminal::completed || stopping ||
@@ -1180,6 +1189,10 @@ struct EnclosureRuntime::State {
                     packet.result = result;
                     lock.unlock();
                     (void)call_callback([&] { return request->sink(request->sink_user, &packet); });
+                    lock.lock();
+                    request->terminal_sink_delivered = true;
+                    condition.notify_all();
+                    lock.unlock();
                 }
                 continue;
             }
@@ -1506,6 +1519,38 @@ dtv_internal_result EnclosureRuntime::take_completion(std::uint64_t request_id,
     --state_->completed_size;
     state_->requests.erase(found);
     *available = true;
+    return make_result(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result EnclosureRuntime::inspect_request(
+    std::uint64_t request_id, UsbRuntimeRequestState *diagnostic)
+{
+    if (request_id == 0 || diagnostic == nullptr) return invalid();
+    std::lock_guard lock(state_->mutex);
+    const auto found = state_->requests.find(request_id);
+    if (found == state_->requests.end()) return invalid();
+    const auto &request = found->second;
+    diagnostic->request_id = request->id;
+    diagnostic->submit_sequence = request->submit_sequence;
+    diagnostic->last_callback_submit_sequence = request->last_callback_submit_sequence;
+    diagnostic->last_completion_sequence = request->completion.completion_sequence;
+    diagnostic->endpoint = request->endpoint;
+    diagnostic->input = request->input;
+    diagnostic->continuous = request->continuous;
+    diagnostic->pending = std::find(state_->pending.begin(), state_->pending.end(), request_id) !=
+        state_->pending.end();
+    diagnostic->active = std::any_of(state_->active.begin(), state_->active.end(),
+        [&](const auto &entry) { return entry == request; });
+    diagnostic->reached_backend = request->reached_backend;
+    diagnostic->callback_received = request->callback_received;
+    diagnostic->terminal_requested = request->terminal_requested;
+    diagnostic->terminal_sink_delivered = request->terminal_sink_delivered;
+    diagnostic->cancel_sent = request->cancel_sent;
+    diagnostic->completion_ready = request->completion_ready;
+    diagnostic->previous_completion_consumed =
+        request->last_callback_submit_sequence != 0 &&
+        request->last_callback_submit_sequence < request->submit_sequence &&
+        !request->completion_ready;
     return make_result(DTV_INTERNAL_RESULT_OK, 0);
 }
 

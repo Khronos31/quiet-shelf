@@ -129,6 +129,25 @@ struct UsbRuntimeCompletion {
     std::vector<unsigned char> bytes;
 };
 
+struct UsbRuntimeRequestState {
+    std::uint64_t request_id = 0;
+    std::uint64_t submit_sequence = 0;
+    std::uint64_t last_callback_submit_sequence = 0;
+    std::uint64_t last_completion_sequence = 0;
+    std::uint8_t endpoint = 0;
+    bool input = false;
+    bool continuous = false;
+    bool pending = false;
+    bool active = false;
+    bool reached_backend = false;
+    bool callback_received = false;
+    bool terminal_requested = false;
+    bool terminal_sink_delivered = false;
+    bool cancel_sent = false;
+    bool completion_ready = false;
+    bool previous_completion_consumed = false;
+};
+
 struct UsbRuntimePacket {
     std::uint64_t request_id = 0;
     std::uint64_t submit_sequence = 0;
@@ -196,6 +215,8 @@ public:
     dtv_internal_result next_completion(UsbRuntimeCompletion *, bool *available);
     dtv_internal_result take_completion(std::uint64_t request_id,
                                         UsbRuntimeCompletion *, bool *available);
+    dtv_internal_result inspect_request(std::uint64_t request_id,
+                                       UsbRuntimeRequestState *);
     UsbRuntimeStopResult stop(const dtv_runtime_clock *, std::uint64_t deadline_ns);
     dtv_internal_result join_release();
     std::size_t worker_count() const;

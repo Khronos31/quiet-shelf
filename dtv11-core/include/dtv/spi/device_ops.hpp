@@ -369,6 +369,8 @@ struct PublicOpenOps {
     dtv_internal_result (*initialize)(dtv_context *, std::span<const PublicOpenIo>,
                                       dtv_timeout, const std::atomic<bool> *) = nullptr;
     bool (*identify_requires_initial_data)(dtv_context *) = nullptr;
+    dtv_internal_result (*cleanup)(dtv_context *, std::span<const PublicOpenIo>,
+                                   dtv_timeout, const std::atomic<bool> *) = nullptr;
 };
 
 struct ModelEntry {

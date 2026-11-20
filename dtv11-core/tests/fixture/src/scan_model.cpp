@@ -108,6 +108,13 @@ std::atomic<bool> scan_open_identify_blocked{false};
 std::atomic<bool> scan_open_identify_release{true};
 std::atomic<unsigned> scan_open_initialize_calls{0};
 std::atomic<std::size_t> scan_open_initialize_io_count{0};
+std::atomic<unsigned> scan_open_cleanup_calls{0};
+std::atomic<unsigned> scan_open_cleanup_io_count{0};
+std::atomic<unsigned> scan_open_cleanup_behavior{0};
+std::atomic<unsigned> scan_open_cleanup_second_result{0};
+std::atomic<unsigned> scan_open_event_sequence{0};
+std::atomic<unsigned> scan_open_cleanup_order{0};
+std::atomic<unsigned> scan_open_stop_order{0};
 unsigned scan_open_plan_calls = 0;
 std::size_t scan_open_plan_count = 0;
 std::array<std::size_t, 2> scan_open_plan_handles{};
@@ -793,8 +800,59 @@ dtv_internal_result scan_open_initialize(dtv_context *,
 
 dtv_internal_result scan_open_stop(dtv_context *, dtv_timeout)
 {
+    scan_open_stop_order.store(scan_open_event_sequence.fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
     scan_open_stop_calls.fetch_add(1, std::memory_order_release);
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result scan_open_cleanup(dtv_context *,
+    std::span<const dtv::spi::PublicOpenIo> ios, dtv_timeout timeout, const std::atomic<bool> *)
+{
+    scan_open_cleanup_calls.fetch_add(1, std::memory_order_release);
+    scan_open_cleanup_order.store(scan_open_event_sequence.fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
+    const auto behavior = scan_open_cleanup_behavior.load(std::memory_order_acquire);
+    if (behavior == 4) {
+        scan_open_identify_blocked.store(true, std::memory_order_release);
+        scan_open_identify_blocked.notify_all();
+        while (!scan_open_identify_release.load(std::memory_order_acquire))
+            scan_open_identify_release.wait(false);
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
+    if (behavior >= 1 && behavior <= 3) {
+        if (ios.empty() || ios.front().io == nullptr || ios.front().io->bulk_out == nullptr)
+            return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+        if (behavior == 2) {
+            scan_open_identify_blocked.store(true, std::memory_order_release);
+            scan_open_identify_blocked.notify_all();
+            while (!scan_open_identify_release.load(std::memory_order_acquire))
+                scan_open_identify_release.wait(false);
+        }
+        static const unsigned char cleanup_byte = 0x5a;
+        const dtv_bytes output{&cleanup_byte, 1};
+        const auto first = ios.front().io->bulk_out(ios.front().io->user, 0x02, output, {});
+        if (first.code == DTV_INTERNAL_RESULT_OK)
+            scan_open_cleanup_io_count.fetch_add(1, std::memory_order_release);
+        if (behavior == 1)
+            return first.code == DTV_INTERNAL_RESULT_OK
+                ? dtv_internal_result_make(DTV_INTERNAL_RESULT_USB_IO, 0) : first;
+        if (behavior == 3 && timeout.timeout_ms != 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                static_cast<std::chrono::milliseconds::rep>(timeout.timeout_ms + 2)));
+        const auto second = ios.front().io->bulk_out(ios.front().io->user, 0x02, output, {});
+        scan_open_cleanup_second_result.store(second.code, std::memory_order_release);
+        return second;
+    }
+    if (scan_public_open_case != 20) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    if (ios.empty() || ios.front().io == nullptr || ios.front().io->bulk_out == nullptr)
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    static const unsigned char cleanup_byte = 0x5a;
+    const dtv_bytes output{&cleanup_byte, 1};
+    const auto result = ios.front().io->bulk_out(ios.front().io->user, 0x02, output, {});
+    if (result.code == DTV_INTERNAL_RESULT_OK)
+        scan_open_cleanup_io_count.fetch_add(1, std::memory_order_release);
+    return result;
 }
 
 dtv_internal_result scan_open_identify(dtv_context *, std::span<const unsigned char> bytes,
@@ -1902,7 +1960,7 @@ const dtv::spi::PublicOpenOps scan_public_open_ops{
     [](dtv_context *) {
         return scan_public_open_case != 21 && scan_public_open_case != 23 &&
                scan_public_open_case != 24;
-    }};
+    }, scan_open_cleanup};
 
 }
 
@@ -1916,6 +1974,13 @@ void set_scan_public_open_case(unsigned value)
     scan_public_open_case = value;
     scan_open_initialize_calls.store(0, std::memory_order_release);
     scan_open_initialize_io_count.store(0, std::memory_order_release);
+    scan_open_cleanup_calls.store(0, std::memory_order_release);
+    scan_open_cleanup_io_count.store(0, std::memory_order_release);
+    scan_open_cleanup_behavior.store(0, std::memory_order_release);
+    scan_open_cleanup_second_result.store(0, std::memory_order_release);
+    scan_open_event_sequence.store(0, std::memory_order_release);
+    scan_open_cleanup_order.store(0, std::memory_order_release);
+    scan_open_stop_order.store(0, std::memory_order_release);
     scan_open_plan_calls = 0;
     scan_open_plan_count = 0;
     scan_open_plan_handles = {};
@@ -2024,6 +2089,28 @@ void set_scan_public_open_case(unsigned value)
     scan_shared_order_endpoints = {};
 }
 
+void set_scan_public_open_cleanup_case_for_test()
+{
+    scan_public_open_case = 20;
+}
+
+void set_scan_public_open_cleanup_behavior_for_test(unsigned behavior)
+{
+    scan_open_cleanup_behavior.store(behavior, std::memory_order_release);
+    scan_open_cleanup_second_result.store(0, std::memory_order_release);
+}
+
+unsigned scan_open_cleanup_second_result_value()
+{
+    return scan_open_cleanup_second_result.load(std::memory_order_acquire);
+}
+
+void block_scan_open_callback_for_test()
+{
+    scan_open_identify_blocked.store(false, std::memory_order_release);
+    scan_open_identify_release.store(false, std::memory_order_release);
+}
+
 unsigned scan_open_initialize_call_count()
 {
     return scan_open_initialize_calls.load(std::memory_order_acquire);
@@ -2068,6 +2155,26 @@ std::size_t scan_open_initialize_io_count_value()
 unsigned scan_open_stop_call_count()
 {
     return scan_open_stop_calls.load(std::memory_order_acquire);
+}
+
+unsigned scan_open_cleanup_call_count()
+{
+    return scan_open_cleanup_calls.load(std::memory_order_acquire);
+}
+
+unsigned scan_open_cleanup_io_count_value()
+{
+    return scan_open_cleanup_io_count.load(std::memory_order_acquire);
+}
+
+unsigned scan_open_cleanup_order_value()
+{
+    return scan_open_cleanup_order.load(std::memory_order_acquire);
+}
+
+unsigned scan_open_stop_order_value()
+{
+    return scan_open_stop_order.load(std::memory_order_acquire);
 }
 
 void set_scan_card_reply_mode(unsigned mode)

@@ -190,6 +190,10 @@ private:
 
 void set_public_discovery_batch_for_test(CompleteGroupBatch);
 void set_public_discovery_context_for_test(UsbContext, CompleteGroupBatch);
+void set_public_open_retire_diagnostic_for_test(bool);
+void arm_public_open_terminal_sink_barrier_for_test();
+bool public_open_terminal_sink_barrier_entered_for_test();
+void release_public_open_terminal_sink_barrier_for_test();
 void set_public_discovery_journal_hook_for_test(std::function<void()>);
 void set_public_discovery_scan_error_for_test(dtv_internal_result);
 void set_public_discovery_ungrouped_allocation_hook_for_test(std::function<void()>);
