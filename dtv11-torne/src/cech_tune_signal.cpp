@@ -1520,6 +1520,21 @@ bool build_tuner_step1_plan(bool boost, TunerCalibrationPlan *plan)
 
 namespace {
 
+struct SignalStrengthPoint {
+    std::uint32_t input;
+    std::uint32_t value;
+};
+
+constexpr SignalStrengthPoint kSignalStrengthPoints[]{
+    {55953, 108500}, {55394, 108000}, {53834, 107000}, {52863, 106000},
+    {52239, 105000}, {52012, 104000}, {51803, 103000}, {51566, 102000},
+    {51356, 101000}, {51112, 100000}, {50869, 99000}, {50600, 98000},
+    {50363, 97000}, {50117, 96000}, {49889, 95000}, {49680, 94000},
+    {49493, 93000}, {49302, 92000}, {48929, 91000}, {48416, 90000},
+    {48035, 89000}, {47593, 88000}, {47282, 87000}, {46953, 86000},
+    {46698, 85000}, {45617, 84000}, {44773, 83000}, {43845, 82000},
+    {43020, 81000}, {42010, 80000}, {0, 0}};
+
 std::uint64_t decode_cnr_q16_16(std::uint16_t encoded)
 {
     const auto mantissa = static_cast<std::uint64_t>((encoded >> 6) & 0x00FF);
@@ -1552,6 +1567,35 @@ std::int64_t log2_q20(std::uint64_t value)
     return (static_cast<std::int64_t>(integer) << 20) + fraction;
 }
 
+}
+
+std::int32_t calculate_signal_strength_millidbm(std::uint16_t register_value)
+{
+    const auto input = 65535U - static_cast<std::uint32_t>(register_value);
+    std::uint32_t value = 0;
+    if (input >= kSignalStrengthPoints[0].input) {
+        value = kSignalStrengthPoints[0].value;
+    } else {
+        for (std::size_t index = 1;
+             index < sizeof(kSignalStrengthPoints) / sizeof(kSignalStrengthPoints[0]);
+             ++index) {
+            const auto &lower = kSignalStrengthPoints[index];
+            const auto &upper = kSignalStrengthPoints[index - 1];
+            if (input == lower.input) {
+                value = lower.value;
+                break;
+            }
+            if (input > lower.input) {
+                const auto input_delta = static_cast<std::uint64_t>(input - lower.input);
+                const auto value_delta = static_cast<std::uint64_t>(upper.value - lower.value);
+                const auto input_span = static_cast<std::uint64_t>(upper.input - lower.input);
+                value = lower.value + static_cast<std::uint32_t>(
+                    input_delta * value_delta / input_span);
+                break;
+            }
+        }
+    }
+    return static_cast<std::int32_t>(value) - 131000;
 }
 
 bool demod_fec_mpeg_locked(std::uint16_t register_568)

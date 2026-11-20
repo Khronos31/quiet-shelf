@@ -438,6 +438,7 @@ bool calculate_demod_cnr(std::uint16_t noise_register,
                          std::uint64_t *noise_q16_16,
                          std::uint64_t *signal_q16_16,
                          std::int32_t *hundredth_db);
+std::int32_t calculate_signal_strength_millidbm(std::uint16_t register_value);
 
 enum class LockReadResult { read_error, unlocked, locked };
 
