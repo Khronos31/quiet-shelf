@@ -83,6 +83,8 @@ void set_scan_stream_192_source();
 void set_scan_stream_failure_modes(unsigned, unsigned, unsigned, unsigned);
 void set_scan_stream_generation_override(std::uint64_t);
 std::uint64_t scan_stream_previous_generation();
+bool scan_stream_plan_blocked_for_test();
+void release_scan_stream_plan_for_test();
 void set_scan_card_state_notification(std::uint32_t, bool);
 void set_scan_receiver_lock_notification(std::uint32_t, std::uint32_t, bool);
 void set_scan_receiver_lock_operation_epoch(std::uint64_t);
@@ -1610,6 +1612,124 @@ int public_stream_wait_lifecycle()
     dtv_drop_enclosure(root);
     set_scan_public_open_case(0);
     return 0;
+}
+
+int public_stream_generation_snapshot()
+{
+    set_scan_public_open_case(25);
+    auto backend = std::make_shared<FakeBackend>();
+    backend->async_enabled = true;
+    backend->actual_length_limit = 7;
+    auto context = dtv::internal::UsbContext::scan_only(backend);
+    set_scan_group_case(0);
+    dtv::internal::CompleteGroupBatch batch;
+    if (dtv::internal::observe_loaded_product_groups(
+            {snapshot(context, 3, 225), snapshot(context, 4, 226)}, &batch).code !=
+            DTV_INTERNAL_RESULT_OK || batch.groups.size() != 1) return 1;
+    dtv::internal::set_public_discovery_context_for_test(std::move(context), std::move(batch));
+    dtv_error error{};
+    error.struct_size = sizeof(error);
+    auto *const *enclosures = dtv_list_enclosures(&error);
+    if (enclosures == nullptr || enclosures[0] == nullptr) return 2;
+    auto *root = enclosures[0];
+    dtv_hold_enclosure(root);
+    std::int32_t open_result = DTV_ERROR_INTERNAL;
+    dtv_error open_error{};
+    open_error.struct_size = sizeof(open_error);
+    std::thread opening([&] { open_result = dtv_open_enclosure(root, nullptr, &open_error); });
+    if (!backend->wait_for_submissions(2)) {
+        backend->complete_endpoint(0x81);
+        backend->complete_endpoint(0x82);
+        opening.join();
+        dtv_release_enclosure(root);
+        dtv_drop_enclosure(root);
+        set_scan_public_open_case(0);
+        return 3;
+    }
+    backend->complete_endpoint(0x81);
+    backend->complete_endpoint(0x82);
+    opening.join();
+    if (open_result != DTV_ERROR_OK || !backend->wait_for_submissions(2)) {
+        if (open_result == DTV_ERROR_OK) {
+            (void)dtv_close_enclosure(root, nullptr, &error);
+            dtv_release_enclosure(root);
+        } else {
+            dtv_release_enclosure(root);
+        }
+        dtv_drop_enclosure(root);
+        set_scan_public_open_case(0);
+        return 4;
+    }
+    auto *const *devices = dtv_get_devices(root);
+    auto *const *receivers = devices == nullptr ? nullptr : dtv_get_receivers(devices[0]);
+    if (receivers == nullptr || receivers[0] == nullptr) {
+        (void)dtv_close_enclosure(root, nullptr, &error);
+        dtv_release_enclosure(root);
+        dtv_drop_enclosure(root);
+        set_scan_public_open_case(0);
+        return 5;
+    }
+    dtv_stream *stream = nullptr;
+    std::atomic<std::int32_t> stream_result{DTV_ERROR_INTERNAL};
+    std::thread opening_stream([&] {
+        stream_result.store(dtv_open_stream(receivers[0], nullptr, &stream, &error),
+            std::memory_order_release);
+    });
+    bool plan_blocked = false;
+    for (unsigned attempt = 0; attempt < 2000; ++attempt) {
+        if (scan_stream_plan_blocked_for_test()) {
+            plan_blocked = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!plan_blocked) {
+        release_scan_stream_plan_for_test();
+        opening_stream.join();
+        if (stream != nullptr) {
+            (void)dtv_close_stream(stream, nullptr, &error);
+            dtv_release_stream(stream);
+        }
+        (void)dtv_close_enclosure(root, nullptr, &error);
+        dtv_release_enclosure(root);
+        dtv_drop_enclosure(root);
+        set_scan_public_open_case(0);
+        return 6;
+    }
+    const auto callbacks = backend->callback_count_snapshot();
+    backend->complete_endpoint(0x81);
+    const bool callback_done = backend->wait_for_callbacks(callbacks + 1);
+    release_scan_stream_plan_for_test();
+    opening_stream.join();
+    if (!callback_done || stream_result.load(std::memory_order_acquire) != DTV_ERROR_OK ||
+        stream == nullptr) {
+        if (stream != nullptr) {
+            (void)dtv_close_stream(stream, nullptr, &error);
+            dtv_release_stream(stream);
+        }
+        (void)dtv_close_enclosure(root, nullptr, &error);
+        dtv_release_enclosure(root);
+        dtv_drop_enclosure(root);
+        set_scan_public_open_case(0);
+        return 7;
+    }
+    std::array<unsigned char, 376> packets{};
+    std::uint64_t output_size = 0;
+    const dtv_call_options read_wait{sizeof(dtv_call_options), 1000};
+    const auto read_result = dtv_read_stream(stream, packets.data(), packets.size(), &read_wait,
+        &output_size, &error);
+    const bool delivered = read_result == DTV_ERROR_OK && output_size == packets.size() &&
+        packets[0] == 0x47 && packets[188] == 0x47;
+    auto close_result = dtv_close_stream(stream, nullptr, &error);
+    for (unsigned attempt = 0; attempt < 4 && close_result == DTV_CLOSE_PENDING; ++attempt)
+        close_result = dtv_get_stream_close_state(stream, &error);
+    dtv_release_stream(stream);
+    const auto enclosure_close = dtv_close_enclosure(root, nullptr, &error);
+    dtv_release_enclosure(root);
+    dtv_drop_enclosure(root);
+    set_scan_public_open_case(0);
+    return delivered && close_result == DTV_CLOSE_CLOSED && enclosure_close == DTV_CLOSE_CLOSED
+        ? 0 : 8;
 }
 
 int public_stream_pid_filter()
@@ -7799,6 +7919,10 @@ int main(int argc, char **argv)
     if (const int result = public_stream_queue_overflow(); result != 0) {
         std::fprintf(stderr, "public_stream_queue_overflow failed: %d\n", result);
         return 63 + result;
+    }
+    if (const int result = public_stream_generation_snapshot(); result != 0) {
+        std::fprintf(stderr, "public_stream_generation_snapshot failed: %d\n", result);
+        return 66 + result;
     }
     if (const int result = public_stream_pid_filter(); result != 0) {
         std::fprintf(stderr, "public_stream_pid_filter failed: %d\n", result);

@@ -2517,6 +2517,8 @@ namespace {
 struct PublicStreamState;
 bool begin_stream_delivery(const std::shared_ptr<PublicStreamState> &);
 bool stream_generation_matches(const std::shared_ptr<PublicStreamState> &, std::uint64_t);
+dtv::spi::PublicStreamGenerationBinding stream_generation_binding(
+    std::uint32_t, const std::shared_ptr<PublicStreamState> &);
 dtv_internal_result deliver_stream_message(const std::shared_ptr<PublicStreamState> &,
                                            const dtv::spi::PublicOpenMessage &);
 int32_t public_error_code(dtv_internal_result);
@@ -2650,7 +2652,28 @@ struct PublicDiscoveryState {
             dtv::spi::PublicOpenPacket packet{raw->handle_index, raw->endpoint, raw->submit_sequence,
                 raw->generation, raw->actual_length, raw->bytes.first(raw->actual_length)};
             dtv::spi::PublicOpenMessage message;
+            std::vector<dtv::spi::PublicStreamGenerationBinding> stream_generations;
+            const bool use_generation_snapshot = self->ops->demux_with_stream_generations != nullptr;
+            if (use_generation_snapshot) {
+                try {
+                    std::lock_guard lock(self->mutex);
+                    if (self->stopping) return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
+                    stream_generations.reserve(self->streams.size());
+                    for (const auto &[receiver_index, stream] : self->streams) {
+                        stream_generations.push_back(stream_generation_binding(receiver_index, stream));
+                    }
+                } catch (...) {
+                    const auto failure = exception_result();
+                    self->record_terminal(failure);
+                    return failure;
+                }
+            }
             const auto classified = call_callback([&] {
+                if (use_generation_snapshot) {
+                    return self->ops->demux_with_stream_generations(self->context, &packet,
+                        std::span<const dtv::spi::PublicStreamGenerationBinding>(stream_generations),
+                        &message);
+                }
                 return self->ops->demux(self->context, &packet, &message);
             });
             if (classified.code != DTV_INTERNAL_RESULT_OK) {
@@ -2671,8 +2694,14 @@ struct PublicDiscoveryState {
             if (self->stopping) return dtv_internal_result_make(DTV_INTERNAL_RESULT_NOT_READY, 0);
             if (message.kind == dtv::spi::PublicOpenMessageKind::source_chunk ||
                 message.kind == dtv::spi::PublicOpenMessageKind::source_end) {
+                const bool generation_matches_snapshot = !use_generation_snapshot ||
+                    std::any_of(stream_generations.begin(), stream_generations.end(),
+                        [&](const auto &binding) {
+                            return binding.receiver_index == message.receiver_index &&
+                                binding.stream_generation == message.stream_generation;
+                        });
                 const auto stream = self->streams.find(message.receiver_index);
-                if (stream != self->streams.end() &&
+                if (generation_matches_snapshot && stream != self->streams.end() &&
                     stream_generation_matches(stream->second, message.stream_generation)) {
                     auto target = stream->second;
                     if (!begin_stream_delivery(target))
@@ -3313,6 +3342,12 @@ bool stream_generation_matches(const std::shared_ptr<PublicStreamState> &state,
                                std::uint64_t generation)
 {
     return state->stream_generation == generation;
+}
+
+dtv::spi::PublicStreamGenerationBinding stream_generation_binding(
+    std::uint32_t receiver_index, const std::shared_ptr<PublicStreamState> &state)
+{
+    return {receiver_index, state->stream_generation};
 }
 
 dtv::spi::PublicStreamRequest stream_request(const PublicStreamState &state);
@@ -9529,7 +9564,8 @@ extern "C" int32_t dtv_open_enclosure(dtv_enclosure *object,
                 plan.buffer_capacity > static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
                 (plan.receiver_lock_source && plan.shared_in_depth == 0) ||
                 (plan.shared_in_depth != 0 && (plan.prestream_sink_limit == 0 ||
-                    plan.reply_capacity == 0 || open_ops->demux == nullptr ||
+                    plan.reply_capacity == 0 || (open_ops->demux == nullptr &&
+                        open_ops->demux_with_stream_generations == nullptr) ||
                     open_ops->identify_shared == nullptr || plan.buffer_capacity > shared_in_limit ||
                     plan.prestream_sink_limit > prestream_limit ||
                     plan.reply_capacity > shared_in_limit ||

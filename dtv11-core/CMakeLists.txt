@@ -70,6 +70,9 @@ target_include_directories(dtv-userland PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_compile_features(dtv-userland PUBLIC c_std_11 cxx_std_20)
 target_link_libraries(dtv-userland PRIVATE ${DTV_LIBUSB_TARGET} Threads::Threads)
 set_target_properties(dtv-userland PROPERTIES CXX_EXTENSIONS OFF)
+if(MSVC)
+    target_compile_options(dtv-userland PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+endif()
 
 include(cmake/DtvProduct.cmake)
 

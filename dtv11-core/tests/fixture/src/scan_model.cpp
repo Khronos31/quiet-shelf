@@ -106,6 +106,8 @@ std::size_t scan_open_identify_bytes = 0;
 std::atomic<unsigned> scan_open_identify_calls{0};
 std::atomic<bool> scan_open_identify_blocked{false};
 std::atomic<bool> scan_open_identify_release{true};
+std::atomic<bool> scan_stream_plan_blocked{false};
+std::atomic<bool> scan_stream_plan_release{true};
 std::atomic<unsigned> scan_open_initialize_calls{0};
 std::atomic<std::size_t> scan_open_initialize_io_count{0};
 std::atomic<unsigned> scan_open_cleanup_calls{0};
@@ -140,6 +142,7 @@ std::atomic<bool> scan_shared_lock_enabled{false};
 std::atomic<std::uint64_t> scan_stream_generation{0};
 std::atomic<std::uint64_t> previous_stream_generation{0};
 std::atomic<std::uint64_t> scan_stream_generation_override{0};
+std::atomic<bool> scan_generation_demux_enabled{false};
 std::atomic<unsigned> scan_stream_packet{0};
 std::atomic<std::uint32_t> scan_queue_packet{0};
 std::atomic<std::size_t> scan_stream_queue_capacity{0};
@@ -722,7 +725,7 @@ dtv_internal_result scan_open_plan(
                     scan_public_open_case == 16 || scan_public_open_case == 17 ||
                     scan_public_open_case == 18 || scan_public_open_case == 21 ||
                     scan_public_open_case == 22 || scan_public_open_case == 23 ||
-                    scan_public_open_case == 24) &&
+                    scan_public_open_case == 24 || scan_public_open_case == 25) &&
                     candidate_index == 1
                     ? 0x82 : 0x81;
                 if ((endpoint.address == wanted_endpoint && (endpoint.attributes & 0x03u) == 0x02u) ||
@@ -734,7 +737,7 @@ dtv_internal_result scan_open_plan(
                         scan_public_open_case == 13 || scan_public_open_case == 14 ||
                         scan_public_open_case == 15 || scan_public_open_case == 16 ||
                         scan_public_open_case == 17 || scan_public_open_case == 18 ||
-                        (scan_public_open_case >= 21 && scan_public_open_case <= 24)) {
+                        (scan_public_open_case >= 21 && scan_public_open_case <= 25)) {
                         plans[*count].shared_in_depth = scan_public_open_case == 10 && candidate_index == 0
                             ? 2 : 1;
                         plans[*count].prestream_sink_limit = 16;
@@ -1309,8 +1312,8 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         if (!accepted) return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
         message->kind = dtv::spi::PublicOpenMessageKind::source_chunk;
         message->receiver_index = 0;
-        const auto generation_override = scan_stream_generation_override.exchange(0,
-            std::memory_order_acq_rel);
+        const auto generation_override = scan_generation_demux_enabled.load(std::memory_order_acquire)
+            ? 0 : scan_stream_generation_override.exchange(0, std::memory_order_acq_rel);
         const auto source_generation = scan_queue_generations[0].load(std::memory_order_acquire);
         message->stream_generation = generation_override == 0 ? source_generation
                                                                : generation_override;
@@ -1432,6 +1435,21 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         if (message->kind != dtv::spi::PublicOpenMessageKind::ignore)
             return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
     }
+    if (scan_public_open_case == 25 &&
+        scan_stream_plan_blocked.load(std::memory_order_acquire) && packet->endpoint == 0x81 &&
+        scan_stream_packet.fetch_add(1, std::memory_order_acq_rel) == 0) {
+        static const auto source = [] {
+            std::array<unsigned char, 376> value{};
+            value[0] = 0x47;
+            value[188] = 0x47;
+            return value;
+        }();
+        message->kind = dtv::spi::PublicOpenMessageKind::source_chunk;
+        message->receiver_index = 0;
+        message->generation = packet->generation;
+        message->payload = source;
+        return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+    }
     if (scan_public_open_case == 14 && stream_generation != 0 && packet->endpoint == 0x81) {
         message->receiver_index = scan_stream_receiver.load(std::memory_order_acquire);
         message->stream_generation = stream_generation;
@@ -1488,6 +1506,26 @@ dtv_internal_result scan_shared_demux(dtv_context *, const dtv::spi::PublicOpenP
         (scan_shared_stale_generation.load(std::memory_order_acquire) ? 1 : 0);
     message->payload = packet->bytes.first(packet->actual_length);
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
+}
+
+dtv_internal_result scan_shared_demux_with_stream_generations(dtv_context *context,
+    const dtv::spi::PublicOpenPacket *packet,
+    std::span<const dtv::spi::PublicStreamGenerationBinding> generations,
+    dtv::spi::PublicOpenMessage *message)
+{
+    const auto result = scan_shared_demux(context, packet, message);
+    if (result.code != DTV_INTERNAL_RESULT_OK ||
+        (message->kind != dtv::spi::PublicOpenMessageKind::source_chunk &&
+         message->kind != dtv::spi::PublicOpenMessageKind::source_end)) return result;
+    const auto override = scan_stream_generation_override.exchange(0, std::memory_order_acq_rel);
+    if (override != 0) {
+        message->stream_generation = override;
+        return result;
+    }
+    const auto binding = std::find_if(generations.begin(), generations.end(),
+        [&](const auto &value) { return value.receiver_index == message->receiver_index; });
+    message->stream_generation = binding == generations.end() ? 0 : binding->stream_generation;
+    return result;
 }
 
 dtv_internal_result scan_shared_identify(dtv_context *context,
@@ -1841,6 +1879,12 @@ dtv_internal_result scan_plan_stream(dtv_context *, const dtv::spi::PublicStream
 {
     if (request == nullptr || plan == nullptr)
         return dtv_internal_result_make(DTV_INTERNAL_RESULT_INVALID_ARGUMENT, 0);
+    if (scan_public_open_case == 25) {
+        scan_stream_plan_blocked.store(true, std::memory_order_release);
+        scan_stream_plan_blocked.notify_all();
+        while (!scan_stream_plan_release.load(std::memory_order_acquire))
+            scan_stream_plan_release.wait(false);
+    }
     thread_local std::array<std::uint64_t, 1> resource_keys{};
     resource_keys[0] = (scan_public_open_case == 15 || scan_public_open_case == 16)
         ? 900 + request->receiver_index : 900;
@@ -1952,7 +1996,7 @@ dtv_internal_result scan_transform_stream(dtv_context *,
     return dtv_internal_result_make(DTV_INTERNAL_RESULT_OK, 0);
 }
 
-const dtv::spi::PublicOpenOps scan_public_open_ops{
+dtv::spi::PublicOpenOps scan_public_open_ops{
     scan_open_plan, scan_open_identify, scan_open_stop, scan_shared_demux, scan_shared_identify,
     scan_plan_operation, scan_plan_tune, scan_tune_by_frequency,
     scan_prepare_stream, scan_start_stream, scan_stop_stream, scan_after_stream_drain,
@@ -1960,7 +2004,7 @@ const dtv::spi::PublicOpenOps scan_public_open_ops{
     [](dtv_context *) {
         return scan_public_open_case != 21 && scan_public_open_case != 23 &&
                scan_public_open_case != 24;
-    }, scan_open_cleanup};
+    }, scan_open_cleanup, nullptr};
 
 }
 
@@ -1972,6 +2016,11 @@ void set_scan_group_case(unsigned value)
 void set_scan_public_open_case(unsigned value)
 {
     scan_public_open_case = value;
+    const bool use_generation_demux = value == 16 || value == 25;
+    scan_generation_demux_enabled.store(use_generation_demux, std::memory_order_release);
+    scan_public_open_ops.demux = use_generation_demux ? nullptr : scan_shared_demux;
+    scan_public_open_ops.demux_with_stream_generations = use_generation_demux
+        ? scan_shared_demux_with_stream_generations : nullptr;
     scan_open_initialize_calls.store(0, std::memory_order_release);
     scan_open_initialize_io_count.store(0, std::memory_order_release);
     scan_open_cleanup_calls.store(0, std::memory_order_release);
@@ -1990,6 +2039,8 @@ void set_scan_public_open_case(unsigned value)
     scan_stream_generation.store(0, std::memory_order_release);
     previous_stream_generation.store(0, std::memory_order_release);
     scan_stream_generation_override.store(0, std::memory_order_release);
+    scan_stream_plan_blocked.store(false, std::memory_order_release);
+    scan_stream_plan_release.store(value != 25, std::memory_order_release);
     scan_stream_packet.store(0, std::memory_order_release);
     scan_queue_packet.store(0, std::memory_order_release);
     scan_stream_queue_capacity.store(0, std::memory_order_release);
@@ -2087,6 +2138,17 @@ void set_scan_public_open_case(unsigned value)
     scan_tune_records = {};
     scan_shared_order = {};
     scan_shared_order_endpoints = {};
+}
+
+bool scan_stream_plan_blocked_for_test()
+{
+    return scan_stream_plan_blocked.load(std::memory_order_acquire);
+}
+
+void release_scan_stream_plan_for_test()
+{
+    scan_stream_plan_release.store(true, std::memory_order_release);
+    scan_stream_plan_release.notify_all();
 }
 
 void set_scan_public_open_cleanup_case_for_test()
@@ -2377,7 +2439,8 @@ bool scan_shared_mode_enabled()
         scan_public_open_case == 15 || scan_public_open_case == 16 ||
         scan_public_open_case == 17 || scan_public_open_case == 18 ||
         scan_public_open_case == 21 || scan_public_open_case == 22 ||
-        scan_public_open_case == 23 || scan_public_open_case == 24;
+        scan_public_open_case == 23 || scan_public_open_case == 24 ||
+        scan_public_open_case == 25;
 }
 
 bool scan_operation_mode_enabled()

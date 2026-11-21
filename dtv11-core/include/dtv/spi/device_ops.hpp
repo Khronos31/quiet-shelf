@@ -338,6 +338,11 @@ struct PublicOpenIo {
     const dtv_usb_io *io = nullptr;
 };
 
+struct PublicStreamGenerationBinding {
+    std::uint32_t receiver_index;
+    std::uint64_t stream_generation;
+};
+
 struct PublicOpenOps {
     dtv_internal_result (*plan)(std::span<const dtv_usb_candidate_info>,
                                 std::span<const dtv_function>,
@@ -371,6 +376,8 @@ struct PublicOpenOps {
     bool (*identify_requires_initial_data)(dtv_context *) = nullptr;
     dtv_internal_result (*cleanup)(dtv_context *, std::span<const PublicOpenIo>,
                                    dtv_timeout, const std::atomic<bool> *) = nullptr;
+    dtv_internal_result (*demux_with_stream_generations)(dtv_context *, const PublicOpenPacket *,
+        std::span<const PublicStreamGenerationBinding>, PublicOpenMessage *) = nullptr;
 };
 
 struct ModelEntry {
