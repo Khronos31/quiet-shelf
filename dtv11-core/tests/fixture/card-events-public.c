@@ -183,6 +183,17 @@ int card_events_public_consumer(card_event_driver driver, void *user)
         dtv_tune_options tune = {sizeof(dtv_tune_options), DTV_TUNE_SELECTOR_TSID,
                                  0x1234, DTV_LNA_ON};
         dtv_call_options call = {sizeof(dtv_call_options), 1000};
+        dtv_tune_options no_selector = {sizeof(dtv_tune_options), DTV_TUNE_SELECTOR_NONE,
+                                        0, DTV_LNA_DEFAULT};
+        if (dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T, 0, NULL,
+                &call, &error) != DTV_ERROR_INVALID_ARGUMENT ||
+            error.code != DTV_ERROR_INVALID_ARGUMENT ||
+            dtv_tune_by_frequency(receivers[1], DTV_SYSTEM_ISDB_S, UINT64_C(11700000000),
+                NULL, &call, &error) != DTV_ERROR_INVALID_ARGUMENT ||
+            error.code != DTV_ERROR_INVALID_ARGUMENT ||
+            dtv_tune_by_frequency(receivers[1], DTV_SYSTEM_ISDB_S, UINT64_C(11700000000),
+                &no_selector, &call, &error) != DTV_ERROR_INVALID_ARGUMENT ||
+            error.code != DTV_ERROR_INVALID_ARGUMENT) return 46;
         dtv_public_test_set_tune_mode(5);
         const int32_t tune_result = dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T,
             UINT64_C(5931428571), &tune, &call, &error);
@@ -359,6 +370,11 @@ int card_events_public_consumer(card_event_driver driver, void *user)
             !wait_receiver_event(&event, root, receivers[1], DTV_EVENT_LOCK_LOST) ||
             !expect_signal(receivers[1], DTV_MEASUREMENT_VALID,
                            DTV_MEASUREMENT_REASON_NONE, 0) || !expect_timeout()) return 44;
+
+        if (dtv_tune_by_frequency(receivers[0], DTV_SYSTEM_ISDB_T, UINT64_C(5931428571),
+                NULL, &call, &error) != DTV_ERROR_OK || error.code != DTV_ERROR_OK ||
+            !expect_signal(receivers[0], DTV_MEASUREMENT_UNKNOWN,
+                           DTV_MEASUREMENT_REASON_TUNE_CHANGED, 0)) return 47;
     }
     if (!drive(driver, user, 13) || !expect_timeout() ||
         !drive(driver, user, 14) || !expect_timeout() ||

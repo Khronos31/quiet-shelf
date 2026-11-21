@@ -2366,7 +2366,7 @@ int public_open_card_events()
     active_public_backend = nullptr;
     dtv::internal::set_public_discovery_journal_hook_for_test({});
     dtv::internal::set_public_discovery_batch_for_test({});
-    const auto tune_verified = scan_tune_call_count() == 16 && scan_tune_effect_count() == 15 &&
+    const auto tune_verified = scan_tune_call_count() == 17 && scan_tune_effect_count() == 16 &&
         scan_tune_peer_was_checked() && scan_tune_card_was_checked() &&
         scan_tune_record_matches(0, 0, DTV_SYSTEM_ISDB_T, UINT64_C(5931428571), true,
             DTV_TUNE_SELECTOR_TSID, 0x1234, DTV_LNA_ON) &&
@@ -2389,7 +2389,9 @@ int public_open_card_events()
         scan_tune_record_matches(14, 1, DTV_SYSTEM_ISDB_S, UINT64_C(1733000000), true,
             DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_OFF) &&
         scan_tune_record_matches(15, 1, DTV_SYSTEM_ISDB_S, UINT64_C(2053000000), true,
-            DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT);
+            DTV_TUNE_SELECTOR_SLOT, 0, DTV_LNA_DEFAULT) &&
+        scan_tune_record_matches(16, 0, DTV_SYSTEM_ISDB_T, UINT64_C(5931428571), false,
+            DTV_TUNE_SELECTOR_NONE, 0, DTV_LNA_DEFAULT);
     set_scan_public_open_case(0);
     return consumer_result != 0 ? consumer_result : tune_verified ? 0 : 2;
 }

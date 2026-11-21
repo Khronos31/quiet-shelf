@@ -173,7 +173,7 @@ struct ScanTuneRecord {
     dtv_tune_options options{};
     dtv_timeout timeout{};
 };
-std::array<ScanTuneRecord, 16> scan_tune_records{};
+std::array<ScanTuneRecord, 17> scan_tune_records{};
 std::array<std::uint64_t, 2> scan_shared_sequences{};
 std::array<std::size_t, 2> scan_shared_lengths{};
 std::array<std::uint64_t, 32> scan_shared_order{};

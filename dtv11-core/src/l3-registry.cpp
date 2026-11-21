@@ -8930,7 +8930,10 @@ extern "C" std::int32_t dtv_tune_by_frequency(dtv_receiver *object, std::uint32_
         (system != DTV_SYSTEM_ISDB_T && system != DTV_SYSTEM_ISDB_S) ||
         (tune_options != nullptr &&
             (tune_options->selector > DTV_TUNE_SELECTOR_TSID || tune_options->lna > DTV_LNA_ON ||
-             (tune_options->selector == DTV_TUNE_SELECTOR_SLOT && tune_options->value > 11)))) {
+             (tune_options->selector == DTV_TUNE_SELECTOR_SLOT && tune_options->value > 11))) ||
+        frequency_hz == 0 ||
+        (system == DTV_SYSTEM_ISDB_S &&
+            (tune_options == nullptr || tune_options->selector == DTV_TUNE_SELECTOR_NONE))) {
         set_public_error(error, DTV_ERROR_INVALID_ARGUMENT);
         return DTV_ERROR_INVALID_ARGUMENT;
     }
