@@ -1051,7 +1051,8 @@ dtv_internal_result CechI2cIo::apply_tune_plan_writes(const TunePlan &plan,
 
 WbdCalibrationIoResult CechI2cIo::begin_wbd_calibration(
     std::uint64_t frequency_hz, std::uint16_t previous_gain,
-    std::uint16_t previous_offset, WbdCalibrationIoState *state)
+    std::uint16_t previous_offset, bool previous_gain_valid,
+    bool previous_offset_valid, WbdCalibrationIoState *state)
 {
     WbdCalibrationIoResult calibration_result{};
     calibration_result.io_result = result(DTV_INTERNAL_RESULT_OK);
@@ -1066,7 +1067,9 @@ WbdCalibrationIoResult CechI2cIo::begin_wbd_calibration(
         return calibration_result;
     }
 
-    if (!build_wbd_calibration_plan(frequency_hz, previous_gain, &state->plan)) {
+    if (!build_wbd_calibration_plan(frequency_hz, previous_gain,
+                                    previous_gain_valid, previous_offset_valid,
+                                    &state->plan)) {
         calibration_result.io_result = result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT);
         return calibration_result;
     }
@@ -1976,13 +1979,12 @@ InitialCalibrationPassResult CechI2cIo::advance_initial_calibration_pass(
         }
 
         if (state->active_stage == InitialCalibrationPassStage::wbd) {
-            if (!state->wbd_gain_valid)
-                return fail(result(DTV_INTERNAL_RESULT_INVALID_ARGUMENT));
             if (state->retained_rf_frequency_hz == 0)
                 state->retained_rf_frequency_hz = state->requested_frequency_hz;
             const auto calibration_result = state->wbd.phase == WbdCalibrationIoPhase::idle
                 ? begin_wbd_calibration(state->retained_rf_frequency_hz,
-                    state->wbd_gain, state->wbd_offset, &state->wbd)
+                    state->wbd_gain, state->wbd_offset,
+                    state->wbd_gain_valid, state->wbd_offset_valid, &state->wbd)
                 : poll_wbd_calibration(&state->wbd);
             if (state->wbd.phase == WbdCalibrationIoPhase::waiting_measurement) {
                 state->wbd_gain = state->wbd.plan.calibration_gain;

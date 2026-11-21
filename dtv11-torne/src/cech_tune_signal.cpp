@@ -1113,6 +1113,8 @@ bool build_tuner_init_plan(std::uint16_t identity, std::uint16_t second_identity
 
 bool build_wbd_calibration_plan(std::uint64_t frequency_hz,
                                 std::uint16_t previous_gain,
+                                bool previous_gain_valid,
+                                bool previous_offset_valid,
                                 TunerCalibrationPlan *plan)
 {
     if (plan == nullptr || frequency_hz < 45000000 || frequency_hz > 860000000)
@@ -1120,7 +1122,8 @@ bool build_wbd_calibration_plan(std::uint64_t frequency_hz,
     *plan = {};
     plan->wbd_calibration = true;
     plan->calibration_gain = wbd_gain(frequency_hz);
-    if (plan->calibration_gain == previous_gain) {
+    if (previous_gain_valid && previous_offset_valid &&
+        plan->calibration_gain == previous_gain) {
         plan->calibration_flags_to_clear = tuner_calibration_wbd;
         plan->complete = true;
         return true;

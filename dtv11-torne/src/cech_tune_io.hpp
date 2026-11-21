@@ -324,6 +324,8 @@ public:
     WbdCalibrationIoResult begin_wbd_calibration(std::uint64_t frequency_hz,
                                                   std::uint16_t previous_gain,
                                                   std::uint16_t previous_offset,
+                                                  bool previous_gain_valid,
+                                                  bool previous_offset_valid,
                                                   WbdCalibrationIoState *state);
     WbdCalibrationIoResult poll_wbd_calibration(WbdCalibrationIoState *state);
     DcCalibrationIoResult begin_dc_calibration_io(TunerVariant variant,

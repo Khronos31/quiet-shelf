@@ -354,6 +354,8 @@ enum class DcCalibrationStatus { in_progress, complete, failed };
 
 bool build_wbd_calibration_plan(std::uint64_t frequency_hz,
                                 std::uint16_t previous_gain,
+                                bool previous_gain_valid,
+                                bool previous_offset_valid,
                                 TunerCalibrationPlan *plan);
 bool complete_wbd_calibration(const TunerCalibrationPlan *plan,
                               bool measurement_available,
