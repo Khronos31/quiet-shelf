@@ -1,0 +1,60 @@
+{
+  "format": "torne-fr30-image-set-v1",
+  "license": "GPL-2.0-or-later",
+  "layout_version": 1,
+  "file": "torne-fr30-v1.bin",
+  "total_bytes": 3428,
+  "sha256": "8a7a5cac3cc6b6309020f3db0dc086dcec387e5fa2af1185b1a4b6c8455fd506",
+  "images": [
+    {
+      "role": "widen-bank0",
+      "file": "widen-bank0.bin",
+      "offset": 0,
+      "length": 172,
+      "sha256": "8fd035bce738a91fa78944423b2e7383e3927faec079c9f82bd51baf422fa53d",
+      "base": "0x000e1000",
+      "entry_read": "0x000e1020",
+      "entry_write": "0x000e1064",
+      "build_id": "0x1d929a25",
+      "capabilities": "0x00000001",
+      "source": "fr30/src/widen.s",
+      "source_sha256": "72f318c69952ed6b161b31ff8653e2e3e76e001b425b1d0d9e0868f865dffdbc",
+      "linker": "fr30/ld/widen-bank0.ld",
+      "linker_sha256": "437bf63fe9593fe168a9749a31abf275a7f0fb6d1759eb123707ce4d8b0f717a",
+      "elf_file": "widen-bank0.elf",
+      "elf_sha256": "6e7c0bd8072f04b3cf16d04f94f79b8f3d3ac2747b9f186f1eeb80386e8d3a91"
+    },
+    {
+      "role": "core0",
+      "file": "core0.bin",
+      "offset": 172,
+      "length": 1332,
+      "sha256": "b59b82dd81f3908cf95bb290d5bdd229b12b5c9de13148bd44be1e5449522274",
+      "base": "0x000a0000",
+      "entry": "0x000a0000",
+      "build_id": "0x07e65e29",
+      "source": "fr30/src/core0.s",
+      "source_sha256": "2feb465cb8d051e61584ad5c0a5a1f33f249adf1c0c57bae3118e1e0854fb8dd",
+      "linker": "fr30/ld/core0.ld",
+      "linker_sha256": "77bb7876773c52a54052f99b605fffba89ea188a9cd5c7a8790b7c7b6e89ae76",
+      "elf_file": "core0.elf",
+      "elf_sha256": "64d45d1f999f62db80888b21610237c0f8e7a31f7c7d6ad7be8dce6dae314ccb"
+    },
+    {
+      "role": "core1",
+      "file": "core1.bin",
+      "offset": 1504,
+      "length": 1924,
+      "sha256": "0e02c9468936bb4411323939baca42e1dc85559e29da632cc186998e6a0ea202",
+      "base": "0x000a0000",
+      "entry": "0x000a0000",
+      "build_id": "0xfc662bd9",
+      "source": "fr30/src/core1.s",
+      "source_sha256": "ebcea142133f63766b1664f4449d6ea124498ae25c94811dce93a0c812d118da",
+      "linker": "fr30/ld/core1.ld",
+      "linker_sha256": "86eb8ed001ef7df9e88aa8ea8952770e5fc0b0124d3bc65ba917d29226499f90",
+      "elf_file": "core1.elf",
+      "elf_sha256": "5aa546560a420a5aee8ef188ce530d15ad39ac9ecf52993e43edd899aa2d5574"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifndef @PRODUCT_NAME_UPPER@_FIRMWARE_HPP
+#define @PRODUCT_NAME_UPPER@_FIRMWARE_HPP
+
+#include <cstdint>
+
+namespace dtv::spi::firmware_assets {
+@DTV_FIRMWARE_DECLARATIONS@}
+
+#endif
