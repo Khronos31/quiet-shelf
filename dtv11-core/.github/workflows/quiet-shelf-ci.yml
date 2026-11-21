@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: quiet-shelf Core snapshot
+
+on:
+  push:
+    paths:
+      - 'dtv11-core/**'
+      - '.github/workflows/core-ci.yml'
+  pull_request:
+    paths:
+      - 'dtv11-core/**'
+      - '.github/workflows/core-ci.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S dtv11-core -B build-core -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build-core --config Release
+      - name: CLI contract
+        run: ctest --test-dir build-core -C Release --output-on-failure
